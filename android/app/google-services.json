@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "551902347979",
+    "project_id": "vocaflow-51274",
+    "storage_bucket": "vocaflow-51274.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:551902347979:android:ed967f5a7addabf2e2914e",
+        "android_client_info": {
+          "package_name": "com.vocaflow.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAhyXr4VuBeHwAsRpBlX_A3gQSmBYD_GfY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
