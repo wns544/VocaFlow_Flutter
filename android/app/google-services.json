@@ -12,7 +12,20 @@
           "package_name": "com.vocaflow.app"
         }
       },
-      "oauth_client": [],
+      "oauth_client": [
+        {
+          "client_id": "551902347979-6otl384tk4ghmvhf5h8rjjsbp6rvb36m.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.vocaflow.app",
+            "certificate_hash": "22b910010c05872d79be12bd1fb69ec477ab9dc9"
+          }
+        },
+        {
+          "client_id": "551902347979-55n8b79u8nrs647b8lgo5vl2lsiq0iet.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
       "api_key": [
         {
           "current_key": "AIzaSyAhyXr4VuBeHwAsRpBlX_A3gQSmBYD_GfY"
@@ -20,7 +33,12 @@
       ],
       "services": {
         "appinvite_service": {
-          "other_platform_oauth_client": []
+          "other_platform_oauth_client": [
+            {
+              "client_id": "551902347979-55n8b79u8nrs647b8lgo5vl2lsiq0iet.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
         }
       }
     }

@@ -17,6 +17,7 @@ dependencies:
   firebase_auth: ^6.5.3
   cloud_firestore: ^6.6.0
   google_sign_in: ^7.2.0
+  connectivity_plus: ^6.1.4
 
 dev_dependencies:
   flutter_test:
@@ -32,3 +33,9 @@ flutter:
     - family: Nunito
       fonts:
         - asset: assets/fonts/Nunito-VariableFont_wght.ttf
+    - family: NotoSerifJP
+      fonts:
+        - asset: assets/fonts/NotoSerifJP-Variable.ttf
+    - family: SourceHanSerifJP
+      fonts:
+        - asset: assets/fonts/SourceHanSerifJP-Regular.otf

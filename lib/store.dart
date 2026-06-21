@@ -2,6 +2,8 @@ import 'dart:convert';
 
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'cloud_change_tracker.dart';
+import 'local_word_search.dart';
 import 'models.dart';
 
 class ActiveStudy {
@@ -15,6 +17,7 @@ class ActiveStudy {
     this.bookId,
     this.lastWordId,
     this.lastState,
+    this.undoHistory = const [],
   });
 
   final List<int> queueIds;
@@ -26,6 +29,7 @@ class ActiveStudy {
   final List<int> sessionIndexes;
   final int? lastWordId;
   final StudyState? lastState;
+  final List<StudyDecision> undoHistory;
 
   Map<String, dynamic> toJson() => {
         'queueIds': queueIds,
@@ -37,6 +41,7 @@ class ActiveStudy {
         'sessionIndexes': sessionIndexes,
         'lastWordId': lastWordId,
         'lastState': lastState?.name,
+        'undoHistory': undoHistory.map((item) => item.toJson()).toList(),
       };
 
   factory ActiveStudy.fromJson(Map<String, dynamic> json) => ActiveStudy(
@@ -52,6 +57,39 @@ class ActiveStudy {
         lastState: StudyState.values
             .where((state) => state.name == json['lastState'])
             .firstOrNull,
+        undoHistory: (json['undoHistory'] as List<dynamic>? ?? [])
+            .map((item) => StudyDecision.fromJson(item as Map<String, dynamic>))
+            .toList(),
+      );
+}
+
+class StudyDecision {
+  const StudyDecision({
+    required this.wordId,
+    required this.previousState,
+    required this.decision,
+  });
+
+  final int wordId;
+  final StudyState previousState;
+  final StudyState decision;
+
+  Map<String, dynamic> toJson() => {
+        'wordId': wordId,
+        'previousState': previousState.name,
+        'decision': decision.name,
+      };
+
+  factory StudyDecision.fromJson(Map<String, dynamic> json) => StudyDecision(
+        wordId: json['wordId'] as int,
+        previousState: StudyState.values.firstWhere(
+          (state) => state.name == json['previousState'],
+          orElse: () => StudyState.fresh,
+        ),
+        decision: StudyState.values.firstWhere(
+          (state) => state.name == json['decision'],
+          orElse: () => StudyState.fresh,
+        ),
       );
 }
 
@@ -68,13 +106,24 @@ class VocaStore {
   static const _horizontalSwipeKey = 'horizontalSwipe';
   static const _reverseSwipeKey = 'reverseSwipe';
   static const _activeStudyKey = 'activeStudy';
+  static const _japaneseFontKey = 'japaneseFont';
+  static const _termFontSizeKey = 'termFontSize';
+  static const _readingFontSizeKey = 'readingFontSize';
+  static const _meaningFontSizeKey = 'meaningFontSize';
+  static const _exampleFontSizeKey = 'exampleFontSize';
+  static const _exampleMeaningFontSizeKey = 'exampleMeaningFontSize';
 
   final SharedPreferences _prefs;
   late List<WordBook> books;
+  late CloudChangeTracker cloudChanges;
+  late LocalWordSearchIndex wordSearch;
+  void Function()? onSessionCompleted;
 
   static Future<VocaStore> load() async {
     final store = VocaStore._(await SharedPreferences.getInstance());
     store.books = store._loadBooks();
+    store.cloudChanges = await CloudChangeTracker.load();
+    store.wordSearch = LocalWordSearchIndex(() => store.books);
     return store;
   }
 
@@ -86,6 +135,13 @@ class VocaStore {
   int get sessionSize => _prefs.getInt(_sessionSizeKey) ?? 10;
   bool get horizontalSwipe => _prefs.getBool(_horizontalSwipeKey) ?? false;
   bool get reverseSwipe => _prefs.getBool(_reverseSwipeKey) ?? false;
+  String get japaneseFont => _prefs.getString(_japaneseFontKey) ?? 'system';
+  double get termFontSize => _prefs.getDouble(_termFontSizeKey) ?? 32;
+  double get readingFontSize => _prefs.getDouble(_readingFontSizeKey) ?? 14;
+  double get meaningFontSize => _prefs.getDouble(_meaningFontSizeKey) ?? 22;
+  double get exampleFontSize => _prefs.getDouble(_exampleFontSizeKey) ?? 16;
+  double get exampleMeaningFontSize =>
+      _prefs.getDouble(_exampleMeaningFontSizeKey) ?? 14;
   String get targetName => _prefs.getString(_targetNameKey) ?? '';
   DateTime? get targetDate {
     final value = _prefs.getString(_targetDateKey);
@@ -173,21 +229,51 @@ class VocaStore {
     return List.of(sessions[nextSessionIndex(book)].words);
   }
 
-  Future<void> selectQuickBook(String id) async =>
-      _prefs.setString(_quickBookKey, id);
+  Future<void> selectQuickBook(String id) async {
+    await _prefs.setString(_quickBookKey, id);
+    await cloudChanges.markProfile();
+  }
 
   Future<void> setSessionSize(int value) async {
     await _prefs.setInt(_sessionSizeKey, value.clamp(5, 100).toInt());
     await _prefs.remove(_completedKey);
     await clearActiveStudy();
+    await cloudChanges.markProfile();
   }
 
   Future<void> setHorizontalSwipe(bool value) async {
     await _prefs.setBool(_horizontalSwipeKey, value);
+    await cloudChanges.markProfile();
   }
 
   Future<void> setReverseSwipe(bool value) async {
     await _prefs.setBool(_reverseSwipeKey, value);
+    await cloudChanges.markProfile();
+  }
+
+  Future<void> setJapaneseFont(String value) async {
+    const allowed = {'system', 'notoSerifJP', 'sourceHanSerifJP'};
+    await _prefs.setString(
+        _japaneseFontKey, allowed.contains(value) ? value : 'system');
+    await cloudChanges.markProfile();
+  }
+
+  Future<void> setCardFontSizes({
+    required double term,
+    required double reading,
+    required double meaning,
+    required double example,
+    required double exampleMeaning,
+  }) async {
+    await Future.wait([
+      _prefs.setDouble(_termFontSizeKey, term.clamp(20, 52).toDouble()),
+      _prefs.setDouble(_readingFontSizeKey, reading.clamp(10, 28).toDouble()),
+      _prefs.setDouble(_meaningFontSizeKey, meaning.clamp(14, 38).toDouble()),
+      _prefs.setDouble(_exampleFontSizeKey, example.clamp(11, 28).toDouble()),
+      _prefs.setDouble(
+          _exampleMeaningFontSizeKey, exampleMeaning.clamp(10, 26).toDouble()),
+    ]);
+    await cloudChanges.markProfile();
   }
 
   Future<void> setTarget(String name, DateTime? date) async {
@@ -197,6 +283,7 @@ class VocaStore {
     } else {
       await _prefs.setString(_targetDateKey, date.toIso8601String());
     }
+    await cloudChanges.markProfile();
   }
 
   Future<void> addBook(String name, List<Word> words) async {
@@ -206,13 +293,26 @@ class VocaStore {
       words: words,
     ));
     await _saveBooks();
+    wordSearch.invalidate();
+    final added = books.last;
+    await cloudChanges.markBook(added.id);
+    await cloudChanges.markWords(added.id, added.words.map((word) => word.id));
+    await cloudChanges.markProfile();
   }
 
   Future<void> updateBook(WordBook updated) async {
     final index = books.indexWhere((book) => book.id == updated.id);
     if (index < 0) return;
+    final previousWordIds = books[index].words.map((word) => word.id).toSet();
+    final updatedWordIds = updated.words.map((word) => word.id).toSet();
     books[index] = updated;
     await _saveBooks();
+    wordSearch.invalidate();
+    await cloudChanges.markBook(updated.id);
+    await cloudChanges.markWords(updated.id, updatedWordIds);
+    for (final removedId in previousWordIds.difference(updatedWordIds)) {
+      await cloudChanges.deleteWord(updated.id, removedId);
+    }
   }
 
   Future<void> updateWord(Word updated) async {
@@ -221,6 +321,8 @@ class VocaStore {
       if (index < 0) continue;
       book.words[index] = updated;
       await _saveBooks();
+      wordSearch.invalidate();
+      await cloudChanges.markWord(book.id, updated.id);
       return;
     }
   }
@@ -228,12 +330,22 @@ class VocaStore {
   Future<void> sortBooksByName() async {
     books.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
     await _saveBooks();
+    wordSearch.invalidate();
+    await cloudChanges.markProfile();
+    for (final book in books) {
+      await cloudChanges.markBook(book.id);
+    }
   }
 
   Future<void> reorderBooks(int oldIndex, int newIndex) async {
     final book = books.removeAt(oldIndex);
     books.insert(newIndex, book);
     await _saveBooks();
+    wordSearch.invalidate();
+    await cloudChanges.markProfile();
+    for (final reordered in books) {
+      await cloudChanges.markBook(reordered.id);
+    }
   }
 
   Future<void> completeSessions(String bookId, Iterable<int> indexes) async {
@@ -243,19 +355,30 @@ class VocaStore {
     final days = (_prefs.getStringList(_studyDaysKey) ?? []).toSet()
       ..add(_dayKey(DateTime.now()));
     await _prefs.setStringList(_studyDaysKey, days.toList());
+    await cloudChanges.markProfile();
+    onSessionCompleted?.call();
   }
 
   Future<void> deleteBook(String id) async {
     final wasSelected = quickBook.id == id;
+    final deleted = books.where((book) => book.id == id).firstOrNull;
     if (activeStudy?.bookId == id) await clearActiveStudy();
     books.removeWhere((book) => book.id == id && id != 'default');
     if (wasSelected) await selectQuickBook('default');
     await _saveBooks();
+    wordSearch.invalidate();
+    if (deleted != null && id != 'default') {
+      await cloudChanges.deleteBook(id, deleted.words.map((word) => word.id));
+    }
   }
 
   Future<void> mark(Word word, StudyState state) async {
     word.state = state;
     await _saveBooks();
+    final book = books
+        .where((candidate) => candidate.words.any((item) => item.id == word.id))
+        .firstOrNull;
+    if (book != null) await cloudChanges.markWord(book.id, word.id);
   }
 
   Future<void> completeCurrentSession() async {
@@ -265,6 +388,8 @@ class VocaStore {
     final days = (_prefs.getStringList(_studyDaysKey) ?? []).toSet()
       ..add(_dayKey(DateTime.now()));
     await _prefs.setStringList(_studyDaysKey, days.toList());
+    await cloudChanges.markProfile();
+    onSessionCompleted?.call();
   }
 
   Future<void> resetProgress() async {
@@ -277,6 +402,10 @@ class VocaStore {
     await _prefs.remove(_studyDaysKey);
     await clearActiveStudy();
     await _saveBooks();
+    await cloudChanges.markProfile();
+    for (final book in books) {
+      await cloudChanges.markWords(book.id, book.words.map((word) => word.id));
+    }
   }
 
   Map<String, dynamic> toBackupJson() => {
@@ -290,6 +419,14 @@ class VocaStore {
         'targetDate': _prefs.getString(_targetDateKey),
         'horizontalSwipe': horizontalSwipe,
         'reverseSwipe': reverseSwipe,
+        'japaneseFont': japaneseFont,
+        'cardFontSizes': {
+          'term': termFontSize,
+          'reading': readingFontSize,
+          'meaning': meaningFontSize,
+          'example': exampleFontSize,
+          'exampleMeaning': exampleMeaningFontSize,
+        },
       };
 
   Future<void> replaceWithBackupJson(Map<String, dynamic> json) async {
@@ -299,6 +436,7 @@ class VocaStore {
         .toList();
     books = decodedBooks.isEmpty ? [_defaultBook()] : decodedBooks;
     await _saveBooks();
+    wordSearch.invalidate();
 
     final quickBookId = json['quickBook'] as String? ?? 'default';
     await selectQuickBook(
@@ -323,6 +461,16 @@ class VocaStore {
         _horizontalSwipeKey, json['horizontalSwipe'] as bool? ?? false);
     await _prefs.setBool(
         _reverseSwipeKey, json['reverseSwipe'] as bool? ?? false);
+    await setJapaneseFont(json['japaneseFont'] as String? ?? 'system');
+    final fontSizes =
+        json['cardFontSizes'] as Map<String, dynamic>? ?? const {};
+    await setCardFontSizes(
+      term: (fontSizes['term'] as num?)?.toDouble() ?? 32,
+      reading: (fontSizes['reading'] as num?)?.toDouble() ?? 14,
+      meaning: (fontSizes['meaning'] as num?)?.toDouble() ?? 22,
+      example: (fontSizes['example'] as num?)?.toDouble() ?? 16,
+      exampleMeaning: (fontSizes['exampleMeaning'] as num?)?.toDouble() ?? 14,
+    );
     final targetDate = json['targetDate'] as String?;
     if (targetDate == null || DateTime.tryParse(targetDate) == null) {
       await _prefs.remove(_targetDateKey);

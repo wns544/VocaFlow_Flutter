@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -9,11 +10,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 
+import 'auto_backup.dart';
+import 'cloud_change_tracker.dart';
 import 'cloud_backup.dart';
 import 'csv_parser.dart';
 import 'excel_exporter.dart';
 import 'excel_parser.dart';
 import 'firebase_options.dart';
+import 'local_word_search.dart';
 import 'models.dart';
 import 'store.dart';
 
@@ -22,11 +26,34 @@ const sea = Color(0xFF34C759);
 const mist = Color(0xFFF2F2F7);
 const coral = Color(0xFFFF3B30);
 
+bool shuffleNewStudyQueues = true;
+
+List<T> shuffledStudyQueue<T>(Iterable<T> items, {Random? random}) =>
+    List<T>.of(items)..shuffle(random);
+
+String? japaneseFontFamily(VocaStore store) => switch (store.japaneseFont) {
+      'notoSerifJP' => 'NotoSerifJP',
+      'sourceHanSerifJP' => 'SourceHanSerifJP',
+      _ => null,
+    };
+
+bool isHanCharacter(String text) =>
+    RegExp(r'^[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]$').hasMatch(text);
+
+bool isBookCompleted(VocaStore store, WordBook book) {
+  final count = store.sessionCount(book);
+  return count > 0 && store.completedCount(book) == count;
+}
+
 var firebaseReady = false;
 Future<void>? _googleSignInInitFuture;
+const _googleServerClientId =
+    '551902347979-55n8b79u8nrs647b8lgo5vl2lsiq0iet.apps.googleusercontent.com';
 
 Future<void> ensureGoogleSignInInitialized() {
-  return _googleSignInInitFuture ??= GoogleSignIn.instance.initialize();
+  return _googleSignInInitFuture ??= GoogleSignIn.instance.initialize(
+    serverClientId: _googleServerClientId,
+  );
 }
 
 Future<void> main() async {
@@ -42,72 +69,107 @@ Future<void> main() async {
   runApp(const VocaFlowApp());
 }
 
-class VocaFlowApp extends StatelessWidget {
+class VocaFlowApp extends StatefulWidget {
   const VocaFlowApp({super.key});
 
   @override
-  Widget build(BuildContext context) => MaterialApp(
-        debugShowCheckedModeBanner: false,
-        title: 'VocaFlow',
-        theme: ThemeData(
-          useMaterial3: true,
-          colorScheme: ColorScheme.fromSeed(
-            seedColor: sea,
-            primary: sea,
-            secondary: coral,
-            surface: Colors.white,
-          ),
-          scaffoldBackgroundColor: mist,
-          fontFamily: 'Nunito',
-          cardTheme: const CardThemeData(
-            elevation: 0,
-            color: Colors.white,
-            margin: EdgeInsets.zero,
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.all(Radius.circular(16)),
-              side: BorderSide(color: Color(0x14000000)),
-            ),
-          ),
-          inputDecorationTheme: InputDecorationTheme(
-            filled: true,
-            fillColor: Colors.white,
-            border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(16),
-              borderSide: BorderSide.none,
-            ),
-          ),
-        ),
-        home: const _Bootstrap(),
-      );
+  State<VocaFlowApp> createState() => _VocaFlowAppState();
 }
 
-class _Bootstrap extends StatefulWidget {
-  const _Bootstrap();
-
-  @override
-  State<_Bootstrap> createState() => _BootstrapState();
-}
-
-class _BootstrapState extends State<_Bootstrap> {
+class _VocaFlowAppState extends State<VocaFlowApp> {
   VocaStore? store;
+  AutoBackupCoordinator? autoBackup;
 
   @override
   void initState() {
     super.initState();
     VocaStore.load().then((value) {
-      if (mounted) setState(() => store = value);
+      if (!mounted) return;
+      final coordinator = firebaseReady
+          ? AutoBackupCoordinator(
+              store: value,
+              onChanged: () {
+                if (mounted) setState(() {});
+              },
+            )
+          : null;
+      coordinator?.start();
+      setState(() {
+        store = value;
+        autoBackup = coordinator;
+      });
     });
   }
 
   @override
-  Widget build(BuildContext context) => store == null
-      ? const Scaffold(body: Center(child: CircularProgressIndicator()))
-      : MainShell(store: store!);
+  void dispose() {
+    autoBackup?.dispose();
+    super.dispose();
+  }
+
+  ThemeData get theme {
+    final base = ThemeData(
+      useMaterial3: true,
+      colorScheme: ColorScheme.fromSeed(
+        seedColor: sea,
+        primary: sea,
+        secondary: coral,
+        surface: Colors.white,
+      ),
+      scaffoldBackgroundColor: mist,
+      fontFamily: 'Nunito',
+      cardTheme: const CardThemeData(
+        elevation: 0,
+        color: Colors.white,
+        margin: EdgeInsets.zero,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.all(Radius.circular(16)),
+          side: BorderSide(color: Color(0x14000000)),
+        ),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: Colors.white,
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(16),
+          borderSide: BorderSide.none,
+        ),
+      ),
+    );
+    final japaneseFamily = store == null ? null : japaneseFontFamily(store!);
+    final fallback = japaneseFamily == null ? null : [japaneseFamily];
+    return base.copyWith(
+      textTheme: base.textTheme.apply(fontFamilyFallback: fallback),
+      primaryTextTheme:
+          base.primaryTextTheme.apply(fontFamilyFallback: fallback),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => MaterialApp(
+        debugShowCheckedModeBanner: false,
+        title: 'VocaFlow',
+        theme: theme,
+        home: store == null
+            ? const Scaffold(body: Center(child: CircularProgressIndicator()))
+            : MainShell(
+                store: store!,
+                autoBackup: autoBackup,
+                onChanged: () => setState(() {}),
+              ),
+      );
 }
 
 class MainShell extends StatefulWidget {
-  const MainShell({super.key, required this.store});
+  const MainShell({
+    super.key,
+    required this.store,
+    required this.onChanged,
+    this.autoBackup,
+  });
   final VocaStore store;
+  final VoidCallback onChanged;
+  final AutoBackupCoordinator? autoBackup;
 
   @override
   State<MainShell> createState() => _MainShellState();
@@ -142,14 +204,18 @@ class _MainShellState extends State<MainShell> {
     if (mounted) refresh();
   }
 
-  void refresh() => setState(() {});
+  void refresh() {
+    setState(() {});
+    widget.onChanged();
+  }
 
   @override
   Widget build(BuildContext context) {
     final pages = [
       HomePage(store: widget.store, refresh: refresh),
       BooksPage(store: widget.store, refresh: refresh),
-      SettingsPage(store: widget.store, refresh: refresh),
+      SettingsPage(
+          store: widget.store, refresh: refresh, autoBackup: widget.autoBackup),
     ];
     return Scaffold(
       body: SafeArea(child: IndexedStack(index: index, children: pages)),
@@ -406,6 +472,7 @@ class HomePage extends StatefulWidget {
 class _ReferenceHomePageState extends State<HomePage> {
   late String selectedBookId = widget.store.quickBook.id;
   final selectedSessions = <int>{};
+  final expandedFavoriteIds = <String>{};
 
   WordBook get book => widget.store.books.firstWhere(
         (item) => item.id == selectedBookId,
@@ -425,21 +492,14 @@ class _ReferenceHomePageState extends State<HomePage> {
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 28, 20, 12),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const Text('VOCAFLOW',
-            style: TextStyle(
-                color: sea,
-                fontSize: 11,
-                fontWeight: FontWeight.w800,
-                letterSpacing: 1.8)),
-        const SizedBox(height: 2),
         Row(children: [
           const Expanded(
-              child: Text('오늘도 단어 정복 💪',
+              child: Text('VOCAFLOW',
                   style: TextStyle(
-                      color: ink,
-                      fontSize: 24,
-                      height: 1.15,
-                      fontWeight: FontWeight.w800))),
+                      color: sea,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 1.8))),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
             decoration: BoxDecoration(
@@ -458,45 +518,6 @@ class _ReferenceHomePageState extends State<HomePage> {
             ]),
           ),
         ]),
-        const SizedBox(height: 12),
-        SizedBox(
-          height: 30,
-          child: ListView.separated(
-            scrollDirection: Axis.horizontal,
-            itemCount: widget.store.books.length,
-            separatorBuilder: (_, __) => const SizedBox(width: 8),
-            itemBuilder: (_, index) {
-              final item = widget.store.books[index];
-              final selected = item.id == selectedBookId;
-              return InkWell(
-                borderRadius: BorderRadius.circular(99),
-                onTap: () async {
-                  await widget.store.selectQuickBook(item.id);
-                  setState(() {
-                    selectedBookId = item.id;
-                    selectedSessions.clear();
-                  });
-                  widget.refresh();
-                },
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                  decoration: BoxDecoration(
-                      color: selected ? sea : Colors.white,
-                      border: Border.all(
-                          color: selected ? sea : const Color(0x14000000)),
-                      borderRadius: BorderRadius.circular(99)),
-                  child: Text(item.name,
-                      style: TextStyle(
-                          color: selected ? Colors.white : ink,
-                          fontSize: 12,
-                          height: 1,
-                          fontWeight: FontWeight.w800)),
-                ),
-              );
-            },
-          ),
-        ),
         const SizedBox(height: 12),
         Card(
           child: Padding(
@@ -568,6 +589,24 @@ class _ReferenceHomePageState extends State<HomePage> {
                 sessions.isEmpty ? null : () => _startNext(context, sessions),
           )),
         ]),
+        const SizedBox(height: 8),
+        SizedBox(
+          width: double.infinity,
+          height: 42,
+          child: OutlinedButton.icon(
+            key: const ValueKey('multi-session-study'),
+            onPressed:
+                sessions.isEmpty ? null : () => _chooseSessions(sessions),
+            icon: const Icon(Icons.playlist_add_check, size: 19),
+            label: const Text('여러 세션 골라 학습'),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: ink,
+              side: const BorderSide(color: Color(0xFFDADCE0)),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14)),
+            ),
+          ),
+        ),
         const SizedBox(height: 12),
         const Text('즐겨찾기 단어장',
             style: TextStyle(
@@ -590,41 +629,84 @@ class _ReferenceHomePageState extends State<HomePage> {
                   separatorBuilder: (_, __) => const SizedBox(height: 7),
                   itemBuilder: (_, index) {
                     final favorite = favoriteBooks[index];
-                    final selected = favorite.id == book.id;
                     final completedCount =
                         widget.store.completedCount(favorite);
                     final sessionCount = widget.store.sessionCount(favorite);
+                    final expanded = expandedFavoriteIds.contains(favorite.id);
+                    final favoriteSessions =
+                        favorite.sessions(widget.store.sessionSize);
                     return Card(
-                      color: selected ? const Color(0xFFF0FDF4) : Colors.white,
-                      child: SizedBox(
-                        height: 68,
-                        child: ListTile(
-                          dense: true,
-                          onTap: () => _selectFavorite(favorite),
-                          leading: CircleAvatar(
-                            radius: 16,
-                            backgroundColor: const Color(0x1A34C759),
-                            foregroundColor: sea,
-                            child:
-                                const Icon(Icons.menu_book_outlined, size: 16),
+                      key: ValueKey('favorite-book-card-${favorite.id}'),
+                      color: isBookCompleted(widget.store, favorite)
+                          ? const Color(0xFFEDEDED)
+                          : Colors.white,
+                      child: Column(children: [
+                        SizedBox(
+                          height: 68,
+                          child: ListTile(
+                            dense: true,
+                            onTap: () => setState(() => expanded
+                                ? expandedFavoriteIds.remove(favorite.id)
+                                : expandedFavoriteIds.add(favorite.id)),
+                            leading: CircleAvatar(
+                              radius: 16,
+                              backgroundColor: const Color(0x1A34C759),
+                              foregroundColor: sea,
+                              child: const Icon(Icons.menu_book_outlined,
+                                  size: 16),
+                            ),
+                            title: Text(favorite.name,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                    color: ink,
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w800)),
+                            subtitle: Text(
+                                '$completedCount/$sessionCount 세션 완료 · ${favorite.words.length}단어',
+                                style: const TextStyle(
+                                    color: Color(0xFF8E8E93), fontSize: 12)),
+                            trailing: IconButton(
+                              key: ValueKey('favorite-sessions-${favorite.id}'),
+                              tooltip: expanded ? '세션 접기' : '세션 펼치기',
+                              onPressed: () => setState(() => expanded
+                                  ? expandedFavoriteIds.remove(favorite.id)
+                                  : expandedFavoriteIds.add(favorite.id)),
+                              icon: AnimatedRotation(
+                                turns: expanded ? .5 : 0,
+                                duration: const Duration(milliseconds: 180),
+                                child: const Icon(Icons.keyboard_arrow_down,
+                                    color: Color(0xFF8E8E93), size: 20),
+                              ),
+                            ),
                           ),
-                          title: Text(favorite.name,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                  color: ink,
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.w800)),
-                          subtitle: Text(
-                              '$completedCount/$sessionCount 세션 완료 · ${favorite.words.length}단어',
-                              style: const TextStyle(
-                                  color: Color(0xFF8E8E93), fontSize: 12)),
-                          trailing: selected
-                              ? const Icon(Icons.check_circle,
-                                  color: sea, size: 18)
-                              : const Icon(Icons.chevron_right,
-                                  color: Color(0xFF8E8E93), size: 18),
                         ),
-                      ),
+                        if (expanded) ...[
+                          const Divider(height: 1),
+                          ...favoriteSessions.map((session) => Material(
+                                color: widget.store.isSessionCompleted(
+                                        favorite.id, session.index)
+                                    ? const Color(0xFFEDEDED)
+                                    : Colors.transparent,
+                                child: ListTile(
+                                  key: ValueKey(
+                                      'favorite-${favorite.id}-session-${session.index}'),
+                                  dense: true,
+                                  contentPadding: const EdgeInsets.only(
+                                      left: 58, right: 14),
+                                  title: Text(session.label,
+                                      style: const TextStyle(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w700)),
+                                  subtitle: Text(
+                                      '${session.memorizedCount}/${session.words.length} 단어'),
+                                  trailing: const Icon(Icons.play_arrow_rounded,
+                                      color: sea, size: 19),
+                                  onTap: () =>
+                                      _openFavoriteSession(favorite, session),
+                                ),
+                              )),
+                        ],
+                      ]),
                     );
                   },
                 ),
@@ -633,13 +715,21 @@ class _ReferenceHomePageState extends State<HomePage> {
     );
   }
 
-  Future<void> _selectFavorite(WordBook selected) async {
-    await widget.store.selectQuickBook(selected.id);
+  Future<void> _openFavoriteSession(
+      WordBook favorite, StudySession session) async {
+    await widget.store.selectQuickBook(favorite.id);
     if (!mounted) return;
-    setState(() {
-      selectedBookId = selected.id;
-      selectedSessions.clear();
-    });
+    setState(() => selectedBookId = favorite.id);
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => CardStudyPage(
+        store: widget.store,
+        words: session.words,
+        bookId: favorite.id,
+        sessionIndexes: [session.index],
+      ),
+    ));
+    if (!mounted) return;
+    setState(() {});
     widget.refresh();
   }
 
@@ -650,6 +740,96 @@ class _ReferenceHomePageState extends State<HomePage> {
     selectedSessions
       ..clear()
       ..add(next.index);
+    await _openSelected(context);
+  }
+
+  Future<void> _chooseSessions(List<StudySession> sessions) async {
+    final chosen = <int>{};
+    final result = await showModalBottomSheet<List<int>>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setModalState) {
+          final wordCount = sessions
+              .where((session) => chosen.contains(session.index))
+              .fold(0, (total, session) => total + session.words.length);
+          return FractionallySizedBox(
+            heightFactor: .76,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(18, 0, 18, 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('여러 세션 골라 학습',
+                      style:
+                          TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+                  const SizedBox(height: 4),
+                  Text(book.name,
+                      style: const TextStyle(
+                          color: Color(0xFF8E8E93), fontSize: 12)),
+                  const SizedBox(height: 12),
+                  Expanded(
+                    child: ListView.separated(
+                      itemCount: sessions.length,
+                      separatorBuilder: (_, __) => const Divider(height: 1),
+                      itemBuilder: (context, index) {
+                        final session = sessions[index];
+                        final completed = widget.store
+                            .isSessionCompleted(book.id, session.index);
+                        return Material(
+                          color: completed
+                              ? const Color(0xFFEDEDED)
+                              : Colors.transparent,
+                          child: CheckboxListTile(
+                            key: ValueKey('multi-session-${session.index}'),
+                            value: chosen.contains(session.index),
+                            onChanged: (selected) => setModalState(() {
+                              if (selected == true) {
+                                chosen.add(session.index);
+                              } else {
+                                chosen.remove(session.index);
+                              }
+                            }),
+                            controlAffinity: ListTileControlAffinity.leading,
+                            title: Text(session.label,
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.w700)),
+                            subtitle: Text(
+                                '${session.words.length}개 단어${completed ? ' · 학습 완료' : ''}'),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 48,
+                    child: FilledButton.icon(
+                      key: const ValueKey('start-multi-session-study'),
+                      onPressed: chosen.isEmpty
+                          ? null
+                          : () =>
+                              Navigator.pop(context, chosen.toList()..sort()),
+                      icon: const Icon(Icons.style, size: 19),
+                      label: Text(chosen.isEmpty
+                          ? '세션을 선택하세요'
+                          : '${chosen.length}개 세션 · $wordCount개 단어 학습'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+    if (result == null || result.isEmpty || !mounted) return;
+    selectedSessions
+      ..clear()
+      ..addAll(result);
     await _openSelected(context);
   }
 
@@ -766,6 +946,7 @@ class _CardStudyPageState extends State<CardStudyPage>
   var exiting = false;
   Word? lastWord;
   StudyState? lastState;
+  final undoHistory = <StudyDecision>[];
 
   bool get horizontalSwipe => widget.store.horizontalSwipe;
   String? get activeBookId => widget.resume?.bookId ?? widget.bookId;
@@ -784,7 +965,10 @@ class _CardStudyPageState extends State<CardStudyPage>
     WidgetsBinding.instance.addObserver(this);
     final resume = widget.resume;
     if (resume == null) {
-      queue = List.of(widget.words ?? widget.store.nextWords());
+      final words = widget.words ?? widget.store.nextWords();
+      queue = shuffleNewStudyQueues
+          ? shuffledStudyQueue(words)
+          : List<Word>.of(words);
       total = queue.length;
     } else {
       queue = widget.store.resolveActiveWords(resume);
@@ -793,6 +977,16 @@ class _CardStudyPageState extends State<CardStudyPage>
       reviewed.addAll(resume.reviewed);
       revealed = resume.revealed;
       lastState = resume.lastState;
+      undoHistory.addAll(resume.undoHistory);
+      if (undoHistory.isEmpty &&
+          resume.lastWordId != null &&
+          resume.lastState != null) {
+        undoHistory.add(StudyDecision(
+          wordId: resume.lastWordId!,
+          previousState: StudyState.fresh,
+          decision: resume.lastState!,
+        ));
+      }
       if (resume.lastWordId != null) {
         lastWord = widget.store.books
             .expand((book) => book.words)
@@ -831,6 +1025,7 @@ class _CardStudyPageState extends State<CardStudyPage>
       sessionIndexes: activeSessionIndexes,
       lastWordId: lastWord?.id,
       lastState: lastState,
+      undoHistory: undoHistory,
     ));
   }
 
@@ -847,8 +1042,14 @@ class _CardStudyPageState extends State<CardStudyPage>
   Future<void> decide(StudyState state) async {
     if (queue.isEmpty) return;
     final word = queue.removeAt(0);
+    final previousState = word.state;
     lastWord = word;
     lastState = state;
+    undoHistory.add(StudyDecision(
+      wordId: word.id,
+      previousState: previousState,
+      decision: state,
+    ));
     if (state == StudyState.memorized) {
       memorized++;
     } else {
@@ -910,13 +1111,13 @@ class _CardStudyPageState extends State<CardStudyPage>
     });
   }
 
-  Future<void> copyTerm(Word word) async {
-    await Clipboard.setData(ClipboardData(text: word.term));
+  Future<void> copyText(String text) async {
+    await Clipboard.setData(ClipboardData(text: text));
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('단어를 클립보드에 복사했습니다.'),
-        duration: Duration(milliseconds: 1200),
+      SnackBar(
+        content: Text('“$text” 복사 완료'),
+        duration: const Duration(milliseconds: 1000),
       ),
     );
   }
@@ -933,6 +1134,16 @@ class _CardStudyPageState extends State<CardStudyPage>
     if (mounted) setState(() {});
   }
 
+  Future<void> editCardFontSizes() async {
+    if (queue.isEmpty) return;
+    final changed = await showCardFontSizeEditor(
+      context,
+      widget.store,
+      previewWord: queue.first,
+    );
+    if (changed && mounted) setState(() {});
+  }
+
   Widget cardFace(Word word, bool back) => Padding(
         padding: const EdgeInsets.all(26),
         child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
@@ -944,51 +1155,70 @@ class _CardStudyPageState extends State<CardStudyPage>
                       back ? const Color(0xFFBFDBFE) : const Color(0xFFE5E5EA),
                   borderRadius: BorderRadius.circular(99))),
           const SizedBox(height: 34),
-          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            Flexible(
-              child: Text(word.term,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                      color: ink, fontSize: 32, fontWeight: FontWeight.w800)),
-            ),
-            const SizedBox(width: 5),
-            IconButton(
-              key: const ValueKey('copy-word'),
-              tooltip: '단어 복사',
-              visualDensity: VisualDensity.compact,
-              onPressed: () => copyTerm(word),
-              icon: const Icon(Icons.copy_outlined,
-                  size: 18, color: Color(0xFF8E8E93)),
-            ),
-          ]),
+          Center(
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              const SizedBox(width: 40),
+              Flexible(
+                child: _TappableHanTerm(
+                  term: word.term,
+                  style: TextStyle(
+                      color: ink,
+                      fontSize: widget.store.termFontSize,
+                      fontFamily: japaneseFontFamily(widget.store),
+                      fontWeight: FontWeight.w800),
+                  onCharacterTap: copyText,
+                ),
+              ),
+              SizedBox(
+                width: 40,
+                child: IconButton(
+                  key: const ValueKey('copy-word'),
+                  tooltip: '단어 복사',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () => copyText(word.term),
+                  icon: const Icon(Icons.copy_outlined,
+                      size: 18, color: Color(0xFF8E8E93)),
+                ),
+              ),
+            ]),
+          ),
           const SizedBox(height: 12),
           if (back) ...[
             Text(word.meaning,
                 textAlign: TextAlign.center,
-                style:
-                    const TextStyle(fontSize: 22, fontWeight: FontWeight.w700)),
+                style: TextStyle(
+                    fontSize: widget.store.meaningFontSize,
+                    fontFamily: japaneseFontFamily(widget.store),
+                    fontWeight: FontWeight.w700)),
             const SizedBox(height: 8),
             Text(word.reading,
-                style: const TextStyle(
-                    color: Color(0xFF8E8E93),
-                    fontSize: 14,
-                    fontFamily: 'monospace')),
+                style: TextStyle(
+                    color: const Color(0xFF8E8E93),
+                    fontSize: widget.store.readingFontSize,
+                    fontFamily:
+                        japaneseFontFamily(widget.store) ?? 'monospace')),
             if (word.example.isNotEmpty) ...[
               const SizedBox(height: 28),
               Text(word.example,
                   textAlign: TextAlign.center,
-                  style: const TextStyle(fontSize: 16)),
+                  style: TextStyle(
+                      fontSize: widget.store.exampleFontSize,
+                      fontFamily: japaneseFontFamily(widget.store))),
               const SizedBox(height: 6),
               Text(word.exampleMeaning,
                   textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.black54)),
+                  style: TextStyle(
+                      color: Colors.black54,
+                      fontSize: widget.store.exampleMeaningFontSize,
+                      fontFamily: japaneseFontFamily(widget.store))),
             ],
           ] else
             Text(word.reading,
-                style: const TextStyle(
-                    color: Color(0xFF8E8E93),
-                    fontSize: 14,
-                    fontFamily: 'monospace')),
+                style: TextStyle(
+                    color: const Color(0xFF8E8E93),
+                    fontSize: widget.store.readingFontSize,
+                    fontFamily:
+                        japaneseFontFamily(widget.store) ?? 'monospace')),
           const Spacer(),
           Text(back ? '탭하여 앞면 보기' : '탭하여 뒤집기',
               style: const TextStyle(color: Color(0x338E8E93), fontSize: 11)),
@@ -996,14 +1226,30 @@ class _CardStudyPageState extends State<CardStudyPage>
       );
 
   Future<void> undo() async {
-    if (lastWord == null || lastState == null) return;
-    queue.remove(lastWord);
-    queue.insert(0, lastWord!);
-    if (lastState == StudyState.memorized) memorized--;
-    if (lastState == StudyState.review) reviewed.remove(lastWord!.term);
-    await widget.store.mark(lastWord!, StudyState.fresh);
-    lastWord = null;
-    lastState = null;
+    if (undoHistory.isEmpty) return;
+    final undone = undoHistory.removeLast();
+    final word = widget.store.books
+        .expand((book) => book.words)
+        .where((item) => item.id == undone.wordId)
+        .firstOrNull;
+    if (word == null) return;
+    queue.removeWhere((item) => item.id == word.id);
+    queue.insert(0, word);
+    if (undone.decision == StudyState.memorized) memorized--;
+    if (undone.decision == StudyState.review &&
+        !undoHistory.any((item) =>
+            item.wordId == word.id && item.decision == StudyState.review)) {
+      reviewed.remove(word.term);
+    }
+    await widget.store.mark(word, undone.previousState);
+    final previous = undoHistory.lastOrNull;
+    lastWord = previous == null
+        ? null
+        : widget.store.books
+            .expand((book) => book.words)
+            .where((item) => item.id == previous.wordId)
+            .firstOrNull;
+    lastState = previous?.decision;
     await persistStudy();
     if (mounted) setState(() {});
   }
@@ -1033,7 +1279,7 @@ class _CardStudyPageState extends State<CardStudyPage>
     final dragProgress = (dragY.abs() / 150).clamp(0.0, 1.0);
     final dragState = dragY == 0 ? null : stateForDirection(dragY > 0);
     final dragColor = dragState == StudyState.memorized
-        ? Color.lerp(Colors.white, const Color(0xFFE3F8E9), dragProgress)!
+        ? Color.lerp(Colors.white, const Color(0xFFCFF2D8), dragProgress)!
         : dragState == StudyState.review
             ? Color.lerp(Colors.white, const Color(0xFFFFE8E6), dragProgress)!
             : Colors.white;
@@ -1080,7 +1326,11 @@ class _CardStudyPageState extends State<CardStudyPage>
                       icon: Icons.edit_outlined, onTap: editCurrentWord),
                   const SizedBox(width: 6),
                   _RoundIconButton(
-                      icon: Icons.undo, onTap: lastWord == null ? null : undo),
+                      icon: Icons.format_size, onTap: editCardFontSizes),
+                  const SizedBox(width: 6),
+                  _RoundIconButton(
+                      icon: Icons.undo,
+                      onTap: undoHistory.isEmpty ? null : undo),
                 ]),
                 const SizedBox(height: 10),
                 LinearProgressIndicator(
@@ -1122,27 +1372,21 @@ class _CardStudyPageState extends State<CardStudyPage>
                       if (nextWord != null)
                         Positioned.fill(
                           child: IgnorePointer(
-                            child: Transform.translate(
-                              offset: const Offset(0, 10),
-                              child: Transform.scale(
-                                scale: .965,
-                                child: Container(
-                                  key: const ValueKey('next-study-card'),
-                                  decoration: BoxDecoration(
-                                    color: Colors.white,
-                                    borderRadius: BorderRadius.circular(24),
-                                    border: Border.all(
-                                        color: const Color(0x14000000)),
-                                    boxShadow: const [
-                                      BoxShadow(
-                                          color: Color(0x10000000),
-                                          blurRadius: 14,
-                                          offset: Offset(0, 7))
-                                    ],
-                                  ),
-                                  child: cardFace(nextWord, false),
-                                ),
+                            child: Container(
+                              key: const ValueKey('next-study-card'),
+                              decoration: BoxDecoration(
+                                color: Colors.white,
+                                borderRadius: BorderRadius.circular(24),
+                                border:
+                                    Border.all(color: const Color(0x14000000)),
+                                boxShadow: const [
+                                  BoxShadow(
+                                      color: Color(0x10000000),
+                                      blurRadius: 14,
+                                      offset: Offset(0, 7))
+                                ],
                               ),
+                              child: cardFace(nextWord, false),
                             ),
                           ),
                         ),
@@ -1182,6 +1426,7 @@ class _CardStudyPageState extends State<CardStudyPage>
                             onHorizontalDragEnd:
                                 horizontalSwipe ? finishDrag : null,
                             child: TweenAnimationBuilder<double>(
+                              key: ValueKey('active-card-${word.id}'),
                               tween: Tween(begin: 0, end: revealed ? pi : 0),
                               duration: const Duration(milliseconds: 420),
                               curve: Curves.easeInOutCubic,
@@ -1274,6 +1519,46 @@ class _RoundIconButton extends StatelessWidget {
               child: Icon(icon, color: const Color(0xFF8E8E93), size: 17)),
         ),
       );
+}
+
+class _TappableHanTerm extends StatelessWidget {
+  const _TappableHanTerm({
+    required this.term,
+    required this.style,
+    required this.onCharacterTap,
+  });
+
+  final String term;
+  final TextStyle style;
+  final ValueChanged<String> onCharacterTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final characters = term.runes.map(String.fromCharCode).toList();
+    return Text.rich(
+      key: const ValueKey('tappable-study-term'),
+      TextSpan(
+        style: style,
+        children: [
+          for (var index = 0; index < characters.length; index++)
+            if (isHanCharacter(characters[index]))
+              WidgetSpan(
+                alignment: PlaceholderAlignment.baseline,
+                baseline: TextBaseline.alphabetic,
+                child: GestureDetector(
+                  key: ValueKey('copy-han-$index'),
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => onCharacterTap(characters[index]),
+                  child: Text(characters[index], style: style),
+                ),
+              )
+            else
+              TextSpan(text: characters[index]),
+        ],
+      ),
+      textAlign: TextAlign.center,
+    );
+  }
 }
 
 class _SwipeHint extends StatelessWidget {
@@ -1599,35 +1884,56 @@ class _BooksPageState extends State<BooksPage> {
   var editMode = false;
   var searchQuery = '';
   final searchController = TextEditingController();
+  final expandedBookIds = <String>{};
+  Timer? searchTimer;
+  late WordSearchSession searchSession;
+  List<WordSearchHit> searchResults = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    searchSession = widget.store.wordSearch.createSession();
+  }
+
+  @override
+  void didUpdateWidget(covariant BooksPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.store, widget.store)) {
+      searchSession = widget.store.wordSearch.createSession();
+      searchResults = const [];
+    }
+  }
 
   @override
   void dispose() {
+    searchTimer?.cancel();
     searchController.dispose();
     super.dispose();
   }
 
-  List<(WordBook, Word)> get searchResults {
-    final query = searchQuery.trim().toLowerCase();
-    if (query.isEmpty) return [];
-    return [
-      for (final book in widget.store.books)
-        for (final word in book.words)
-          if ([
-            book.name,
-            word.term,
-            word.reading,
-            word.meaning,
-            word.example,
-            word.exampleMeaning,
-          ].any((value) => value.toLowerCase().contains(query)))
-            (book, word),
-    ];
+  void onSearchChanged(String value) {
+    searchTimer?.cancel();
+    setState(() => searchQuery = value);
+    if (value.trim().isEmpty) {
+      searchSession.reset();
+      setState(() => searchResults = const []);
+      return;
+    }
+    searchTimer = Timer(const Duration(milliseconds: 120), runSearch);
+  }
+
+  void runSearch() {
+    final results = searchSession.search(searchQuery);
+    if (mounted) setState(() => searchResults = results);
   }
 
   void startCustomOrder() {
+    searchTimer?.cancel();
     searchController.clear();
+    searchSession.reset();
     setState(() {
       searchQuery = '';
+      searchResults = const [];
       editMode = true;
     });
   }
@@ -1635,7 +1941,7 @@ class _BooksPageState extends State<BooksPage> {
   Future<void> sortByName() async {
     await widget.store.sortBooksByName();
     if (!mounted) return;
-    setState(() {});
+    if (searchQuery.trim().isNotEmpty) runSearch();
     widget.refresh();
   }
 
@@ -1644,7 +1950,7 @@ class _BooksPageState extends State<BooksPage> {
     if (!mounted || updated == null) return;
     await widget.store.updateWord(updated);
     if (!mounted) return;
-    setState(() {});
+    if (searchQuery.trim().isNotEmpty) runSearch();
     widget.refresh();
   }
 
@@ -1654,7 +1960,7 @@ class _BooksPageState extends State<BooksPage> {
     book.name = name.trim();
     await widget.store.updateBook(book);
     if (!mounted) return;
-    setState(() {});
+    if (searchQuery.trim().isNotEmpty) runSearch();
     widget.refresh();
   }
 
@@ -1689,7 +1995,7 @@ class _BooksPageState extends State<BooksPage> {
     if (!mounted || confirmed != true) return;
     await widget.store.deleteBook(book.id);
     if (!mounted) return;
-    setState(() {});
+    if (searchQuery.trim().isNotEmpty) runSearch();
     widget.refresh();
   }
 
@@ -1772,79 +2078,148 @@ class _BooksPageState extends State<BooksPage> {
     if (mounted) setState(() {});
   }
 
+  Future<void> openSession(WordBook book, int sessionIndex) async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => WordListPage(
+          store: widget.store,
+          bookId: book.id,
+          sessionIndex: sessionIndex,
+        ),
+      ),
+    );
+    if (mounted) setState(() {});
+  }
+
   Widget bookCard(WordBook book, int index) => Padding(
         key: ValueKey(book.id),
         padding: const EdgeInsets.only(bottom: 10),
         child: Card(
-          child: SizedBox(
-            height: 76,
-            child: ListTile(
-              contentPadding: const EdgeInsets.symmetric(horizontal: 16),
-              leading: Container(
-                  width: 40,
-                  height: 40,
-                  decoration: BoxDecoration(
-                      color: const Color(0x1A34C759),
-                      borderRadius: BorderRadius.circular(12)),
-                  child: const Icon(Icons.menu_book_outlined,
-                      color: sea, size: 20)),
-              title: Text(book.name,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                      fontSize: 14, fontWeight: FontWeight.w800)),
-              subtitle: Text(
-                  '${book.words.length}단어 · ${widget.store.sessionCount(book)}세션',
-                  style:
-                      const TextStyle(color: Color(0xFF8E8E93), fontSize: 11)),
-              trailing: editMode
-                  ? Row(mainAxisSize: MainAxisSize.min, children: [
-                      IconButton(
-                          visualDensity: VisualDensity.compact,
-                          constraints: const BoxConstraints.tightFor(
-                              width: 34, height: 40),
-                          onPressed: () => renameBook(book),
-                          icon: const Icon(Icons.edit_outlined,
-                              size: 18, color: Color(0xFF8E8E93))),
-                      if (book.id != 'default')
+          key: ValueKey('book-card-${book.id}'),
+          color: isBookCompleted(widget.store, book)
+              ? const Color(0xFFEDEDED)
+              : Colors.white,
+          child: Column(children: [
+            SizedBox(
+              height: 76,
+              child: ListTile(
+                contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+                leading: Container(
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                        color: const Color(0x1A34C759),
+                        borderRadius: BorderRadius.circular(12)),
+                    child: const Icon(Icons.menu_book_outlined,
+                        color: sea, size: 20)),
+                title: Text(book.name,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                        fontSize: 14, fontWeight: FontWeight.w800)),
+                subtitle: Text(
+                    '${book.words.length}단어 · ${widget.store.sessionCount(book)}세션',
+                    style: const TextStyle(
+                        color: Color(0xFF8E8E93), fontSize: 11)),
+                trailing: editMode
+                    ? Row(mainAxisSize: MainAxisSize.min, children: [
                         IconButton(
                             visualDensity: VisualDensity.compact,
                             constraints: const BoxConstraints.tightFor(
                                 width: 34, height: 40),
-                            onPressed: () => confirmDelete(book),
-                            icon: const Icon(Icons.delete_outline,
-                                size: 18, color: coral)),
-                      ReorderableDragStartListener(
-                        index: index,
-                        child: const SizedBox(
-                            width: 30,
-                            height: 40,
-                            child: Icon(Icons.drag_handle,
-                                size: 20, color: Color(0xFF8E8E93))),
-                      ),
-                    ])
-                  : Row(mainAxisSize: MainAxisSize.min, children: [
-                      IconButton(
-                        key: ValueKey('favorite-${book.id}'),
-                        tooltip: book.isFavorite ? '즐겨찾기 해제' : '즐겨찾기',
-                        visualDensity: VisualDensity.compact,
-                        constraints: const BoxConstraints.tightFor(
-                            width: 38, height: 40),
-                        onPressed: () => toggleFavorite(book),
-                        icon: Icon(
-                          book.isFavorite ? Icons.star : Icons.star_border,
-                          size: 21,
-                          color: book.isFavorite
-                              ? const Color(0xFFFFB800)
-                              : const Color(0xFF8E8E93),
+                            onPressed: () => renameBook(book),
+                            icon: const Icon(Icons.edit_outlined,
+                                size: 18, color: Color(0xFF8E8E93))),
+                        if (book.id != 'default')
+                          IconButton(
+                              visualDensity: VisualDensity.compact,
+                              constraints: const BoxConstraints.tightFor(
+                                  width: 34, height: 40),
+                              onPressed: () => confirmDelete(book),
+                              icon: const Icon(Icons.delete_outline,
+                                  size: 18, color: coral)),
+                        ReorderableDragStartListener(
+                          index: index,
+                          child: const SizedBox(
+                              width: 30,
+                              height: 40,
+                              child: Icon(Icons.drag_handle,
+                                  size: 20, color: Color(0xFF8E8E93))),
                         ),
-                      ),
-                      const Icon(Icons.chevron_right,
-                          size: 19, color: Color(0xFF8E8E93)),
-                    ]),
-              onTap: editMode ? null : () => openBook(book),
-              onLongPress: editMode ? null : importFile,
+                      ])
+                    : Row(mainAxisSize: MainAxisSize.min, children: [
+                        IconButton(
+                          key: ValueKey('favorite-${book.id}'),
+                          tooltip: book.isFavorite ? '즐겨찾기 해제' : '즐겨찾기',
+                          visualDensity: VisualDensity.compact,
+                          constraints: const BoxConstraints.tightFor(
+                              width: 38, height: 40),
+                          onPressed: () => toggleFavorite(book),
+                          icon: Icon(
+                            book.isFavorite ? Icons.star : Icons.star_border,
+                            size: 21,
+                            color: book.isFavorite
+                                ? const Color(0xFFFFB800)
+                                : const Color(0xFF8E8E93),
+                          ),
+                        ),
+                        AnimatedRotation(
+                          turns: expandedBookIds.contains(book.id) ? .5 : 0,
+                          duration: const Duration(milliseconds: 180),
+                          child: const Icon(Icons.keyboard_arrow_down,
+                              size: 20, color: Color(0xFF8E8E93)),
+                        ),
+                      ]),
+                onTap: editMode
+                    ? null
+                    : () => setState(() => expandedBookIds.contains(book.id)
+                        ? expandedBookIds.remove(book.id)
+                        : expandedBookIds.add(book.id)),
+                onLongPress: editMode ? null : importFile,
+              ),
             ),
-          ),
+            AnimatedSize(
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeOutCubic,
+              alignment: Alignment.topCenter,
+              child: !expandedBookIds.contains(book.id) || editMode
+                  ? const SizedBox.shrink()
+                  : Column(children: [
+                      const Divider(height: 1),
+                      ...book.sessions(widget.store.sessionSize).map(
+                            (session) => Material(
+                              color: widget.store.isSessionCompleted(
+                                      book.id, session.index)
+                                  ? const Color(0xFFEDEDED)
+                                  : Colors.transparent,
+                              child: ListTile(
+                                key: ValueKey(
+                                    'book-${book.id}-session-${session.index}'),
+                                dense: true,
+                                contentPadding:
+                                    const EdgeInsets.only(left: 58, right: 14),
+                                title: Text(session.label,
+                                    style: const TextStyle(
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w700)),
+                                subtitle: Text(
+                                    '${session.memorizedCount}/${session.words.length} 단어'),
+                                trailing: const Icon(Icons.chevron_right,
+                                    color: Color(0xFF8E8E93), size: 18),
+                                onTap: () => openSession(book, session.index),
+                              ),
+                            ),
+                          ),
+                      const Divider(height: 1),
+                      TextButton.icon(
+                        onPressed: () => openBook(book),
+                        icon: const Icon(Icons.menu_book_outlined, size: 17),
+                        label: const Text('단어장 전체 보기'),
+                      ),
+                      const SizedBox(height: 4),
+                    ]),
+            ),
+          ]),
         ),
       );
 
@@ -1858,7 +2233,9 @@ class _BooksPageState extends State<BooksPage> {
       itemCount: results.length,
       separatorBuilder: (_, __) => const SizedBox(height: 8),
       itemBuilder: (context, index) {
-        final (book, word) = results[index];
+        final hit = results[index];
+        final book = hit.book;
+        final word = hit.word;
         return Card(
           child: ListTile(
             key: ValueKey('global-search-result-${word.id}'),
@@ -1971,7 +2348,7 @@ class _BooksPageState extends State<BooksPage> {
             key: const ValueKey('global-word-search'),
             controller: searchController,
             enabled: !editMode,
-            onChanged: (value) => setState(() => searchQuery = value),
+            onChanged: onSearchChanged,
             decoration: InputDecoration(
               hintText: editMode ? '드래그 손잡이로 순서를 바꾸세요' : '전체 단어장에서 검색',
               prefixIcon:
@@ -2028,6 +2405,22 @@ class BookDetailPage extends StatefulWidget {
 
 class _BookDetailPageState extends State<BookDetailPage> {
   var searchQuery = '';
+  Timer? searchTimer;
+  late WordSearchSession searchSession;
+  List<Word> searchResults = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    searchSession =
+        widget.store.wordSearch.createSession(bookId: widget.bookId);
+  }
+
+  @override
+  void dispose() {
+    searchTimer?.cancel();
+    super.dispose();
+  }
 
   WordBook get book =>
       widget.store.books.firstWhere((item) => item.id == widget.bookId);
@@ -2037,19 +2430,31 @@ class _BookDetailPageState extends State<BookDetailPage> {
     if (!mounted || updated == null) return;
     await widget.store.updateWord(updated);
     widget.onChanged();
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    if (searchQuery.trim().isNotEmpty) {
+      runSearch();
+    } else {
+      setState(() {});
+    }
   }
 
-  bool matchesSearch(Word word) {
-    final query = searchQuery.trim().toLowerCase();
-    if (query.isEmpty) return true;
-    return [
-      word.term,
-      word.reading,
-      word.meaning,
-      word.example,
-      word.exampleMeaning,
-    ].any((value) => value.toLowerCase().contains(query));
+  void onSearchChanged(String value) {
+    searchTimer?.cancel();
+    setState(() => searchQuery = value);
+    if (value.trim().isEmpty) {
+      searchSession.reset();
+      setState(() => searchResults = const []);
+      return;
+    }
+    searchTimer = Timer(const Duration(milliseconds: 120), runSearch);
+  }
+
+  void runSearch() {
+    final results = searchSession
+        .search(searchQuery)
+        .map((hit) => hit.word)
+        .toList(growable: false);
+    if (mounted) setState(() => searchResults = results);
   }
 
   Future<void> rename() async {
@@ -2146,7 +2551,6 @@ class _BookDetailPageState extends State<BookDetailPage> {
   @override
   Widget build(BuildContext context) {
     final sessions = book.sessions(widget.store.sessionSize);
-    final searchResults = book.words.where(matchesSearch).toList();
     return Scaffold(
       appBar: AppBar(
         title: GestureDetector(
@@ -2174,7 +2578,7 @@ class _BookDetailPageState extends State<BookDetailPage> {
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
           child: TextField(
             key: const ValueKey('word-search'),
-            onChanged: (value) => setState(() => searchQuery = value),
+            onChanged: onSearchChanged,
             decoration: const InputDecoration(
               hintText: '단어·뜻·발음·예문 검색',
               prefixIcon: Icon(Icons.search),
@@ -2545,10 +2949,16 @@ class LegacySettingsPage extends StatelessWidget {
 }
 
 class SettingsPage extends StatefulWidget {
-  const SettingsPage({super.key, required this.store, required this.refresh});
+  const SettingsPage({
+    super.key,
+    required this.store,
+    required this.refresh,
+    this.autoBackup,
+  });
 
   final VocaStore store;
   final VoidCallback refresh;
+  final AutoBackupCoordinator? autoBackup;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -2557,6 +2967,19 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   var signingIn = false;
   var syncing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted &&
+          firebaseReady &&
+          FirebaseAuth.instance.currentUser != null &&
+          widget.autoBackup?.initialized == false) {
+        _setupAutoBackupAfterLogin();
+      }
+    });
+  }
 
   Future<void> signInWithGoogle() async {
     if (!firebaseReady) {
@@ -2575,7 +2998,10 @@ class _SettingsPageState extends State<SettingsPage> {
         idToken: googleAuth.idToken,
       );
       await FirebaseAuth.instance.signInWithCredential(credential);
-      if (mounted) setState(() {});
+      if (mounted) {
+        setState(() {});
+        await _setupAutoBackupAfterLogin();
+      }
     } on GoogleSignInException catch (error) {
       if (!mounted ||
           error.code == GoogleSignInExceptionCode.canceled ||
@@ -2603,6 +3029,64 @@ class _SettingsPageState extends State<SettingsPage> {
     if (mounted) setState(() {});
   }
 
+  Future<void> _setupAutoBackupAfterLogin() async {
+    final coordinator = widget.autoBackup;
+    if (coordinator == null || coordinator.initialized) return;
+    setState(() => syncing = true);
+    try {
+      final hasCloud = await coordinator.hasCloudBackup();
+      if (!mounted) return;
+      InitialSyncChoice? choice;
+      if (hasCloud) {
+        choice = await showDialog<InitialSyncChoice>(
+          context: context,
+          barrierDismissible: false,
+          builder: (context) => AlertDialog(
+            title: const Text('자동 백업 처음 설정'),
+            content: const Text(
+              '이 계정에 기존 백업이 있습니다. 이 기기의 데이터와 어떻게 맞출까요?',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('취소'),
+              ),
+              OutlinedButton(
+                onPressed: () =>
+                    Navigator.pop(context, InitialSyncChoice.merge),
+                child: const Text('클라우드 + 이 기기 합치기'),
+              ),
+              FilledButton(
+                onPressed: () =>
+                    Navigator.pop(context, InitialSyncChoice.cloudReplace),
+                child: const Text('클라우드로 이 기기 교체'),
+              ),
+            ],
+          ),
+        );
+        if (choice == null) return;
+      }
+      await coordinator.initialize(choice);
+      widget.refresh();
+      _showSnack('자동 백업을 켰습니다.');
+    } catch (error) {
+      _showSnack('자동 백업 설정에 실패했습니다. ($error)');
+    } finally {
+      if (mounted) setState(() => syncing = false);
+    }
+  }
+
+  Future<void> toggleAutoBackup(bool value) async {
+    final coordinator = widget.autoBackup;
+    if (coordinator == null) return;
+    if (value && !coordinator.initialized) {
+      await _setupAutoBackupAfterLogin();
+      return;
+    }
+    await coordinator.setEnabled(value);
+    if (mounted) setState(() {});
+  }
+
   Future<void> uploadToCloud() async {
     final confirmed = await _confirm(
       title: '클라우드 백업',
@@ -2611,7 +3095,13 @@ class _SettingsPageState extends State<SettingsPage> {
     );
     if (!confirmed) return;
     await _runCloudTask(() async {
-      await CloudBackup().upload(widget.store);
+      final coordinator = widget.autoBackup;
+      if (coordinator == null) {
+        await CloudBackup().upload(widget.store);
+        await widget.store.cloudChanges.clearPending();
+      } else {
+        await coordinator.manualFullUpload();
+      }
       _showSnack('클라우드에 백업했습니다.');
     });
   }
@@ -2625,11 +3115,45 @@ class _SettingsPageState extends State<SettingsPage> {
     );
     if (!confirmed) return;
     await _runCloudTask(() async {
-      final backup = await CloudBackup().downloadBackupJson();
-      await widget.store.replaceWithBackupJson(backup);
+      final coordinator = widget.autoBackup;
+      if (coordinator == null) {
+        final backup = await CloudBackup().downloadBackupJson();
+        await widget.store.replaceWithBackupJson(backup);
+        await widget.store.cloudChanges.clearPending();
+      } else {
+        await coordinator.manualRestore();
+      }
       widget.refresh();
       _showSnack('클라우드 데이터를 가져왔습니다.');
     });
+  }
+
+  Future<void> viewCloudContents() async {
+    if (!firebaseReady || FirebaseAuth.instance.currentUser == null) {
+      _showSnack('먼저 Google로 로그인해 주세요.');
+      return;
+    }
+    setState(() => syncing = true);
+    try {
+      final overview = await CloudBackup().loadOverview();
+      if (!mounted) return;
+      setState(() => syncing = false);
+      await showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        useSafeArea: true,
+        showDragHandle: true,
+        builder: (_) => _CloudBackupOverviewSheet(overview: overview),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      final message = error is StateError
+          ? '아직 클라우드에 저장된 백업이 없습니다.'
+          : '클라우드 저장 내용을 불러오지 못했습니다. ($error)';
+      _showSnack(message);
+    } finally {
+      if (mounted && syncing) setState(() => syncing = false);
+    }
   }
 
   Future<void> _runCloudTask(Future<void> Function() task) async {
@@ -2685,6 +3209,10 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   Widget build(BuildContext context) {
     final user = firebaseReady ? FirebaseAuth.instance.currentUser : null;
+    final auto = widget.autoBackup;
+    final lastSuccess = auto?.lastSuccess?.toLocal();
+    final lastSuccessText =
+        lastSuccess == null ? '아직 없음' : lastSuccess.toString().substring(0, 16);
     return ListView(
       padding: const EdgeInsets.fromLTRB(24, 32, 24, 28),
       children: [
@@ -2752,6 +3280,65 @@ class _SettingsPageState extends State<SettingsPage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                SwitchListTile.adaptive(
+                  key: const ValueKey('auto-backup-setting'),
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('자동 백업',
+                      style:
+                          TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+                  subtitle: const Text('변경 후 60초가 지나면 필요한 항목만 백업합니다.'),
+                  value: auto?.enabled ?? false,
+                  onChanged: syncing || user == null || auto == null
+                      ? null
+                      : toggleAutoBackup,
+                ),
+                const SizedBox(height: 8),
+                DropdownButtonFormField<AutoBackupNetworkPolicy>(
+                  key: ValueKey(
+                      'auto-backup-network-${auto?.networkPolicy.name ?? 'all'}'),
+                  initialValue:
+                      auto?.networkPolicy ?? AutoBackupNetworkPolicy.all,
+                  decoration: const InputDecoration(
+                    labelText: '자동 백업 네트워크',
+                    isDense: true,
+                  ),
+                  items: const [
+                    DropdownMenuItem(
+                      value: AutoBackupNetworkPolicy.all,
+                      child: Text('모든 네트워크'),
+                    ),
+                    DropdownMenuItem(
+                      value: AutoBackupNetworkPolicy.wifiOnly,
+                      child: Text('Wi-Fi만'),
+                    ),
+                  ],
+                  onChanged: user == null || auto == null
+                      ? null
+                      : (value) async {
+                          if (value == null) return;
+                          await auto.setNetworkPolicy(value);
+                          if (mounted) setState(() {});
+                        },
+                ),
+                const SizedBox(height: 12),
+                Text('마지막 성공: $lastSuccessText',
+                    style: const TextStyle(
+                        color: Color(0xFF8E8E93), fontSize: 12)),
+                Text(
+                    '대기 중 변경: ${auto?.pendingCount ?? widget.store.cloudChanges.pendingCount}개',
+                    style: const TextStyle(
+                        color: Color(0xFF8E8E93), fontSize: 12)),
+                if (auto?.isUploading == true)
+                  const Text('증분 백업 중...',
+                      style: TextStyle(color: sea, fontSize: 12)),
+                if (auto?.lastError != null) ...[
+                  const SizedBox(height: 4),
+                  Text('마지막 오류: ${auto!.lastError}',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: coral, fontSize: 12)),
+                ],
+                const Divider(height: 28),
                 const Text(
                   '로그인한 계정에 단어장과 학습 기록을 저장합니다.',
                   style: TextStyle(color: Color(0xFF8E8E93), fontSize: 12),
@@ -2790,6 +3377,24 @@ class _SettingsPageState extends State<SettingsPage> {
                     style: OutlinedButton.styleFrom(
                       foregroundColor: ink,
                       side: const BorderSide(color: Color(0xFFDADCE0)),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  height: 44,
+                  child: TextButton.icon(
+                    key: const ValueKey('view-cloud-contents'),
+                    onPressed:
+                        syncing || user == null ? null : viewCloudContents,
+                    icon: const Icon(Icons.manage_search, size: 19),
+                    label: const Text('클라우드에 저장된 내용 보기'),
+                    style: TextButton.styleFrom(
+                      foregroundColor: sea,
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(14),
                       ),
@@ -2836,48 +3441,64 @@ class _SettingsPageState extends State<SettingsPage> {
           ]),
         ),
         const SizedBox(height: 20),
-        const _SectionTitle('기본 세션 크기'),
+        const _SectionTitle('학습 카드 글자 크기'),
+        Card(
+          child: ListTile(
+            key: const ValueKey('card-font-size-setting'),
+            leading: const Icon(Icons.format_size, color: sea),
+            title: const Text('전체 및 항목별 크기',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+            subtitle: Text(
+                '단어 ${widget.store.termFontSize.round()} · 뜻 ${widget.store.meaningFontSize.round()}'),
+            trailing: const Text('변경',
+                style: TextStyle(
+                    color: sea, fontSize: 12, fontWeight: FontWeight.w700)),
+            onTap: editCardFontSizes,
+          ),
+        ),
+        const SizedBox(height: 20),
+        const _SectionTitle('일본어 글꼴'),
         Card(
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
-            child: Column(children: [
-              const Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text('세션당 기본 단어 수 (5 ~ 200)',
-                      style:
-                          TextStyle(color: Color(0xFF8E8E93), fontSize: 12))),
-              const SizedBox(height: 6),
-              SizedBox(
-                height: 120,
-                child: CupertinoPicker(
-                  itemExtent: 40,
-                  scrollController: FixedExtentScrollController(
-                      initialItem: ((widget.store.sessionSize - 5) / 5)
-                          .round()
-                          .clamp(0, 39)),
-                  selectionOverlay: Container(
-                    margin: const EdgeInsets.symmetric(horizontal: 16),
-                    decoration: BoxDecoration(
-                        color: const Color(0x99E5E5EA),
-                        border: Border.all(color: const Color(0x14000000)),
-                        borderRadius: BorderRadius.circular(12)),
-                  ),
-                  onSelectedItemChanged: (index) async {
-                    await widget.store.setSessionSize(5 + index * 5);
-                    widget.refresh();
-                    if (mounted) setState(() {});
-                  },
-                  children: List.generate(
-                      40,
-                      (index) => Center(
-                          child: Text('${5 + index * 5}',
-                              style: const TextStyle(
-                                  fontSize: 18, fontWeight: FontWeight.w700)))),
-                ),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: DropdownButtonFormField<String>(
+              key: const ValueKey('japanese-font-setting'),
+              initialValue: widget.store.japaneseFont,
+              decoration: const InputDecoration(
+                labelText: '일본어 명조체',
+                prefixIcon: Icon(Icons.translate, color: sea),
+                filled: false,
               ),
-              const Text('위아래로 드래그',
-                  style: TextStyle(color: Color(0xFF8E8E93), fontSize: 11)),
-            ]),
+              items: const [
+                DropdownMenuItem(value: 'system', child: Text('기본 글꼴')),
+                DropdownMenuItem(
+                    value: 'notoSerifJP', child: Text('Noto Serif JP')),
+                DropdownMenuItem(
+                    value: 'sourceHanSerifJP',
+                    child: Text('Source Han Serif JP / 源ノ明朝')),
+              ],
+              onChanged: (value) async {
+                if (value == null) return;
+                await widget.store.setJapaneseFont(value);
+                widget.refresh();
+                if (mounted) setState(() {});
+              },
+            ),
+          ),
+        ),
+        const SizedBox(height: 20),
+        const _SectionTitle('기본 세션 크기'),
+        Card(
+          child: ListTile(
+            key: const ValueKey('session-size-setting'),
+            leading: const Icon(Icons.view_carousel_outlined, color: sea),
+            title: const Text('세션당 기본 단어 수',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+            subtitle: Text('현재 ${widget.store.sessionSize}개'),
+            trailing: const Text('변경',
+                style: TextStyle(
+                    color: sea, fontSize: 12, fontWeight: FontWeight.w700)),
+            onTap: editSessionSize,
           ),
         ),
         const SizedBox(height: 20),
@@ -2900,20 +3521,71 @@ class _SettingsPageState extends State<SettingsPage> {
                       color: sea, fontSize: 12, fontWeight: FontWeight.w700)),
               onTap: editTarget,
             ),
-            const Divider(height: 1),
-            ListTile(
-              dense: true,
-              title: const Text('학습 데이터 초기화',
-                  style: TextStyle(
-                      color: coral, fontSize: 14, fontWeight: FontWeight.w700)),
-              trailing:
-                  const Icon(Icons.delete_outline, color: coral, size: 18),
-              onTap: resetProgress,
-            ),
           ]),
+        ),
+        const SizedBox(height: 48),
+        const _SectionTitle('위험 영역'),
+        Card(
+          child: ListTile(
+            key: const ValueKey('reset-study-data'),
+            dense: true,
+            title: const Text('학습 데이터 초기화',
+                style: TextStyle(
+                    color: coral, fontSize: 14, fontWeight: FontWeight.w700)),
+            subtitle: const Text('외운 상태와 완료한 세션 기록을 모두 삭제합니다.'),
+            trailing: const Icon(Icons.delete_outline, color: coral, size: 18),
+            onTap: resetProgress,
+          ),
         ),
       ],
     );
+  }
+
+  Future<void> editSessionSize() async {
+    var selected = widget.store.sessionSize;
+    final saved = await showDialog<int>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('기본 세션 크기 변경'),
+          content: SizedBox(
+            width: 240,
+            height: 144,
+            child: CupertinoPicker(
+              itemExtent: 38,
+              scrollController: FixedExtentScrollController(
+                initialItem: ((selected - 5) / 5).round().clamp(0, 39),
+              ),
+              onSelectedItemChanged: (index) =>
+                  setDialogState(() => selected = 5 + index * 5),
+              children: List.generate(
+                40,
+                (index) => Center(child: Text('${5 + index * 5}개')),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('취소')),
+            FilledButton(
+                onPressed: () => Navigator.pop(context, selected),
+                child: const Text('저장')),
+          ],
+        ),
+      ),
+    );
+    if (saved == null || saved == widget.store.sessionSize) return;
+    await widget.store.setSessionSize(saved);
+    widget.refresh();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> editCardFontSizes() async {
+    final changed = await showCardFontSizeEditor(context, widget.store);
+    if (!changed) return;
+    widget.refresh();
+    if (mounted) setState(() {});
   }
 
   Future<void> editTarget() async {
@@ -2930,7 +3602,7 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Future<void> resetProgress() async {
-    final confirmed = await showDialog<bool>(
+    final firstConfirmed = await showDialog<bool>(
           context: context,
           builder: (context) => AlertDialog(
             title: const Text('학습 데이터를 초기화할까요?'),
@@ -2946,11 +3618,161 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         ) ??
         false;
-    if (!confirmed) return;
+    if (!firstConfirmed || !mounted) return;
+    final secondConfirmed = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('정말 초기화할까요?'),
+            content: const Text('이 작업은 되돌릴 수 없습니다. 왼쪽의 초기화 버튼을 눌러 확정하세요.'),
+            actions: [
+              FilledButton(
+                  key: const ValueKey('final-reset-confirm'),
+                  style: FilledButton.styleFrom(backgroundColor: coral),
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const Text('초기화')),
+              TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('취소')),
+            ],
+          ),
+        ) ??
+        false;
+    if (!secondConfirmed) return;
     await widget.store.resetProgress();
     widget.refresh();
     if (mounted) setState(() {});
   }
+}
+
+class _CloudBackupOverviewSheet extends StatelessWidget {
+  const _CloudBackupOverviewSheet({required this.overview});
+
+  final CloudBackupOverview overview;
+
+  String get fontLabel => switch (overview.japaneseFont) {
+        'notoSerifJP' => 'Noto Serif JP',
+        'sourceHanSerifJP' => 'Source Han Serif JP',
+        _ => '기본 글꼴',
+      };
+
+  String get updatedAtLabel {
+    final value = overview.updatedAt?.toLocal();
+    if (value == null) return '시간 정보 없음';
+    String two(int number) => number.toString().padLeft(2, '0');
+    return '${value.year}.${two(value.month)}.${two(value.day)} '
+        '${two(value.hour)}:${two(value.minute)}';
+  }
+
+  @override
+  Widget build(BuildContext context) => FractionallySizedBox(
+        heightFactor: .84,
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+          children: [
+            const Text('클라우드에 저장된 내용',
+                style: TextStyle(fontSize: 21, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 4),
+            Text('마지막 백업 $updatedAtLabel',
+                style: const TextStyle(color: Color(0xFF8E8E93), fontSize: 12)),
+            const SizedBox(height: 16),
+            Row(children: [
+              Expanded(
+                  child: _CloudMetric(
+                      label: '단어장', value: '${overview.books.length}개')),
+              const SizedBox(width: 8),
+              Expanded(
+                  child: _CloudMetric(
+                      label: '단어', value: '${overview.totalWords}개')),
+              const SizedBox(width: 8),
+              Expanded(
+                  child: _CloudMetric(
+                      label: '완료 세션',
+                      value: '${overview.completedSessionCount}개')),
+            ]),
+            const SizedBox(height: 16),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('저장 방식',
+                          style: TextStyle(fontWeight: FontWeight.w800)),
+                      const SizedBox(height: 7),
+                      const Text(
+                        'Google 계정별 Firebase 공간에 단어장은 각각 분리하고, 단어·학습 상태·완료 세션·설정은 함께 저장합니다.',
+                        style: TextStyle(
+                            color: Color(0xFF8E8E93),
+                            fontSize: 12,
+                            height: 1.45),
+                      ),
+                      const Divider(height: 24),
+                      Text(
+                          '기본 세션 ${overview.sessionSize}개 · 학습일 ${overview.studyDayCount}일'),
+                      const SizedBox(height: 5),
+                      Text('일본어 글꼴 $fontLabel'),
+                      if (overview.targetName.isNotEmpty) ...[
+                        const SizedBox(height: 5),
+                        Text('학습 목표 ${overview.targetName}'),
+                      ],
+                    ]),
+              ),
+            ),
+            const SizedBox(height: 18),
+            const Text('저장된 단어장',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 8),
+            if (overview.books.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 24),
+                child: Text('저장된 단어장이 없습니다.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Color(0xFF8E8E93))),
+              )
+            else
+              ...overview.books.map((book) => Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Card(
+                      child: ListTile(
+                        leading:
+                            const Icon(Icons.menu_book_outlined, color: sea),
+                        title: Text(book.name,
+                            style:
+                                const TextStyle(fontWeight: FontWeight.w700)),
+                        subtitle: Text('${book.wordCount}개 단어'),
+                        trailing: book.isFavorite
+                            ? const Icon(Icons.star,
+                                color: Color(0xFFFFB800), size: 19)
+                            : null,
+                      ),
+                    ),
+                  )),
+          ],
+        ),
+      );
+}
+
+class _CloudMetric extends StatelessWidget {
+  const _CloudMetric({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 13),
+        decoration: BoxDecoration(
+          color: const Color(0xFFF2F2F7),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Column(children: [
+          Text(value,
+              style: const TextStyle(color: ink, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 3),
+          Text(label,
+              style: const TextStyle(color: Color(0xFF8E8E93), fontSize: 10)),
+        ]),
+      );
 }
 
 class _ChromeIcon extends StatelessWidget {
@@ -3004,6 +3826,255 @@ class _SectionTitle extends StatelessWidget {
                 fontWeight: FontWeight.w800,
                 letterSpacing: .4)),
       );
+}
+
+Future<bool> showCardFontSizeEditor(
+  BuildContext context,
+  VocaStore store, {
+  Word? previewWord,
+}) async {
+  final word = previewWord ??
+      Word(
+        term: '日本語',
+        reading: 'にほんご',
+        meaning: '일본어',
+        example: '毎日、日本語を勉強します。',
+        exampleMeaning: '매일 일본어를 공부합니다.',
+      );
+  var overall = 1.0;
+  var term = store.termFontSize;
+  var reading = store.readingFontSize;
+  var meaning = store.meaningFontSize;
+  var example = store.exampleFontSize;
+  var exampleMeaning = store.exampleMeaningFontSize;
+  final values = await showModalBottomSheet<List<double>>(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    showDragHandle: true,
+    builder: (context) => StatefulBuilder(
+      builder: (context, setModalState) => FractionallySizedBox(
+        heightFactor: .94,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+          child: Column(children: [
+            Row(children: [
+              const Expanded(
+                child: Text('학습 카드 글자 크기',
+                    style:
+                        TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+              ),
+              TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('취소')),
+              const SizedBox(width: 4),
+              FilledButton(
+                key: const ValueKey('save-card-font-sizes'),
+                onPressed: () => Navigator.pop(
+                    context, [term, reading, meaning, example, exampleMeaning]),
+                child: const Text('저장'),
+              ),
+            ]),
+            const SizedBox(height: 12),
+            Expanded(
+              child: SingleChildScrollView(
+                child: Column(children: [
+                  Container(
+                    key: const ValueKey('font-size-card-preview'),
+                    width: double.infinity,
+                    padding: const EdgeInsets.fromLTRB(24, 24, 24, 22),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(24),
+                      border: Border.all(color: const Color(0x14000000)),
+                      boxShadow: const [
+                        BoxShadow(
+                            color: Color(0x14000000),
+                            blurRadius: 18,
+                            offset: Offset(0, 8)),
+                      ],
+                    ),
+                    child: Column(children: [
+                      const Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text('카드 미리보기',
+                            style: TextStyle(
+                                color: Color(0xFF8E8E93), fontSize: 11)),
+                      ),
+                      const SizedBox(height: 22),
+                      Row(mainAxisSize: MainAxisSize.min, children: [
+                        const SizedBox(width: 40),
+                        Flexible(
+                          child: Text(word.term,
+                              key: const ValueKey('font-preview-term'),
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                  color: ink,
+                                  fontSize: term,
+                                  fontFamily: japaneseFontFamily(store),
+                                  fontWeight: FontWeight.w800)),
+                        ),
+                        const SizedBox(
+                          width: 40,
+                          child: Icon(Icons.copy_outlined,
+                              size: 18, color: Color(0xFF8E8E93)),
+                        ),
+                      ]),
+                      const SizedBox(height: 8),
+                      Text(word.reading,
+                          key: const ValueKey('font-preview-reading'),
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                              color: const Color(0xFF8E8E93),
+                              fontSize: reading,
+                              fontFamily:
+                                  japaneseFontFamily(store) ?? 'monospace')),
+                      const SizedBox(height: 18),
+                      Text(word.meaning,
+                          key: const ValueKey('font-preview-meaning'),
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                              fontSize: meaning,
+                              fontFamily: japaneseFontFamily(store),
+                              fontWeight: FontWeight.w700)),
+                      if (word.example.isNotEmpty) ...[
+                        const SizedBox(height: 20),
+                        Text(word.example,
+                            key: const ValueKey('font-preview-example'),
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                                fontSize: example,
+                                fontFamily: japaneseFontFamily(store))),
+                        const SizedBox(height: 6),
+                        Text(word.exampleMeaning,
+                            key: const ValueKey('font-preview-example-meaning'),
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                                color: Colors.black54,
+                                fontSize: exampleMeaning,
+                                fontFamily: japaneseFontFamily(store))),
+                      ],
+                    ]),
+                  ),
+                  const SizedBox(height: 18),
+                  _FontSizeSlider(
+                    label: '전체 크기',
+                    valueLabel: '${(overall * 100).round()}%',
+                    value: overall,
+                    min: .75,
+                    max: 1.5,
+                    divisions: 15,
+                    onChanged: (value) => setModalState(() {
+                      overall = value;
+                      term = 32 * value;
+                      reading = 14 * value;
+                      meaning = 22 * value;
+                      example = 16 * value;
+                      exampleMeaning = 14 * value;
+                    }),
+                  ),
+                  const Divider(),
+                  _FontSizeSlider(
+                    label: '단어',
+                    valueLabel: '${term.round()}',
+                    value: term,
+                    min: 20,
+                    max: 52,
+                    divisions: 32,
+                    onChanged: (value) => setModalState(() => term = value),
+                  ),
+                  _FontSizeSlider(
+                    label: '발음',
+                    valueLabel: '${reading.round()}',
+                    value: reading,
+                    min: 10,
+                    max: 28,
+                    divisions: 18,
+                    onChanged: (value) => setModalState(() => reading = value),
+                  ),
+                  _FontSizeSlider(
+                    label: '뜻',
+                    valueLabel: '${meaning.round()}',
+                    value: meaning,
+                    min: 14,
+                    max: 38,
+                    divisions: 24,
+                    onChanged: (value) => setModalState(() => meaning = value),
+                  ),
+                  _FontSizeSlider(
+                    label: '예문',
+                    valueLabel: '${example.round()}',
+                    value: example,
+                    min: 11,
+                    max: 28,
+                    divisions: 17,
+                    onChanged: (value) => setModalState(() => example = value),
+                  ),
+                  _FontSizeSlider(
+                    label: '예문 뜻',
+                    valueLabel: '${exampleMeaning.round()}',
+                    value: exampleMeaning,
+                    min: 10,
+                    max: 26,
+                    divisions: 16,
+                    onChanged: (value) =>
+                        setModalState(() => exampleMeaning = value),
+                  ),
+                ]),
+              ),
+            ),
+          ]),
+        ),
+      ),
+    ),
+  );
+  if (values == null) return false;
+  await store.setCardFontSizes(
+    term: values[0],
+    reading: values[1],
+    meaning: values[2],
+    example: values[3],
+    exampleMeaning: values[4],
+  );
+  return true;
+}
+
+class _FontSizeSlider extends StatelessWidget {
+  const _FontSizeSlider({
+    required this.label,
+    required this.valueLabel,
+    required this.value,
+    required this.min,
+    required this.max,
+    required this.divisions,
+    required this.onChanged,
+  });
+
+  final String label;
+  final String valueLabel;
+  final double value;
+  final double min;
+  final double max;
+  final int divisions;
+  final ValueChanged<double> onChanged;
+
+  @override
+  Widget build(BuildContext context) => Column(children: [
+        Row(children: [
+          Expanded(
+              child: Text(label,
+                  style: const TextStyle(fontWeight: FontWeight.w700))),
+          Text(valueLabel,
+              style: const TextStyle(color: sea, fontWeight: FontWeight.w800)),
+        ]),
+        Slider(
+          value: value.clamp(min, max).toDouble(),
+          min: min,
+          max: max,
+          divisions: divisions,
+          onChanged: onChanged,
+        ),
+      ]);
 }
 
 class _CircleStat extends StatelessWidget {
