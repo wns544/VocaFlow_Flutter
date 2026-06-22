@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vocaflow/models.dart';
@@ -44,6 +46,20 @@ void main() {
     final reloaded = await VocaStore.load();
     expect(reloaded.horizontalSwipe, isTrue);
     expect(reloaded.reverseSwipe, isTrue);
+  });
+
+  test('study card display settings persist', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+
+    await store.setReadingAboveTerm(true);
+    await store.setShowExamples(false);
+    await store.setFlipCard(true);
+
+    final reloaded = await VocaStore.load();
+    expect(reloaded.readingAboveTerm, isTrue);
+    expect(reloaded.showExamples, isFalse);
+    expect(reloaded.flipCard, isTrue);
   });
 
   test('active study position persists', () async {
@@ -108,5 +124,98 @@ void main() {
     expect(reloaded.meaningFontSize, 26);
     expect(reloaded.exampleFontSize, 19);
     expect(reloaded.exampleMeaningFontSize, 17);
+  });
+
+  test('meaning style persists and is included in backup data', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+
+    await store.setMeaningStyle(fontWeight: 600, opacity: .55);
+
+    final reloaded = await VocaStore.load();
+    expect(reloaded.meaningFontWeight, 600);
+    expect(reloaded.meaningOpacity, .55);
+    expect(reloaded.toBackupJson()['cardMeaningStyle'], {
+      'fontWeight': 600,
+      'opacity': .55,
+    });
+  });
+
+  test('ChatGPT conversation URL stays local and is not backed up', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+
+    expect(
+      await store.setChatGptConversationUrl(
+        'https://chatgpt.com/c/private-id?temporary=true',
+      ),
+      isTrue,
+    );
+    expect(store.chatGptConversationUrl, 'https://chatgpt.com/c/private-id');
+    expect(store.toBackupJson(), isNot(contains('chatGptConversationUrl')));
+    expect(
+      await store.setChatGptConversationUrl('https://example.com/c/id'),
+      isFalse,
+    );
+
+    final reloaded = await VocaStore.load();
+    expect(reloaded.chatGptConversationUrl, 'https://chatgpt.com/c/private-id');
+  });
+
+  test('mixed-book active study preserves word ownership and selections',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    await store.addBook('A', [
+      Word(id: 77, term: 'from A', meaning: '', reading: ''),
+    ]);
+    await store.addBook('B', [
+      Word(id: 77, term: 'from B', meaning: '', reading: ''),
+    ]);
+    final first = store.books[store.books.length - 2];
+    final second = store.books.last;
+    await store.saveActiveStudy(ActiveStudy(
+      queueIds: const [77, 77],
+      queueBookIds: [first.id, second.id],
+      total: 2,
+      memorized: 0,
+      reviewed: const [],
+      revealed: false,
+      sessionIndexes: const [],
+      sessionSelections: {
+        first.id: const [0],
+        second.id: const [0],
+      },
+    ));
+
+    final reloaded = await VocaStore.load();
+    final active = reloaded.activeStudy!;
+    expect(reloaded.resolveActiveWords(active).map((word) => word.term),
+        ['from A', 'from B']);
+    expect(active.sessionSelections, {
+      first.id: [0],
+      second.id: [0],
+    });
+  });
+
+  test('repairs clearly swapped Japanese reading and Korean meaning once',
+      () async {
+    final book = WordBook(
+      id: 'japanese',
+      name: 'Japanese',
+      words: [Word(id: 88, term: '遺跡', reading: '유적', meaning: 'いせき')],
+    );
+    SharedPreferences.setMockInitialValues({
+      'books': jsonEncode([book.toJson()]),
+    });
+
+    final store = await VocaStore.load();
+    final repaired = store.books.single.words.single;
+
+    expect(repaired.reading, 'いせき');
+    expect(repaired.meaning, '유적');
+    final preferences = await SharedPreferences.getInstance();
+    expect(preferences.getBool('readingMeaningMigrationV1'), isTrue);
+    expect(store.cloudChanges.snapshot.wordIdsByBook['japanese'], {88});
   });
 }

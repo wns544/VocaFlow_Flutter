@@ -80,12 +80,16 @@ class StudySession {
     required this.label,
     required this.words,
     required this.size,
+    required this.startWordNumber,
+    required this.endWordNumber,
   });
 
   final int index;
   final String label;
   final List<Word> words;
   final int size;
+  final int startWordNumber;
+  final int endWordNumber;
 
   bool get isCompleted =>
       words.isNotEmpty &&
@@ -121,9 +125,11 @@ class WordBook {
         index: index,
         label: override?.name?.trim().isNotEmpty == true
             ? override!.name!.trim()
-            : '세션 ${index + 1}',
+            : '단어 ${offset + 1}~$end',
         words: words.sublist(offset, end),
         size: size,
+        startWordNumber: offset + 1,
+        endWordNumber: end,
       ));
       offset = end;
       index++;

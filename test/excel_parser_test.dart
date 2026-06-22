@@ -31,4 +31,40 @@ void main() {
     expect(words.single.reading, '애플');
     expect(words.single.example, 'I ate an apple.');
   });
+
+  test('xlsx header controls reading and meaning column order', () {
+    final workbook = Excel.createExcel();
+    final sheet = workbook['Sheet1'];
+    sheet.appendRow([
+      TextCellValue('단어'),
+      TextCellValue('발음'),
+      TextCellValue('뜻'),
+    ]);
+    sheet.appendRow([
+      TextCellValue('遺跡'),
+      TextCellValue('いせき'),
+      TextCellValue('유적'),
+    ]);
+
+    final words = parseWordsXlsx(workbook.encode()!);
+
+    expect(words.single.term, '遺跡');
+    expect(words.single.reading, 'いせき');
+    expect(words.single.meaning, '유적');
+  });
+
+  test('headerless Japanese rows detect kana reading before meaning', () {
+    final workbook = Excel.createExcel();
+    final sheet = workbook['Sheet1'];
+    sheet.appendRow([
+      TextCellValue('遺跡'),
+      TextCellValue('いせき'),
+      TextCellValue('유적'),
+    ]);
+
+    final words = parseWordsXlsx(workbook.encode()!);
+
+    expect(words.single.reading, 'いせき');
+    expect(words.single.meaning, '유적');
+  });
 }

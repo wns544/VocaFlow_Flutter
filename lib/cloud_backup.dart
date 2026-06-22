@@ -233,9 +233,15 @@ class CloudBackup {
       'targetDate': profileData['targetDate'] as String?,
       'horizontalSwipe': profileData['horizontalSwipe'] as bool? ?? false,
       'reverseSwipe': profileData['reverseSwipe'] as bool? ?? false,
+      'readingAboveTerm': profileData['readingAboveTerm'] as bool? ?? false,
+      'showExamples': profileData['showExamples'] as bool? ?? true,
+      'flipCard': profileData['flipCard'] as bool? ?? false,
       'japaneseFont': profileData['japaneseFont'] as String? ?? 'system',
       'cardFontSizes': profileData['cardFontSizes'] as Map<String, dynamic>? ??
           <String, dynamic>{},
+      'cardMeaningStyle':
+          profileData['cardMeaningStyle'] as Map<String, dynamic>? ??
+              <String, dynamic>{},
     };
   }
 
@@ -287,8 +293,12 @@ class CloudBackup {
         'targetDate': backup['targetDate'],
         'horizontalSwipe': backup['horizontalSwipe'],
         'reverseSwipe': backup['reverseSwipe'],
+        'readingAboveTerm': backup['readingAboveTerm'],
+        'showExamples': backup['showExamples'],
+        'flipCard': backup['flipCard'],
         'japaneseFont': backup['japaneseFont'],
         'cardFontSizes': backup['cardFontSizes'],
+        'cardMeaningStyle': backup['cardMeaningStyle'],
         'bookOrder': store.books.map((book) => book.id).toList(),
         'updatedAt': FieldValue.serverTimestamp(),
       };

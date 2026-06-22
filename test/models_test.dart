@@ -2,6 +2,27 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vocaflow/models.dart';
 
 void main() {
+  test('default session labels show their word ranges', () {
+    final book = WordBook(
+      id: 'ranges',
+      name: 'Ranges',
+      words: List.generate(
+        105,
+        (index) => Word(
+          id: index,
+          term: 'word$index',
+          meaning: '',
+          reading: '',
+        ),
+      ),
+    );
+
+    final sessions = book.sessions(50);
+
+    expect(sessions.map((session) => session.label),
+        ['단어 1~50', '단어 51~100', '단어 101~105']);
+  });
+
   test('session overrides change label and size', () {
     final book = WordBook(
       id: 'book',

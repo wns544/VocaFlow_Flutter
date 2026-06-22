@@ -16,4 +16,11 @@ void main() {
         'term,meaning,reading\nvalid,유효한,val-id\nmissing,meaning');
     expect(words.map((word) => word.term), ['valid']);
   });
+
+  test('CSV header may place reading before meaning', () {
+    final words = parseWordsCsv('단어,발음,뜻\n遺跡,いせき,유적');
+
+    expect(words.single.reading, 'いせき');
+    expect(words.single.meaning, '유적');
+  });
 }

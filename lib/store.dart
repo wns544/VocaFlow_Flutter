@@ -3,12 +3,14 @@ import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'cloud_change_tracker.dart';
+import 'kanji_lookup.dart';
 import 'local_word_search.dart';
 import 'models.dart';
 
 class ActiveStudy {
   const ActiveStudy({
     required this.queueIds,
+    this.queueBookIds = const [],
     required this.total,
     required this.memorized,
     required this.reviewed,
@@ -18,9 +20,12 @@ class ActiveStudy {
     this.lastWordId,
     this.lastState,
     this.undoHistory = const [],
+    this.sessionSelections = const {},
+    this.lastWordBookId,
   });
 
   final List<int> queueIds;
+  final List<String> queueBookIds;
   final int total;
   final int memorized;
   final List<String> reviewed;
@@ -30,9 +35,12 @@ class ActiveStudy {
   final int? lastWordId;
   final StudyState? lastState;
   final List<StudyDecision> undoHistory;
+  final Map<String, List<int>> sessionSelections;
+  final String? lastWordBookId;
 
   Map<String, dynamic> toJson() => {
         'queueIds': queueIds,
+        'queueBookIds': queueBookIds,
         'total': total,
         'memorized': memorized,
         'reviewed': reviewed,
@@ -42,10 +50,14 @@ class ActiveStudy {
         'lastWordId': lastWordId,
         'lastState': lastState?.name,
         'undoHistory': undoHistory.map((item) => item.toJson()).toList(),
+        'sessionSelections': sessionSelections,
+        'lastWordBookId': lastWordBookId,
       };
 
   factory ActiveStudy.fromJson(Map<String, dynamic> json) => ActiveStudy(
         queueIds: (json['queueIds'] as List<dynamic>? ?? []).cast<int>(),
+        queueBookIds:
+            (json['queueBookIds'] as List<dynamic>? ?? []).cast<String>(),
         total: json['total'] as int? ?? 0,
         memorized: json['memorized'] as int? ?? 0,
         reviewed: (json['reviewed'] as List<dynamic>? ?? []).cast<String>(),
@@ -60,6 +72,16 @@ class ActiveStudy {
         undoHistory: (json['undoHistory'] as List<dynamic>? ?? [])
             .map((item) => StudyDecision.fromJson(item as Map<String, dynamic>))
             .toList(),
+        sessionSelections:
+            (json['sessionSelections'] as Map<String, dynamic>? ?? {}).map(
+          (key, value) => MapEntry(
+            key,
+            (value as List<dynamic>)
+                .map((item) => (item as num).toInt())
+                .toList(),
+          ),
+        ),
+        lastWordBookId: json['lastWordBookId'] as String?,
       );
 }
 
@@ -68,16 +90,19 @@ class StudyDecision {
     required this.wordId,
     required this.previousState,
     required this.decision,
+    this.bookId,
   });
 
   final int wordId;
   final StudyState previousState;
   final StudyState decision;
+  final String? bookId;
 
   Map<String, dynamic> toJson() => {
         'wordId': wordId,
         'previousState': previousState.name,
         'decision': decision.name,
+        'bookId': bookId,
       };
 
   factory StudyDecision.fromJson(Map<String, dynamic> json) => StudyDecision(
@@ -90,6 +115,7 @@ class StudyDecision {
           (state) => state.name == json['decision'],
           orElse: () => StudyState.fresh,
         ),
+        bookId: json['bookId'] as String?,
       );
 }
 
@@ -105,13 +131,20 @@ class VocaStore {
   static const _targetDateKey = 'targetDate';
   static const _horizontalSwipeKey = 'horizontalSwipe';
   static const _reverseSwipeKey = 'reverseSwipe';
+  static const _readingAboveTermKey = 'readingAboveTerm';
+  static const _showExamplesKey = 'showExamples';
+  static const _flipCardKey = 'flipCard';
   static const _activeStudyKey = 'activeStudy';
   static const _japaneseFontKey = 'japaneseFont';
   static const _termFontSizeKey = 'termFontSize';
   static const _readingFontSizeKey = 'readingFontSize';
   static const _meaningFontSizeKey = 'meaningFontSize';
+  static const _meaningFontWeightKey = 'meaningFontWeight';
+  static const _meaningOpacityKey = 'meaningOpacity';
   static const _exampleFontSizeKey = 'exampleFontSize';
   static const _exampleMeaningFontSizeKey = 'exampleMeaningFontSize';
+  static const _chatGptConversationUrlKey = 'chatGptConversationUrl';
+  static const _readingMeaningMigrationKey = 'readingMeaningMigrationV1';
 
   final SharedPreferences _prefs;
   late List<WordBook> books;
@@ -124,6 +157,7 @@ class VocaStore {
     store.books = store._loadBooks();
     store.cloudChanges = await CloudChangeTracker.load();
     store.wordSearch = LocalWordSearchIndex(() => store.books);
+    await store._repairSwappedJapaneseFields();
     return store;
   }
 
@@ -135,13 +169,20 @@ class VocaStore {
   int get sessionSize => _prefs.getInt(_sessionSizeKey) ?? 10;
   bool get horizontalSwipe => _prefs.getBool(_horizontalSwipeKey) ?? false;
   bool get reverseSwipe => _prefs.getBool(_reverseSwipeKey) ?? false;
+  bool get readingAboveTerm => _prefs.getBool(_readingAboveTermKey) ?? false;
+  bool get showExamples => _prefs.getBool(_showExamplesKey) ?? true;
+  bool get flipCard => _prefs.getBool(_flipCardKey) ?? false;
   String get japaneseFont => _prefs.getString(_japaneseFontKey) ?? 'system';
   double get termFontSize => _prefs.getDouble(_termFontSizeKey) ?? 32;
   double get readingFontSize => _prefs.getDouble(_readingFontSizeKey) ?? 14;
   double get meaningFontSize => _prefs.getDouble(_meaningFontSizeKey) ?? 22;
+  int get meaningFontWeight => _prefs.getInt(_meaningFontWeightKey) ?? 500;
+  double get meaningOpacity => _prefs.getDouble(_meaningOpacityKey) ?? .70;
   double get exampleFontSize => _prefs.getDouble(_exampleFontSizeKey) ?? 16;
   double get exampleMeaningFontSize =>
       _prefs.getDouble(_exampleMeaningFontSizeKey) ?? 14;
+  String get chatGptConversationUrl =>
+      _prefs.getString(_chatGptConversationUrlKey) ?? '';
   String get targetName => _prefs.getString(_targetNameKey) ?? '';
   DateTime? get targetDate {
     final value = _prefs.getString(_targetDateKey);
@@ -161,6 +202,17 @@ class VocaStore {
   }
 
   List<Word> resolveActiveWords(ActiveStudy active) {
+    if (active.queueBookIds.length == active.queueIds.length) {
+      return List.generate(active.queueIds.length, (index) {
+        final bookId = active.queueBookIds[index];
+        final wordId = active.queueIds[index];
+        return books
+            .where((book) => book.id == bookId)
+            .expand((book) => book.words)
+            .where((word) => word.id == wordId)
+            .firstOrNull;
+      }).whereType<Word>().toList();
+    }
     final preferredBook = active.bookId == null
         ? null
         : books.where((book) => book.id == active.bookId).firstOrNull;
@@ -251,6 +303,21 @@ class VocaStore {
     await cloudChanges.markProfile();
   }
 
+  Future<void> setReadingAboveTerm(bool value) async {
+    await _prefs.setBool(_readingAboveTermKey, value);
+    await cloudChanges.markProfile();
+  }
+
+  Future<void> setShowExamples(bool value) async {
+    await _prefs.setBool(_showExamplesKey, value);
+    await cloudChanges.markProfile();
+  }
+
+  Future<void> setFlipCard(bool value) async {
+    await _prefs.setBool(_flipCardKey, value);
+    await cloudChanges.markProfile();
+  }
+
   Future<void> setJapaneseFont(String value) async {
     const allowed = {'system', 'notoSerifJP', 'sourceHanSerifJP'};
     await _prefs.setString(
@@ -274,6 +341,31 @@ class VocaStore {
           _exampleMeaningFontSizeKey, exampleMeaning.clamp(10, 26).toDouble()),
     ]);
     await cloudChanges.markProfile();
+  }
+
+  Future<void> setMeaningStyle({
+    required int fontWeight,
+    required double opacity,
+  }) async {
+    final normalizedWeight =
+        (((fontWeight.clamp(400, 700) / 100).round() * 100).clamp(400, 700))
+            .toInt();
+    await Future.wait([
+      _prefs.setInt(_meaningFontWeightKey, normalizedWeight),
+      _prefs.setDouble(_meaningOpacityKey, opacity.clamp(.45, 1).toDouble()),
+    ]);
+    await cloudChanges.markProfile();
+  }
+
+  Future<bool> setChatGptConversationUrl(String value) async {
+    if (value.trim().isEmpty) {
+      await _prefs.remove(_chatGptConversationUrlKey);
+      return true;
+    }
+    final normalized = normalizeChatGptConversationUrl(value);
+    if (normalized == null) return false;
+    await _prefs.setString(_chatGptConversationUrlKey, normalized);
+    return true;
   }
 
   Future<void> setTarget(String name, DateTime? date) async {
@@ -419,6 +511,9 @@ class VocaStore {
         'targetDate': _prefs.getString(_targetDateKey),
         'horizontalSwipe': horizontalSwipe,
         'reverseSwipe': reverseSwipe,
+        'readingAboveTerm': readingAboveTerm,
+        'showExamples': showExamples,
+        'flipCard': flipCard,
         'japaneseFont': japaneseFont,
         'cardFontSizes': {
           'term': termFontSize,
@@ -426,6 +521,10 @@ class VocaStore {
           'meaning': meaningFontSize,
           'example': exampleFontSize,
           'exampleMeaning': exampleMeaningFontSize,
+        },
+        'cardMeaningStyle': {
+          'fontWeight': meaningFontWeight,
+          'opacity': meaningOpacity,
         },
       };
 
@@ -461,6 +560,11 @@ class VocaStore {
         _horizontalSwipeKey, json['horizontalSwipe'] as bool? ?? false);
     await _prefs.setBool(
         _reverseSwipeKey, json['reverseSwipe'] as bool? ?? false);
+    await _prefs.setBool(
+        _readingAboveTermKey, json['readingAboveTerm'] as bool? ?? false);
+    await _prefs.setBool(
+        _showExamplesKey, json['showExamples'] as bool? ?? true);
+    await _prefs.setBool(_flipCardKey, json['flipCard'] as bool? ?? false);
     await setJapaneseFont(json['japaneseFont'] as String? ?? 'system');
     final fontSizes =
         json['cardFontSizes'] as Map<String, dynamic>? ?? const {};
@@ -470,6 +574,12 @@ class VocaStore {
       meaning: (fontSizes['meaning'] as num?)?.toDouble() ?? 22,
       example: (fontSizes['example'] as num?)?.toDouble() ?? 16,
       exampleMeaning: (fontSizes['exampleMeaning'] as num?)?.toDouble() ?? 14,
+    );
+    final meaningStyle =
+        json['cardMeaningStyle'] as Map<String, dynamic>? ?? const {};
+    await setMeaningStyle(
+      fontWeight: (meaningStyle['fontWeight'] as num?)?.toInt() ?? 500,
+      opacity: (meaningStyle['opacity'] as num?)?.toDouble() ?? .70,
     );
     final targetDate = json['targetDate'] as String?;
     if (targetDate == null || DateTime.tryParse(targetDate) == null) {
@@ -497,6 +607,33 @@ class VocaStore {
         _booksKey,
         jsonEncode(books.map((book) => book.toJson()).toList()),
       );
+
+  Future<void> _repairSwappedJapaneseFields() async {
+    if (_prefs.getBool(_readingMeaningMigrationKey) ?? false) return;
+    final changedWords = <String, List<int>>{};
+    for (final book in books) {
+      for (var index = 0; index < book.words.length; index++) {
+        final word = book.words[index];
+        final readingHasHangul = RegExp(r'[가-힣]').hasMatch(word.reading);
+        final meaningHasKana =
+            RegExp(r'[\u3040-\u30ff]').hasMatch(word.meaning);
+        if (!readingHasHangul || !meaningHasKana) continue;
+        book.words[index] = word.copyWith(
+          reading: word.meaning,
+          meaning: word.reading,
+        );
+        changedWords.putIfAbsent(book.id, () => []).add(word.id);
+      }
+    }
+    if (changedWords.isNotEmpty) {
+      await _saveBooks();
+      wordSearch.invalidate();
+      for (final entry in changedWords.entries) {
+        await cloudChanges.markWords(entry.key, entry.value);
+      }
+    }
+    await _prefs.setBool(_readingMeaningMigrationKey, true);
+  }
 
   static String _dayKey(DateTime date) =>
       '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
