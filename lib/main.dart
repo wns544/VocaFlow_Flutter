@@ -27,7 +27,23 @@ const sea = Color(0xFF34C759);
 const mist = Color(0xFFF2F2F7);
 const coral = Color(0xFFFF3B30);
 const studySpeechChannel = MethodChannel('com.vocaflow.app/study_speech');
+const resumeSnapshotChannel = MethodChannel('com.vocaflow.app/resume_snapshot');
 final defaultKanjiLookupService = KanjiLookupService();
+final resumeSnapshotNavigatorObserver = _ResumeSnapshotNavigatorObserver();
+final resumeRouteObserver = RouteObserver<ModalRoute<dynamic>>();
+
+enum StudyExitChoice { save, discard }
+
+class _ResumeSnapshotNavigatorObserver extends NavigatorObserver {
+  @override
+  void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    super.didPush(route, previousRoute);
+    final name = route.settings.name;
+    if (name != '/' && name != '/study') {
+      unawaited(deleteResumeSnapshot());
+    }
+  }
+}
 
 bool shuffleNewStudyQueues = true;
 
@@ -76,7 +92,7 @@ Future<void> speakStudyWord(String text) async {
     });
   } on MissingPluginException {
     // Voice playback is only available on supported device builds.
-  } on PlatformException {
+  } on Exception {
     // Studying should continue even when a device has no matching TTS voice.
   }
 }
@@ -97,8 +113,7 @@ Future<void> ensureGoogleSignInInitialized() {
   );
 }
 
-Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
+Future<bool> initializeFirebase() async {
   try {
     await Firebase.initializeApp(
       options: DefaultFirebaseOptions.currentPlatform,
@@ -107,11 +122,50 @@ Future<void> main() async {
   } catch (_) {
     firebaseReady = false;
   }
-  runApp(const VocaFlowApp());
+  return firebaseReady;
+}
+
+Future<void> captureResumeSnapshot(String target) async {
+  try {
+    await resumeSnapshotChannel
+        .invokeMethod<void>('capture', {'target': target});
+  } on Exception {
+    // Snapshot capture is opportunistic and must never interrupt navigation.
+  }
+}
+
+void scheduleResumeSnapshotCapture(String target) {
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    unawaited(captureResumeSnapshot(target));
+  });
+}
+
+Future<void> deleteResumeSnapshot() async {
+  try {
+    await resumeSnapshotChannel.invokeMethod<void>('delete');
+  } on Exception {
+    // The cache may already be absent.
+  }
+}
+
+Future<void> notifyRestorationReady() async {
+  try {
+    await resumeSnapshotChannel.invokeMethod<void>('restorationReady');
+  } on PlatformException {
+    // Non-Android platforms do not install the snapshot channel.
+  }
+}
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final firebaseInitialization = initializeFirebase();
+  runApp(VocaFlowApp(firebaseInitialization: firebaseInitialization));
 }
 
 class VocaFlowApp extends StatefulWidget {
-  const VocaFlowApp({super.key});
+  const VocaFlowApp({super.key, this.firebaseInitialization});
+
+  final Future<bool>? firebaseInitialization;
 
   @override
   State<VocaFlowApp> createState() => _VocaFlowAppState();
@@ -120,31 +174,82 @@ class VocaFlowApp extends StatefulWidget {
 class _VocaFlowAppState extends State<VocaFlowApp> {
   VocaStore? store;
   AutoBackupCoordinator? autoBackup;
+  final autoBackupNotifier = ValueNotifier<AutoBackupCoordinator?>(null);
+  final navigatorKey = GlobalKey<NavigatorState>();
+  ActiveStudy? initialStudy;
+  var restorationNotified = false;
 
   @override
   void initState() {
     super.initState();
-    VocaStore.load().then((value) {
-      if (!mounted) return;
-      final coordinator = firebaseReady
-          ? AutoBackupCoordinator(
-              store: value,
-              onChanged: () {
-                if (mounted) setState(() {});
-              },
-            )
-          : null;
-      coordinator?.start();
-      setState(() {
-        store = value;
-        autoBackup = coordinator;
-      });
+    _loadLocalState();
+  }
+
+  Future<void> _loadLocalState() async {
+    final value = await VocaStore.load();
+    var active = value.activeStudy;
+    if (active != null &&
+        value.resolveActiveWords(active).length != active.queueIds.length) {
+      await value.clearActiveStudy();
+      active = null;
+    }
+    if (!mounted) return;
+    setState(() {
+      store = value;
+      initialStudy = active;
     });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || restorationNotified) return;
+      restorationNotified = true;
+      unawaited(_completeInitialRestoration());
+    });
+
+    final ready = await (widget.firebaseInitialization ??
+        Future<bool>.value(firebaseReady));
+    if (!mounted || !ready) return;
+    final coordinator = AutoBackupCoordinator(
+      store: value,
+      onChanged: () {
+        if (mounted) setState(() {});
+      },
+    );
+    coordinator.start();
+    autoBackup = coordinator;
+    autoBackupNotifier.value = coordinator;
+    unawaited(_restoreCloudActiveStudy(coordinator));
+  }
+
+  Future<void> _restoreCloudActiveStudy(
+      AutoBackupCoordinator coordinator) async {
+    if (initialStudy != null || store?.activeStudy != null) return;
+    if (!coordinator.enabled || !coordinator.initialized) return;
+    try {
+      final backup = await coordinator.cloud.downloadBackupJson();
+      final restored = await store?.restoreActiveStudyFromBackupJson(backup);
+      if (!mounted || restored == null || initialStudy != null) return;
+      setState(() => initialStudy = restored);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final navigator = navigatorKey.currentState;
+        if (!mounted || navigator == null) return;
+        navigator.pushNamed('/study');
+      });
+    } catch (_) {
+      // Cloud resume is opportunistic; local startup must stay instant.
+    }
+  }
+
+  Future<void> _completeInitialRestoration() async {
+    await notifyRestorationReady();
+    if (!mounted || store == null) return;
+    final target =
+        initialStudy == null ? 'main:${store!.lastMainTab}' : 'study';
+    await captureResumeSnapshot(target);
   }
 
   @override
   void dispose() {
     autoBackup?.dispose();
+    autoBackupNotifier.dispose();
     super.dispose();
   }
 
@@ -188,18 +293,47 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
   }
 
   @override
-  Widget build(BuildContext context) => MaterialApp(
+  Widget build(BuildContext context) {
+    final loadedStore = store;
+    if (loadedStore == null) {
+      return MaterialApp(
+        key: const ValueKey('loading-app'),
         debugShowCheckedModeBanner: false,
-        title: 'VocaFlow',
         theme: theme,
-        home: store == null
-            ? const Scaffold(body: Center(child: CircularProgressIndicator()))
-            : MainShell(
-                store: store!,
-                autoBackup: autoBackup,
-                onChanged: () => setState(() {}),
-              ),
+        home: const ColoredBox(color: mist),
       );
+    }
+    return MaterialApp(
+      key: const ValueKey('ready-app'),
+      navigatorKey: navigatorKey,
+      debugShowCheckedModeBanner: false,
+      title: 'VocaFlow',
+      theme: theme,
+      navigatorObservers: [
+        resumeSnapshotNavigatorObserver,
+        resumeRouteObserver
+      ],
+      initialRoute: initialStudy == null ? '/' : '/study',
+      onGenerateRoute: (settings) {
+        if (settings.name == '/study' && initialStudy != null) {
+          return MaterialPageRoute(
+            settings: settings,
+            builder: (_) =>
+                CardStudyPage(store: loadedStore, resume: initialStudy!),
+          );
+        }
+        return MaterialPageRoute(
+            settings: settings.name == '/'
+                ? settings
+                : const RouteSettings(name: '/'),
+            builder: (_) => MainShell(
+                  store: loadedStore,
+                  autoBackup: autoBackupNotifier,
+                  onChanged: () => setState(() {}),
+                ));
+      },
+    );
+  }
 }
 
 class MainShell extends StatefulWidget {
@@ -207,43 +341,51 @@ class MainShell extends StatefulWidget {
     super.key,
     required this.store,
     required this.onChanged,
-    this.autoBackup,
+    required this.autoBackup,
   });
   final VocaStore store;
   final VoidCallback onChanged;
-  final AutoBackupCoordinator? autoBackup;
+  final ValueNotifier<AutoBackupCoordinator?> autoBackup;
 
   @override
   State<MainShell> createState() => _MainShellState();
 }
 
-class _MainShellState extends State<MainShell> {
-  var index = 0;
-  var restoredStudy = false;
+class _MainShellState extends State<MainShell> with RouteAware {
+  late var index = widget.store.lastMainTab;
+  ModalRoute<dynamic>? _route;
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => restoreStudy());
+    widget.autoBackup.addListener(_autoBackupChanged);
+    scheduleResumeSnapshotCapture('main:$index');
   }
 
-  Future<void> restoreStudy() async {
-    if (restoredStudy || !mounted) return;
-    restoredStudy = true;
-    final active = widget.store.activeStudy;
-    if (active == null) return;
-    final words = widget.store.resolveActiveWords(active);
-    if (words.length != active.queueIds.length) {
-      await widget.store.clearActiveStudy();
-      return;
-    }
-    await Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => CardStudyPage(
-        store: widget.store,
-        resume: active,
-      ),
-    ));
-    if (mounted) refresh();
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route == _route) return;
+    if (_route != null) resumeRouteObserver.unsubscribe(this);
+    _route = route;
+    if (route != null) resumeRouteObserver.subscribe(this, route);
+  }
+
+  @override
+  void didPopNext() {
+    scheduleResumeSnapshotCapture('main:$index');
+  }
+
+  void _autoBackupChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    resumeRouteObserver.unsubscribe(this);
+    widget.autoBackup.removeListener(_autoBackupChanged);
+    super.dispose();
   }
 
   void refresh() {
@@ -257,13 +399,19 @@ class _MainShellState extends State<MainShell> {
       HomePage(store: widget.store, refresh: refresh),
       BooksPage(store: widget.store, refresh: refresh),
       SettingsPage(
-          store: widget.store, refresh: refresh, autoBackup: widget.autoBackup),
+          store: widget.store,
+          refresh: refresh,
+          autoBackup: widget.autoBackup.value),
     ];
     return Scaffold(
       body: SafeArea(child: IndexedStack(index: index, children: pages)),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: index,
-        onTap: (value) => setState(() => index = value),
+        onTap: (value) {
+          setState(() => index = value);
+          unawaited(widget.store.setLastMainTab(value));
+          scheduleResumeSnapshotCapture('main:$value');
+        },
         backgroundColor: Colors.white,
         elevation: 0,
         selectedItemColor: sea,
@@ -551,6 +699,20 @@ class _ReferenceHomePageState extends State<HomePage> {
     final favoriteBooks =
         widget.store.books.where((item) => item.isFavorite).toList();
 
+    final next = sessions.isEmpty
+        ? null
+        : sessions.firstWhere((session) => !session.isCompleted,
+            orElse: () => sessions.first);
+    final nextKey = next == null
+        ? ''
+        : widget.store.activeStudyKeyFor(
+            bookId: book.id,
+            sessionIndexes: [next.index],
+            sessionSelections: const {},
+          );
+    final activeNext =
+        next == null ? null : widget.store.getActiveStudyFor(nextKey);
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 28, 20, 12),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -637,74 +799,90 @@ class _ReferenceHomePageState extends State<HomePage> {
                                     crossAxisAlignment:
                                         CrossAxisAlignment.start,
                                     children: [
-                                      const Text('현재 학습 단어장',
-                                          style: TextStyle(
-                                              color: Color(0xFF8E8E93),
-                                              fontSize: 10,
-                                              fontWeight: FontWeight.w600)),
-                                      const SizedBox(height: 1),
-                                      Text(book.name,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: const TextStyle(
-                                              color: ink,
-                                              fontSize: 17,
-                                              fontWeight: FontWeight.w800)),
-                                    ]),
-                              ),
-                              const SizedBox(width: 12),
-                              Text(
-                                  '${book.words.isEmpty ? 0 : (memorized / book.words.length * 100).round()}%',
-                                  style: const TextStyle(
-                                      color: sea,
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w800)),
-                            ]),
-                        const SizedBox(height: 7),
-                        LinearProgressIndicator(
-                            value: book.words.isEmpty
-                                ? 0
-                                : memorized / book.words.length,
-                            minHeight: 6,
-                            borderRadius: BorderRadius.circular(99),
-                            backgroundColor: const Color(0xFFE5E5EA)),
-                        const SizedBox(height: 5),
-                        Align(
-                            alignment: Alignment.centerLeft,
-                            child: Text('$memorized/${book.words.length} 외움',
-                                style: const TextStyle(
-                                    color: Color(0xFF8E8E93), fontSize: 11))),
-                      ]),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Row(children: [
-                    Expanded(
-                        child: _QuickAction(
-                      icon: Icons.history,
-                      iconColor: const Color(0xFFFB923C),
-                      iconBackground: const Color(0xFFFFF7ED),
-                      title: '복습하기',
-                      subtitle: reviewWords.isEmpty
-                          ? '기록 없음'
-                          : '${reviewWords.length}개 단어',
-                      onTap: reviewWords.isEmpty
-                          ? null
-                          : () => _openReview(context, reviewWords),
-                    )),
-                    const SizedBox(width: 8),
-                    Expanded(
-                        child: _QuickAction(
-                      icon: Icons.play_circle_outline,
-                      iconColor: sea,
-                      iconBackground: const Color(0x1A34C759),
-                      title: '학습하기',
-                      subtitle: '처음부터',
-                      onTap: sessions.isEmpty
-                          ? null
-                          : () => _startNext(context, sessions),
-                    )),
-                  ]),
-                ]),
+                                       const Text('현재 학습 단어장',
+                                           style: TextStyle(
+                                               color: Color(0xFF8E8E93),
+                                               fontSize: 10,
+                                               fontWeight: FontWeight.w600)),
+                                       const SizedBox(height: 1),
+                                       Text(book.name,
+                                           overflow: TextOverflow.ellipsis,
+                                           style: const TextStyle(
+                                               color: ink,
+                                               fontSize: 17,
+                                               fontWeight: FontWeight.w800)),
+                                     ]),
+                               ),
+                               const SizedBox(width: 12),
+                               Text(
+                                   '${book.words.isEmpty ? 0 : (memorized / book.words.length * 100).round()}%',
+                                   style: const TextStyle(
+                                       color: sea,
+                                       fontSize: 12,
+                                       fontWeight: FontWeight.w800)),
+                             ]),
+                         const SizedBox(height: 7),
+                         LinearProgressIndicator(
+                             value: book.words.isEmpty
+                                 ? 0
+                                 : memorized / book.words.length,
+                             minHeight: 6,
+                             borderRadius: BorderRadius.circular(99),
+                             backgroundColor: const Color(0xFFE5E5EA)),
+                         const SizedBox(height: 5),
+                         Align(
+                             alignment: Alignment.centerLeft,
+                             child: Text('$memorized/${book.words.length} 외움',
+                                 style: const TextStyle(
+                                     color: Color(0xFF8E8E93), fontSize: 11))),
+                       ]),
+                     ),
+                   ),
+                   const SizedBox(height: 12),
+                   Row(children: [
+                     Expanded(
+                         child: _QuickAction(
+                       icon: Icons.history,
+                       iconColor: const Color(0xFFFB923C),
+                       iconBackground: const Color(0xFFFFF7ED),
+                       title: '복습하기',
+                       subtitle: reviewWords.isEmpty
+                           ? '기록 없음'
+                           : '${reviewWords.length}개 단어',
+                       onTap: reviewWords.isEmpty
+                           ? null
+                           : () => _openReview(context, reviewWords),
+                     )),
+                     const SizedBox(width: 8),
+                     Expanded(
+                         child: _QuickAction(
+                       icon: Icons.play_circle_outline,
+                       iconColor: sea,
+                       iconBackground: const Color(0x1A34C759),
+                       title: activeNext != null ? '이어서 학습' : '학습하기',
+                       subtitle: activeNext != null
+                           ? '${activeNext.memorized}/${activeNext.total} 외움'
+                           : '처음부터',
+                       onTap: sessions.isEmpty
+                           ? null
+                           : () async {
+                               if (activeNext != null) {
+                                 await Navigator.of(context).push(MaterialPageRoute(
+                                   builder: (_) => CardStudyPage(
+                                     store: widget.store,
+                                     resume: activeNext,
+                                   ),
+                                 ));
+                                 if (!mounted) return;
+                                 setState(() {});
+                                 widget.refresh();
+                               } else {
+                                 await _startNext(context, sessions);
+                               }
+                             },
+                     )),
+                   ]),
+                 ]),
         ),
         const SizedBox(height: 8),
         SizedBox(
@@ -1061,7 +1239,8 @@ class CardStudyPage extends StatefulWidget {
       this.sessionIndexes = const [],
       this.sessionSelections = const {},
       this.resume,
-      this.kanjiLookupService});
+      this.kanjiLookupService,
+      this.decisionWriter});
   final VocaStore store;
   final List<Word>? words;
   final String? bookId;
@@ -1069,47 +1248,34 @@ class CardStudyPage extends StatefulWidget {
   final Map<String, List<int>> sessionSelections;
   final ActiveStudy? resume;
   final KanjiLookupService? kanjiLookupService;
+  final Future<void> Function(Word word, StudyState state)? decisionWriter;
 
   @override
   State<CardStudyPage> createState() => _CardStudyPageState();
 }
 
 class _CardStudyPageState extends State<CardStudyPage>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, RouteAware {
   late final List<Word> queue;
   late final int total;
+  late final Map<Word, String> _bookIdsByWord;
   final reviewed = <String>{};
+  final _primaryDrag = ValueNotifier<double>(0);
+  Future<void> _persistenceChain = Future<void>.value();
   var memorized = 0;
   var revealed = false;
-  var dragOffset = Offset.zero;
-  var touchBias = Offset.zero;
-  var dragging = false;
-  var dismissing = false;
   var exiting = false;
   var confirmingExit = false;
+  var _cardsStudiedSinceSync = 0;
   Word? lastWord;
   StudyState? lastState;
   final undoHistory = <StudyDecision>[];
+  ModalRoute<dynamic>? _route;
 
   bool get horizontalSwipe => widget.store.horizontalSwipe;
   String? get activeBookId => widget.resume?.bookId ?? widget.bookId;
   List<int> get activeSessionIndexes =>
       widget.resume?.sessionIndexes ?? widget.sessionIndexes;
-  double get primaryDrag {
-    if (horizontalSwipe) return dragOffset.dx;
-    return dragOffset.dy.abs() >= dragOffset.dx.abs() * .75
-        ? dragOffset.dy
-        : -dragOffset.dx;
-  }
-
-  double get primaryVelocity {
-    if (horizontalSwipe) return _lastDragVelocity.dx;
-    return _lastDragVelocity.dy.abs() >= _lastDragVelocity.dx.abs() * .75
-        ? _lastDragVelocity.dy
-        : -_lastDragVelocity.dx;
-  }
-
-  Offset _lastDragVelocity = Offset.zero;
   Map<String, List<int>> get activeSessionSelections {
     final resumed = widget.resume?.sessionSelections ?? const {};
     if (resumed.isNotEmpty) return resumed;
@@ -1130,7 +1296,20 @@ class _CardStudyPageState extends State<CardStudyPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    final resume = widget.resume;
+    _bookIdsByWord = {
+      for (final book in widget.store.books)
+        for (final word in book.words) word: book.id,
+    };
+    ActiveStudy? resolvedResume = widget.resume;
+    if (resolvedResume == null) {
+      final key = widget.store.activeStudyKeyFor(
+        bookId: widget.bookId,
+        sessionIndexes: widget.sessionIndexes,
+        sessionSelections: widget.sessionSelections,
+      );
+      resolvedResume = widget.store.getActiveStudyFor(key);
+    }
+    final resume = resolvedResume;
     if (resume == null) {
       final words = widget.words ?? widget.store.nextWords();
       queue = shuffleNewStudyQueues
@@ -1166,12 +1345,32 @@ class _CardStudyPageState extends State<CardStudyPage>
             .firstOrNull;
       }
     }
-    WidgetsBinding.instance.addPostFrameCallback((_) => persistStudy());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      persistStudy();
+      if (mounted) unawaited(captureResumeSnapshot('study'));
+    });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route == _route) return;
+    if (_route != null) resumeRouteObserver.unsubscribe(this);
+    _route = route;
+    if (route != null) resumeRouteObserver.subscribe(this, route);
+  }
+
+  @override
+  void didPopNext() {
+    scheduleResumeSnapshotCapture('study');
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    resumeRouteObserver.unsubscribe(this);
+    _primaryDrag.dispose();
     super.dispose();
   }
 
@@ -1181,13 +1380,18 @@ class _CardStudyPageState extends State<CardStudyPage>
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached ||
         state == AppLifecycleState.hidden) {
-      persistStudy();
+      unawaited(_flushStudyPersistence());
     }
   }
 
   Future<void> persistStudy() async {
     if (queue.isEmpty || exiting) return;
-    await widget.store.saveActiveStudy(ActiveStudy(
+    final key = widget.store.activeStudyKeyFor(
+      bookId: activeBookId,
+      sessionIndexes: activeSessionIndexes,
+      sessionSelections: activeSessionSelections,
+    );
+    await widget.store.saveActiveStudyFor(key, ActiveStudy(
       queueIds: queue.map((word) => word.id).toList(),
       queueBookIds: queue.map(_bookIdForWord).whereType<String>().toList(),
       total: total,
@@ -1204,12 +1408,83 @@ class _CardStudyPageState extends State<CardStudyPage>
     ));
   }
 
-  String? _bookIdForWord(Word word) => widget.store.books
-      .where((book) => book.words.any((item) => identical(item, word)))
-      .map((book) => book.id)
-      .firstOrNull;
+  String? _bookIdForWord(Word word) => _bookIdsByWord[word];
+
+  String _cardIdentity(Word word) =>
+      '${_bookIdForWord(word) ?? activeBookId ?? 'unknown'}:${word.id}';
+
+  Future<void> _flushStudyPersistence() async {
+    await _persistenceChain;
+    if (queue.isNotEmpty && !exiting) await persistStudy();
+  }
+
+  void _scheduleDecisionPersistence(Word word, StudyState state) {
+    _persistenceChain = _persistenceChain.then((_) async {
+      await WidgetsBinding.instance.endOfFrame;
+      await (widget.decisionWriter?.call(word, state) ??
+          widget.store.mark(word, state));
+      if (queue.isNotEmpty && !exiting) await persistStudy();
+    });
+  }
 
   Future<void> requestExitStudy() async {
+    if (exiting || confirmingExit) return;
+    setState(() => confirmingExit = true);
+    final choice = await showDialog<StudyExitChoice>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('학습을 나갈까요?'),
+        content: const Text('현재 학습 진행상태를 저장해두면 다음에 이어서 볼 수 있어요.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('계속 학습'),
+          ),
+          TextButton(
+            key: const ValueKey('discard-exit-study'),
+            onPressed: () => Navigator.pop(context, StudyExitChoice.discard),
+            child: const Text('저장 안 함'),
+          ),
+          FilledButton(
+            key: const ValueKey('save-exit-study'),
+            onPressed: () => Navigator.pop(context, StudyExitChoice.save),
+            child: const Text('저장하고 나가기'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    setState(() => confirmingExit = false);
+    if (choice == StudyExitChoice.save) {
+      await exitStudy(saveProgress: true);
+    } else if (choice == StudyExitChoice.discard) {
+      await exitStudy(saveProgress: false);
+    }
+  }
+
+  Future<void> exitStudy({required bool saveProgress}) async {
+    if (exiting) return;
+    await _persistenceChain;
+    if (saveProgress) {
+      await persistStudy();
+      scheduleResumeSnapshotCapture('study');
+    } else {
+      final key = widget.store.activeStudyKeyFor(
+        bookId: activeBookId,
+        sessionIndexes: activeSessionIndexes,
+        sessionSelections: activeSessionSelections,
+      );
+      await widget.store.clearActiveStudyFor(key);
+      unawaited(deleteResumeSnapshot());
+    }
+    if (!mounted) return;
+    setState(() => exiting = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) Navigator.of(context).pop();
+    });
+  }
+
+  Future<void> _legacyRequestExitStudy() async {
     if (exiting || confirmingExit) return;
     setState(() => confirmingExit = true);
     final confirmed = await showDialog<bool>(
@@ -1233,12 +1508,19 @@ class _CardStudyPageState extends State<CardStudyPage>
         false;
     if (!mounted) return;
     setState(() => confirmingExit = false);
-    if (confirmed) await exitStudy();
+    if (confirmed) await _legacyExitStudy();
   }
 
-  Future<void> exitStudy() async {
+  Future<void> _legacyExitStudy() async {
     if (exiting) return;
-    await widget.store.clearActiveStudy();
+    await _persistenceChain;
+    final key = widget.store.activeStudyKeyFor(
+      bookId: activeBookId,
+      sessionIndexes: activeSessionIndexes,
+      sessionSelections: activeSessionSelections,
+    );
+    await widget.store.clearActiveStudyFor(key);
+    unawaited(deleteResumeSnapshot());
     if (!mounted) return;
     setState(() => exiting = true);
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1246,7 +1528,7 @@ class _CardStudyPageState extends State<CardStudyPage>
     });
   }
 
-  Future<void> decide(StudyState state) async {
+  void decide(StudyState state) {
     if (queue.isEmpty) return;
     final word = queue.removeAt(0);
     final previousState = word.state;
@@ -1265,96 +1547,37 @@ class _CardStudyPageState extends State<CardStudyPage>
       final insertAt = reviewReinsertIndex(queue.length);
       queue.insert(insertAt, word);
     }
-    await widget.store.mark(word, state);
+    word.state = state;
     revealed = false;
-    dragOffset = Offset.zero;
-    dismissing = false;
+    _cardsStudiedSinceSync++;
+    if (_cardsStudiedSinceSync >= 5) {
+      _cardsStudiedSinceSync = 0;
+      AutoBackupCoordinator.activeInstance?.requestImmediateBackup();
+    }
     if (queue.isEmpty) {
-      if (activeSessionSelections.isNotEmpty) {
-        for (final selection in activeSessionSelections.entries) {
-          await widget.store.completeSessions(selection.key, selection.value);
+      _persistenceChain = _persistenceChain.then((_) async {
+        await (widget.decisionWriter?.call(word, state) ??
+            widget.store.mark(word, state));
+        if (activeSessionSelections.isNotEmpty) {
+          for (final selection in activeSessionSelections.entries) {
+            await widget.store.completeSessions(selection.key, selection.value);
+          }
+        } else {
+          await widget.store.completeCurrentSession();
         }
-      } else {
-        await widget.store.completeCurrentSession();
-      }
-      await widget.store.clearActiveStudy();
+        final key = widget.store.activeStudyKeyFor(
+          bookId: activeBookId,
+          sessionIndexes: activeSessionIndexes,
+          sessionSelections: activeSessionSelections,
+        );
+        await widget.store.clearActiveStudyFor(key);
+        unawaited(deleteResumeSnapshot());
+      });
     } else {
-      await persistStudy();
+      _scheduleDecisionPersistence(word, state);
     }
     if (mounted) setState(() {});
-  }
-
-  void finishDrag(DragEndDetails details) {
-    if (dismissing) return;
-    _lastDragVelocity = details.velocity.pixelsPerSecond;
-    final velocity = primaryVelocity;
-    final towardNegative = primaryDrag < -90 || velocity < -650;
-    final towardPositive = primaryDrag > 90 || velocity > 650;
-    if (!towardNegative && !towardPositive) {
-      setState(() {
-        dragging = false;
-        dragOffset = Offset.zero;
-        touchBias = Offset.zero;
-      });
-      return;
-    }
-    final positive = towardPositive;
-    final state = stateForDirection(positive);
-    final screenSize = MediaQuery.sizeOf(context);
-    final dismissDistance = max(screenSize.width, screenSize.height) * 1.25;
-    final velocityVector =
-        _lastDragVelocity.distance > 80 ? _lastDragVelocity : dragOffset;
-    final direction = velocityVector.distance == 0
-        ? (horizontalSwipe
-            ? Offset(positive ? 1 : -1, 0)
-            : Offset(0, positive ? 1 : -1))
-        : velocityVector / velocityVector.distance;
-
-    setState(() {
-      dragging = false;
-      dismissing = true;
-      dragOffset = direction * dismissDistance;
-    });
-    Future<void>.delayed(const Duration(milliseconds: 280), () async {
-      if (!mounted) return;
-      await decide(state);
-    });
-  }
-
-  void cancelDrag() {
-    setState(() {
-      dragging = false;
-      dragOffset = Offset.zero;
-      touchBias = Offset.zero;
-    });
-  }
-
-  void beginDrag(DragStartDetails details) {
-    final size = MediaQuery.sizeOf(context);
-    final local = details.localPosition;
-    setState(() {
-      dragging = true;
-      _lastDragVelocity = Offset.zero;
-      touchBias = Offset(
-        ((local.dx / size.width) * 2 - 1).clamp(-1.0, 1.0),
-        ((local.dy / size.height) * 2 - 1).clamp(-1.0, 1.0),
-      );
-    });
-  }
-
-  void updateDrag(DragUpdateDetails details) {
-    setState(() {
-      dragOffset = Offset(
-        (dragOffset.dx + details.delta.dx).clamp(-240.0, 240.0),
-        (dragOffset.dy + details.delta.dy).clamp(-240.0, 240.0),
-      );
-    });
-  }
-
-  double get dragRotation {
-    final crossDrag = horizontalSwipe ? dragOffset.dy : dragOffset.dx;
-    final lever = horizontalSwipe ? -touchBias.dy : touchBias.dx;
-    return (crossDrag / 1800 + primaryDrag * lever / 3200).clamp(-0.08, 0.08);
+    scheduleResumeSnapshotCapture('study');
   }
 
   Future<void> copyText(String text) async {
@@ -1390,7 +1613,12 @@ class _CardStudyPageState extends State<CardStudyPage>
     if (!mounted || updated == null) return;
     await widget.store.updateWord(updated);
     final index = queue.indexWhere((word) => word.id == updated.id);
-    if (index >= 0) queue[index] = updated;
+    if (index >= 0) {
+      final previous = queue[index];
+      final bookId = _bookIdsByWord.remove(previous);
+      queue[index] = updated;
+      if (bookId != null) _bookIdsByWord[updated] = bookId;
+    }
     if (lastWord?.id == updated.id) lastWord = updated;
     if (mounted) setState(() {});
   }
@@ -1409,6 +1637,7 @@ class _CardStudyPageState extends State<CardStudyPage>
     final shouldReveal = !revealed;
     setState(() => revealed = shouldReveal);
     persistStudy();
+    scheduleResumeSnapshotCapture('study');
     if (shouldReveal) {
       speakStudyWord(word.term.isEmpty ? word.reading : word.term);
     }
@@ -1465,6 +1694,8 @@ class _CardStudyPageState extends State<CardStudyPage>
                         fontFamily: japaneseFontFamily(widget.store),
                         fontWeight: FontWeight.w800),
                     onCharacterTap: copyText,
+                    onCharacterDoubleTap: (character) =>
+                        showKanjiDetails(character, word),
                     onCharacterLongPress: (character) =>
                         showKanjiDetails(character, word),
                   ),
@@ -1556,6 +1787,7 @@ class _CardStudyPageState extends State<CardStudyPage>
     lastState = previous?.decision;
     await persistStudy();
     if (mounted) setState(() {});
+    scheduleResumeSnapshotCapture('study');
   }
 
   @override
@@ -1593,14 +1825,6 @@ class _CardStudyPageState extends State<CardStudyPage>
     final studyContextLabel = activeSessionSelections.length > 1
         ? sessionLabel
         : '${selectedBook?.name ?? '기본 단어장'} · $sessionLabel';
-    final dragProgress = (primaryDrag.abs() / 150).clamp(0.0, 1.0);
-    final dragState =
-        primaryDrag == 0 ? null : stateForDirection(primaryDrag > 0);
-    final dragColor = dragState == StudyState.memorized
-        ? Color.lerp(Colors.white, const Color(0xFFCFF2D8), dragProgress)!
-        : dragState == StudyState.review
-            ? Color.lerp(Colors.white, const Color(0xFFFFE8E6), dragProgress)!
-            : Colors.white;
     final negativeColor =
         stateForDirection(false) == StudyState.memorized ? sea : coral;
     final positiveColor =
@@ -1611,12 +1835,9 @@ class _CardStudyPageState extends State<CardStudyPage>
         if (!didPop) requestExitStudy();
       },
       child: Scaffold(
-        body: AnimatedContainer(
-          key: const ValueKey('study-card-background'),
-          duration:
-              dragging ? Duration.zero : const Duration(milliseconds: 180),
-          curve: Curves.easeOut,
-          decoration: BoxDecoration(color: dragColor),
+        body: _StudyBackground(
+          primaryDrag: _primaryDrag,
+          stateForDirection: stateForDirection,
           child: SafeArea(
             child: Padding(
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 10),
@@ -1682,97 +1903,37 @@ class _CardStudyPageState extends State<CardStudyPage>
                       icon: Icons.keyboard_arrow_up, color: negativeColor),
                 const SizedBox(height: 12),
                 Expanded(
-                  child: Stack(
-                    clipBehavior: Clip.none,
-                    children: [
-                      if (nextWord != null)
-                        Positioned.fill(
-                          child: IgnorePointer(
-                            child: Container(
-                              key: const ValueKey('next-study-card'),
-                              decoration: BoxDecoration(
-                                color: Colors.white,
-                                borderRadius: BorderRadius.circular(24),
-                                border:
-                                    Border.all(color: const Color(0x14000000)),
-                                boxShadow: const [
-                                  BoxShadow(
-                                      color: Color(0x10000000),
-                                      blurRadius: 14,
-                                      offset: Offset(0, 7))
-                                ],
-                              ),
-                              child: cardFace(nextWord, false),
-                            ),
-                          ),
-                        ),
-                      Positioned.fill(
-                        child: IgnorePointer(
-                          ignoring: dismissing,
-                          child: GestureDetector(
-                            key: const ValueKey('study-card'),
-                            onTap: () => toggleReveal(word),
-                            onPanStart: beginDrag,
-                            onPanUpdate: updateDrag,
-                            onPanCancel: cancelDrag,
-                            onPanEnd: finishDrag,
-                            child: AnimatedContainer(
-                              key: const ValueKey('study-card-surface'),
-                              duration: dragging
-                                  ? Duration.zero
-                                  : Duration(
-                                      milliseconds: dismissing ? 280 : 180),
-                              curve: dismissing
-                                  ? Curves.easeInCubic
-                                  : Curves.easeOutCubic,
-                              width: double.infinity,
-                              transformAlignment: Alignment.center,
-                              transform: Matrix4.identity()
-                                ..setTranslationRaw(
-                                    dragOffset.dx, dragOffset.dy, 0.0)
-                                ..rotateZ(dragRotation),
-                              decoration: BoxDecoration(
-                                color: Colors.white,
-                                borderRadius: BorderRadius.circular(24),
-                                border:
-                                    Border.all(color: const Color(0x14000000)),
-                                boxShadow: const [
-                                  BoxShadow(
-                                      color: Color(0x18000000),
-                                      blurRadius: 22,
-                                      offset: Offset(0, 10))
-                                ],
-                              ),
-                              child: widget.store.flipCard
-                                  ? TweenAnimationBuilder<double>(
-                                      key: ValueKey('active-card-${word.id}'),
-                                      tween: Tween(
-                                          begin: 0, end: revealed ? pi : 0),
-                                      duration:
-                                          const Duration(milliseconds: 420),
-                                      curve: Curves.easeInOutCubic,
-                                      builder: (context, angle, _) {
-                                        final back = angle > pi / 2;
-                                        return Transform(
-                                          alignment: Alignment.center,
-                                          transform: Matrix4.identity()
-                                            ..setEntry(3, 2, 0.0012)
-                                            ..rotateY(angle),
-                                          child: Transform(
-                                            alignment: Alignment.center,
-                                            transform: Matrix4.rotationY(
-                                                back ? pi : 0),
-                                            child: cardFace(word, back),
-                                          ),
-                                        );
-                                      },
-                                    )
-                                  : cardFace(word, revealed),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
+                  child: _StudyCardDeck(
+                    frontId: _cardIdentity(word),
+                    backId: nextWord == null ? null : _cardIdentity(nextWord),
+                    horizontalSwipe: horizontalSwipe,
+                    onTap: () => toggleReveal(word),
+                    onPrimaryDragChanged: (value) => _primaryDrag.value = value,
+                    onDismissed: (positive) =>
+                        decide(stateForDirection(positive)),
+                    front: widget.store.flipCard
+                        ? TweenAnimationBuilder<double>(
+                            key: ValueKey('active-card-${_cardIdentity(word)}'),
+                            tween: Tween(begin: 0, end: revealed ? pi : 0),
+                            duration: const Duration(milliseconds: 420),
+                            curve: Curves.easeInOutCubic,
+                            builder: (context, angle, _) {
+                              final back = angle > pi / 2;
+                              return Transform(
+                                alignment: Alignment.center,
+                                transform: Matrix4.identity()
+                                  ..setEntry(3, 2, 0.0012)
+                                  ..rotateY(angle),
+                                child: Transform(
+                                  alignment: Alignment.center,
+                                  transform: Matrix4.rotationY(back ? pi : 0),
+                                  child: cardFace(word, back),
+                                ),
+                              );
+                            },
+                          )
+                        : cardFace(word, revealed),
+                    back: nextWord == null ? null : cardFace(nextWord, false),
                   ),
                 ),
                 const SizedBox(height: 8),
@@ -1799,6 +1960,297 @@ class _CardStudyPageState extends State<CardStudyPage>
       ),
     );
   }
+}
+
+class _StudyBackground extends StatelessWidget {
+  const _StudyBackground({
+    required this.primaryDrag,
+    required this.stateForDirection,
+    required this.child,
+  });
+
+  final ValueNotifier<double> primaryDrag;
+  final StudyState Function(bool positive) stateForDirection;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) => ValueListenableBuilder<double>(
+        valueListenable: primaryDrag,
+        child: child,
+        builder: (context, drag, child) {
+          final progress = (drag.abs() / 150).clamp(0.0, 1.0);
+          final dragState = drag == 0 ? null : stateForDirection(drag > 0);
+          final color = dragState == StudyState.memorized
+              ? Color.lerp(Colors.white, const Color(0xFFCFF2D8), progress)!
+              : dragState == StudyState.review
+                  ? Color.lerp(Colors.white, const Color(0xFFFFE8E6), progress)!
+                  : Colors.white;
+          return AnimatedContainer(
+            key: const ValueKey('study-card-background'),
+            duration:
+                drag == 0 ? const Duration(milliseconds: 180) : Duration.zero,
+            curve: Curves.easeOut,
+            color: color,
+            child: child,
+          );
+        },
+      );
+}
+
+class _StudyCardDeck extends StatefulWidget {
+  const _StudyCardDeck({
+    required this.frontId,
+    required this.backId,
+    required this.horizontalSwipe,
+    required this.front,
+    required this.back,
+    required this.onTap,
+    required this.onPrimaryDragChanged,
+    required this.onDismissed,
+  });
+
+  final String frontId;
+  final String? backId;
+  final bool horizontalSwipe;
+  final Widget front;
+  final Widget? back;
+  final VoidCallback onTap;
+  final ValueChanged<double> onPrimaryDragChanged;
+  final ValueChanged<bool> onDismissed;
+
+  @override
+  State<_StudyCardDeck> createState() => _StudyCardDeckState();
+}
+
+class _StudyCardDeckState extends State<_StudyCardDeck>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  Animation<Offset>? _offsetAnimation;
+  Animation<double>? _rotationAnimation;
+  Offset _offset = Offset.zero;
+  Offset _touchBias = Offset.zero;
+  double _rotation = 0;
+  bool _dismissing = false;
+
+  double _primaryFor(Offset offset) {
+    if (widget.horizontalSwipe) return offset.dx;
+    return offset.dy.abs() >= offset.dx.abs() * .75 ? offset.dy : -offset.dx;
+  }
+
+  double _rotationFor(Offset offset) {
+    final primary = _primaryFor(offset);
+    final cross = widget.horizontalSwipe ? offset.dy : offset.dx;
+    final lever = widget.horizontalSwipe ? -_touchBias.dy : _touchBias.dx;
+    return (cross / 1800 + primary * lever / 3200).clamp(-0.08, 0.08);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(vsync: this)
+      ..addListener(() {
+        final offsetAnimation = _offsetAnimation;
+        final rotationAnimation = _rotationAnimation;
+        if (offsetAnimation == null || rotationAnimation == null) return;
+        setState(() {
+          _offset = offsetAnimation.value;
+          _rotation = rotationAnimation.value;
+        });
+        widget.onPrimaryDragChanged(_primaryFor(_offset));
+      });
+  }
+
+  @override
+  void didUpdateWidget(covariant _StudyCardDeck oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.frontId == widget.frontId) return;
+    _controller.stop();
+    _offset = Offset.zero;
+    _rotation = 0;
+    _touchBias = Offset.zero;
+    _dismissing = false;
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _beginDrag(DragStartDetails details) {
+    if (_dismissing) return;
+    _controller.stop();
+    final size = context.size ?? Size.zero;
+    setState(() {
+      _touchBias = Offset(
+        size.width == 0
+            ? 0
+            : ((details.localPosition.dx / size.width) * 2 - 1)
+                .clamp(-1.0, 1.0),
+        size.height == 0
+            ? 0
+            : ((details.localPosition.dy / size.height) * 2 - 1)
+                .clamp(-1.0, 1.0),
+      );
+    });
+  }
+
+  void _updateDrag(DragUpdateDetails details) {
+    if (_dismissing) return;
+    setState(() {
+      _offset += details.delta;
+      _rotation = _rotationFor(_offset);
+    });
+    widget.onPrimaryDragChanged(_primaryFor(_offset));
+  }
+
+  Future<void> _animateTo({
+    required Offset offset,
+    required double rotation,
+    required Duration duration,
+    required Curve curve,
+  }) async {
+    _controller
+      ..stop()
+      ..duration = duration;
+    final curved = CurvedAnimation(parent: _controller, curve: curve);
+    _offsetAnimation =
+        Tween<Offset>(begin: _offset, end: offset).animate(curved);
+    _rotationAnimation =
+        Tween<double>(begin: _rotation, end: rotation).animate(curved);
+    await _controller.forward(from: 0);
+  }
+
+  Future<void> _cancelDrag() async {
+    if (_dismissing) return;
+    await _animateTo(
+      offset: Offset.zero,
+      rotation: 0,
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOutCubic,
+    );
+    _touchBias = Offset.zero;
+    widget.onPrimaryDragChanged(0);
+  }
+
+  Future<void> _finishDrag(DragEndDetails details) async {
+    if (_dismissing) return;
+    final velocityVector = details.velocity.pixelsPerSecond;
+    final primaryVelocity = _primaryFor(velocityVector);
+    final primaryDrag = _primaryFor(_offset);
+    final towardNegative = primaryDrag < -90 || primaryVelocity < -650;
+    final towardPositive = primaryDrag > 90 || primaryVelocity > 650;
+    if (!towardNegative && !towardPositive) {
+      await _cancelDrag();
+      return;
+    }
+
+    final positive = towardPositive;
+    final availableSize = context.size ?? MediaQuery.sizeOf(context);
+    final dismissDistance =
+        max(availableSize.width, availableSize.height) * 1.25;
+    final fallbackDirection = widget.horizontalSwipe
+        ? Offset(positive ? 1 : -1, 0)
+        : Offset(0, positive ? 1 : -1);
+    final directionSource = velocityVector.distance > 80
+        ? velocityVector
+        : (_offset.distance == 0 ? fallbackDirection : _offset);
+    final direction = directionSource / directionSource.distance;
+    final target = direction * dismissDistance;
+    final speed = velocityVector.distance;
+    final remaining = (target - _offset).distance;
+    final durationMs =
+        speed > 650 ? (remaining / speed * 1000).round().clamp(160, 280) : 280;
+    setState(() => _dismissing = true);
+    await _animateTo(
+      offset: target,
+      rotation: _rotationFor(target),
+      duration: Duration(milliseconds: durationMs),
+      curve: Curves.easeInCubic,
+    );
+    if (!mounted) return;
+    widget.onPrimaryDragChanged(0);
+    widget.onDismissed(positive);
+  }
+
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+        key: const ValueKey('study-card'),
+        behavior: HitTestBehavior.opaque,
+        onTap: _dismissing ? null : widget.onTap,
+        onPanStart: _beginDrag,
+        onPanUpdate: _updateDrag,
+        onPanCancel: _cancelDrag,
+        onPanEnd: _finishDrag,
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            if (widget.back case final back?)
+              Positioned.fill(
+                child: _StudyCardLayer(
+                  key: ValueKey('deck-card-${widget.backId}'),
+                  testKey: const ValueKey('next-study-card'),
+                  child: back,
+                ),
+              ),
+            Positioned.fill(
+              child: _StudyCardLayer(
+                key: ValueKey('deck-card-${widget.frontId}'),
+                testKey: const ValueKey('study-card-surface'),
+                offset: _offset,
+                rotation: _rotation,
+                foreground: true,
+                child: widget.front,
+              ),
+            ),
+          ],
+        ),
+      );
+}
+
+class _StudyCardLayer extends StatelessWidget {
+  const _StudyCardLayer({
+    super.key,
+    required this.testKey,
+    required this.child,
+    this.offset = Offset.zero,
+    this.rotation = 0,
+    this.foreground = false,
+  });
+
+  final Key testKey;
+  final Widget child;
+  final Offset offset;
+  final double rotation;
+  final bool foreground;
+
+  @override
+  Widget build(BuildContext context) => Transform(
+        key: testKey,
+        alignment: Alignment.center,
+        transform: Matrix4.identity()
+          ..setTranslationRaw(offset.dx, offset.dy, 0)
+          ..rotateZ(rotation),
+        child: RepaintBoundary(
+          child: Container(
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(24),
+              border: Border.all(color: const Color(0x14000000)),
+              boxShadow: [
+                BoxShadow(
+                  color: foreground
+                      ? const Color(0x18000000)
+                      : const Color(0x10000000),
+                  blurRadius: foreground ? 22 : 14,
+                  offset: Offset(0, foreground ? 10 : 7),
+                ),
+              ],
+            ),
+            child: child,
+          ),
+        ),
+      );
 }
 
 class _RoundIconButton extends StatelessWidget {
@@ -1829,12 +2281,14 @@ class _TappableHanTerm extends StatelessWidget {
     required this.term,
     required this.style,
     required this.onCharacterTap,
+    required this.onCharacterDoubleTap,
     required this.onCharacterLongPress,
   });
 
   final String term;
   final TextStyle style;
   final ValueChanged<String> onCharacterTap;
+  final ValueChanged<String> onCharacterDoubleTap;
   final ValueChanged<String> onCharacterLongPress;
 
   @override
@@ -1854,6 +2308,7 @@ class _TappableHanTerm extends StatelessWidget {
                   key: ValueKey('copy-han-$index'),
                   behavior: HitTestBehavior.opaque,
                   onTap: () => onCharacterTap(characters[index]),
+                  onDoubleTap: () => onCharacterDoubleTap(characters[index]),
                   onLongPress: () => onCharacterLongPress(characters[index]),
                   child: Text(characters[index], style: style),
                 ),
@@ -2422,6 +2877,53 @@ class BooksPage extends StatefulWidget {
   State<BooksPage> createState() => _BooksPageState();
 }
 
+class _SmoothBookExpansion extends StatelessWidget {
+  const _SmoothBookExpansion({
+    required this.expanded,
+    required this.child,
+  });
+
+  final bool expanded;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) => AnimatedSwitcher(
+        duration: Duration(milliseconds: expanded ? 260 : 180),
+        switchInCurve: Curves.easeOutCubic,
+        switchOutCurve: Curves.easeInCubic,
+        transitionBuilder: (child, animation) {
+          final curved = CurvedAnimation(
+            parent: animation,
+            curve: Curves.easeOutCubic,
+            reverseCurve: Curves.easeInCubic,
+          );
+          return SizeTransition(
+            sizeFactor: curved,
+            axisAlignment: -1,
+            child: FadeTransition(
+              opacity: curved,
+              child: SlideTransition(
+                position: Tween<Offset>(
+                  begin: const Offset(0, -0.04),
+                  end: Offset.zero,
+                ).animate(curved),
+                child: child,
+              ),
+            ),
+          );
+        },
+        child: expanded
+            ? KeyedSubtree(
+                key: const ValueKey('expanded-book-sessions'),
+                child: child,
+              )
+            : const SizedBox(
+                key: ValueKey('collapsed-book-sessions'),
+                height: 0,
+              ),
+      );
+}
+
 class _BooksPageState extends State<BooksPage> {
   var editMode = false;
   var searchQuery = '';
@@ -2720,46 +3222,41 @@ class _BooksPageState extends State<BooksPage> {
                 onLongPress: editMode ? null : importFile,
               ),
             ),
-            AnimatedSize(
-              duration: const Duration(milliseconds: 220),
-              curve: Curves.easeOutCubic,
-              alignment: Alignment.topCenter,
-              child: !expandedBookIds.contains(book.id) || editMode
-                  ? const SizedBox.shrink()
-                  : Column(children: [
-                      const Divider(height: 1),
-                      ...book.sessions(widget.store.sessionSize).map(
-                            (session) => Material(
-                              color: widget.store.isSessionCompleted(
-                                      book.id, session.index)
-                                  ? const Color(0xFFEDEDED)
-                                  : Colors.transparent,
-                              child: ListTile(
-                                key: ValueKey(
-                                    'book-${book.id}-session-${session.index}'),
-                                dense: true,
-                                contentPadding:
-                                    const EdgeInsets.only(left: 58, right: 14),
-                                title: Text(session.label,
-                                    style: const TextStyle(
-                                        fontSize: 13,
-                                        fontWeight: FontWeight.w700)),
-                                subtitle: Text(
-                                    '${session.memorizedCount}/${session.words.length} 단어'),
-                                trailing: const Icon(Icons.chevron_right,
-                                    color: Color(0xFF8E8E93), size: 18),
-                                onTap: () => openSession(book, session.index),
-                              ),
-                            ),
-                          ),
-                      const Divider(height: 1),
-                      TextButton.icon(
-                        onPressed: () => openBook(book),
-                        icon: const Icon(Icons.menu_book_outlined, size: 17),
-                        label: const Text('단어장 전체 보기'),
+            _SmoothBookExpansion(
+              expanded: expandedBookIds.contains(book.id) && !editMode,
+              child: Column(children: [
+                const Divider(height: 1),
+                ...book.sessions(widget.store.sessionSize).map(
+                      (session) => Material(
+                        color: widget.store
+                                .isSessionCompleted(book.id, session.index)
+                            ? const Color(0xFFEDEDED)
+                            : Colors.transparent,
+                        child: ListTile(
+                          key: ValueKey(
+                              'book-${book.id}-session-${session.index}'),
+                          dense: true,
+                          contentPadding:
+                              const EdgeInsets.only(left: 58, right: 14),
+                          title: Text(session.label,
+                              style: const TextStyle(
+                                  fontSize: 13, fontWeight: FontWeight.w700)),
+                          subtitle: Text(
+                              '${session.memorizedCount}/${session.words.length} 단어'),
+                          trailing: const Icon(Icons.chevron_right,
+                              color: Color(0xFF8E8E93), size: 18),
+                          onTap: () => openSession(book, session.index),
+                        ),
                       ),
-                      const SizedBox(height: 4),
-                    ]),
+                    ),
+                const Divider(height: 1),
+                TextButton.icon(
+                  onPressed: () => openBook(book),
+                  icon: const Icon(Icons.menu_book_outlined, size: 17),
+                  label: const Text('단어장 전체 보기'),
+                ),
+                const SizedBox(height: 4),
+              ]),
             ),
           ]),
         ),
@@ -3454,6 +3951,7 @@ class LegacySettingsPage extends StatelessWidget {
                 false;
             if (ok) {
               await store.resetProgress();
+              await deleteResumeSnapshot();
               refresh();
             }
           },
@@ -3553,6 +4051,7 @@ class _SettingsPageState extends State<SettingsPage> {
     await FirebaseAuth.instance.signOut();
     await ensureGoogleSignInInitialized();
     await GoogleSignIn.instance.signOut();
+    await deleteResumeSnapshot();
     if (mounted) setState(() {});
   }
 
@@ -4225,38 +4724,10 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Future<void> editSessionSize() async {
-    var selected = widget.store.sessionSize;
+    final selected = widget.store.sessionSize;
     final saved = await showDialog<int>(
       context: context,
-      builder: (context) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: const Text('기본 세션 크기 변경'),
-          content: SizedBox(
-            width: 240,
-            height: 144,
-            child: CupertinoPicker(
-              itemExtent: 38,
-              scrollController: FixedExtentScrollController(
-                initialItem: ((selected - 5) / 5).round().clamp(0, 39),
-              ),
-              onSelectedItemChanged: (index) =>
-                  setDialogState(() => selected = 5 + index * 5),
-              children: List.generate(
-                40,
-                (index) => Center(child: Text('${5 + index * 5}개')),
-              ),
-            ),
-          ),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('취소')),
-            FilledButton(
-                onPressed: () => Navigator.pop(context, selected),
-                child: const Text('저장')),
-          ],
-        ),
-      ),
+      builder: (context) => _SessionSizeDialog(initialValue: selected),
     );
     if (saved == null || saved == widget.store.sessionSize) return;
     await widget.store.setSessionSize(saved);
@@ -4375,10 +4846,74 @@ class _SettingsPageState extends State<SettingsPage> {
         false;
     if (!secondConfirmed) return;
     await widget.store.resetProgress();
+    await deleteResumeSnapshot();
     widget.refresh();
     if (mounted) setState(() {});
   }
 }
+
+class _SessionSizeDialog extends StatefulWidget {
+  final int initialValue;
+  const _SessionSizeDialog({required this.initialValue});
+
+  @override
+  State<_SessionSizeDialog> createState() => _SessionSizeDialogState();
+}
+
+class _SessionSizeDialogState extends State<_SessionSizeDialog> {
+  late final FixedExtentScrollController _scrollController;
+  late int _selected;
+
+  @override
+  void initState() {
+    super.initState();
+    _selected = widget.initialValue;
+    _scrollController = FixedExtentScrollController(
+      initialItem: ((_selected - 5) / 5).round().clamp(0, 39),
+    );
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('기본 세션 크기 변경'),
+      content: SizedBox(
+        width: 240,
+        height: 144,
+        child: CupertinoPicker(
+          itemExtent: 38,
+          scrollController: _scrollController,
+          onSelectedItemChanged: (index) {
+            setState(() {
+              _selected = 5 + index * 5;
+            });
+          },
+          children: List.generate(
+            40,
+            (index) => Center(child: Text('${5 + index * 5}개')),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('취소'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(context, _selected),
+          child: const Text('저장'),
+        ),
+      ],
+    );
+  }
+}
+
 
 class _CloudBackupOverviewSheet extends StatelessWidget {
   const _CloudBackupOverviewSheet({required this.overview});

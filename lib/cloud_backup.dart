@@ -242,6 +242,8 @@ class CloudBackup {
       'cardMeaningStyle':
           profileData['cardMeaningStyle'] as Map<String, dynamic>? ??
               <String, dynamic>{},
+      'activeStudy':
+          profileData['activeStudy'] as Map<String, dynamic>? ?? null,
     };
   }
 
@@ -299,6 +301,7 @@ class CloudBackup {
         'japaneseFont': backup['japaneseFont'],
         'cardFontSizes': backup['cardFontSizes'],
         'cardMeaningStyle': backup['cardMeaningStyle'],
+        'activeStudy': backup['activeStudy'],
         'bookOrder': store.books.map((book) => book.id).toList(),
         'updatedAt': FieldValue.serverTimestamp(),
       };

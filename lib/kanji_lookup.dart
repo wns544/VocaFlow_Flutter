@@ -162,23 +162,20 @@ Map<String, String> _decodeKoreanTable(String source) {
 List<String> _stringList(dynamic value) =>
     (value as List<dynamic>? ?? const []).whereType<String>().toList();
 
+final HttpClient _sharedHttpClient = HttpClient();
+
 Future<Map<String, dynamic>> _fetchJapaneseJson(Uri uri) async {
-  final client = HttpClient();
-  try {
-    final request =
-        await client.getUrl(uri).timeout(const Duration(seconds: 8));
-    request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-    final response = await request.close().timeout(const Duration(seconds: 8));
-    if (response.statusCode != HttpStatus.ok) {
-      throw HttpException('KanjiAPI returned ${response.statusCode}', uri: uri);
-    }
-    final body = await response.transform(utf8.decoder).join();
-    final decoded = jsonDecode(body);
-    if (decoded is! Map<String, dynamic>) {
-      throw const FormatException('KanjiAPI returned invalid JSON.');
-    }
-    return decoded;
-  } finally {
-    client.close(force: true);
+  final request =
+      await _sharedHttpClient.getUrl(uri).timeout(const Duration(seconds: 8));
+  request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+  final response = await request.close().timeout(const Duration(seconds: 8));
+  if (response.statusCode != HttpStatus.ok) {
+    throw HttpException('KanjiAPI returned ${response.statusCode}', uri: uri);
   }
+  final body = await response.transform(utf8.decoder).join();
+  final decoded = jsonDecode(body);
+  if (decoded is! Map<String, dynamic>) {
+    throw const FormatException('KanjiAPI returned invalid JSON.');
+  }
+  return decoded;
 }

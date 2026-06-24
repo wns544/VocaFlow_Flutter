@@ -12,6 +12,8 @@ import 'store.dart';
 enum InitialSyncChoice { cloudReplace, merge }
 
 class AutoBackupCoordinator with WidgetsBindingObserver {
+  static AutoBackupCoordinator? activeInstance;
+
   AutoBackupCoordinator({
     required this.store,
     this.onChanged,
@@ -52,6 +54,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       : store.cloudChanges.networkPolicy(user!.uid);
 
   void start() {
+    activeInstance = this;
     WidgetsBinding.instance.addObserver(this);
     store.cloudChanges.onChanged = _handleTrackedChange;
     store.onSessionCompleted = requestImmediateBackup;
@@ -64,6 +67,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   }
 
   void dispose() {
+    if (activeInstance == this) activeInstance = null;
     WidgetsBinding.instance.removeObserver(this);
     if (store.cloudChanges.onChanged == _handleTrackedChange) {
       store.cloudChanges.onChanged = null;

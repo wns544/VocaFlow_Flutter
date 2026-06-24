@@ -32,6 +32,58 @@ Map<String, dynamic> mergeBackupJson({
   result['books'] = cloudBooks.map((book) => book.toJson()).toList();
   result['completed'] = _union(cloud['completed'], local['completed']);
   result['studyDays'] = _union(cloud['studyDays'], local['studyDays']);
+  
+  final mergedStudies = <String, dynamic>{};
+  final cloudStudies = cloud['activeStudies'] as Map<dynamic, dynamic>? ?? const {};
+  final localStudies = local['activeStudies'] as Map<dynamic, dynamic>? ?? const {};
+  final allKeys = {...cloudStudies.keys, ...localStudies.keys};
+  
+  for (final key in allKeys) {
+    final cloudVal = cloudStudies[key];
+    final localVal = localStudies[key];
+    if (cloudVal != null && localVal != null) {
+      final timeCloud = cloudVal['updatedAt'] != null
+          ? DateTime.tryParse(cloudVal['updatedAt'] as String)
+          : null;
+      final timeLocal = localVal['updatedAt'] != null
+          ? DateTime.tryParse(localVal['updatedAt'] as String)
+          : null;
+      if (timeCloud != null && timeLocal != null) {
+        if (timeCloud.isAfter(timeLocal)) {
+          mergedStudies[key.toString()] = cloudVal;
+        } else {
+          mergedStudies[key.toString()] = localVal;
+        }
+      } else {
+        final cloudQueueLen = (cloudVal['queueIds'] as List?)?.length ?? 9999;
+        final localQueueLen = (localVal['queueIds'] as List?)?.length ?? 9999;
+        if (cloudQueueLen <= localQueueLen) {
+          mergedStudies[key.toString()] = cloudVal;
+        } else {
+          mergedStudies[key.toString()] = localVal;
+        }
+      }
+    } else {
+      mergedStudies[key.toString()] = cloudVal ?? localVal;
+    }
+  }
+  result['activeStudies'] = mergedStudies;
+
+  dynamic fallbackActive;
+  DateTime? latestTime;
+  mergedStudies.forEach((k, v) {
+    if (v is Map) {
+      final timeStr = v['updatedAt'] as String?;
+      final time = timeStr == null ? null : DateTime.tryParse(timeStr);
+      if (fallbackActive == null ||
+          (time != null && (latestTime == null || time.isAfter(latestTime!)))) {
+        fallbackActive = v;
+        latestTime = time;
+      }
+    }
+  });
+  result['activeStudy'] =
+      fallbackActive ?? cloud['activeStudy'] ?? local['activeStudy'];
   return result;
 }
 

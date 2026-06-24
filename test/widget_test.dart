@@ -5,6 +5,7 @@
 // gestures. You can also use WidgetTester to find child widgets in the widget
 // tree, read text, and verify that the values of widget properties are correct.
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -58,6 +59,35 @@ void main() {
     expect(find.textContaining('즐겨찾기한 단어장이 없습니다.'), findsOneWidget);
   });
 
+  testWidgets('local UI does not wait for Firebase initialization',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final firebase = Completer<bool>();
+
+    await tester
+        .pumpWidget(VocaFlowApp(firebaseInitialization: firebase.future));
+    await tester.pumpAndSettle();
+
+    expect(find.text('VOCAFLOW'), findsOneWidget);
+    expect(firebase.isCompleted, isFalse);
+    firebase.complete(false);
+    await tester.pump();
+  });
+
+  testWidgets('cold start restores the last main tab',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({'lastMainTab': 2});
+
+    await tester.pumpWidget(const VocaFlowApp());
+    await tester.pumpAndSettle();
+
+    expect(
+        tester
+            .widget<BottomNavigationBar>(find.byType(BottomNavigationBar))
+            .currentIndex,
+        2);
+  });
+
   testWidgets('creates a word book from the add dialog',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({});
@@ -109,11 +139,10 @@ void main() {
     await tester.pump();
     final background = tester.widget<AnimatedContainer>(
         find.byKey(const ValueKey('study-card-background')));
-    final surface = tester.widget<AnimatedContainer>(
-        find.byKey(const ValueKey('study-card-surface')));
+    final surface = tester
+        .widget<Transform>(find.byKey(const ValueKey('study-card-surface')));
     expect((background.decoration as BoxDecoration).color, isNot(Colors.white));
-    expect((surface.decoration as BoxDecoration).color, Colors.white);
-    expect(surface.transformAlignment, Alignment.center);
+    expect(surface.alignment, Alignment.center);
 
     await gesture.moveBy(const Offset(0, -80));
     await gesture.up();
@@ -137,15 +166,156 @@ void main() {
     await gesture.moveBy(const Offset(25, -30));
     await tester.pump();
 
-    final surface = tester.widget<AnimatedContainer>(
-        find.byKey(const ValueKey('study-card-surface')));
-    final matrix = surface.transform!;
+    final surface = tester
+        .widget<Transform>(find.byKey(const ValueKey('study-card-surface')));
+    final matrix = surface.transform;
     expect(matrix.storage[12], greaterThan(10));
     expect(matrix.storage[13], lessThan(-10));
     expect(matrix.storage[1].abs(), greaterThan(0.001));
     expect(matrix.storage[1].abs(), lessThan(0.09));
 
     await gesture.up();
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets('warm resume keeps the exact study card and revealed face',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final calls = <MethodCall>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(resumeSnapshotChannel, (call) async {
+      calls.add(call);
+      return true;
+    });
+    addTearDown(() => TestDefaultBinaryMessengerBinding
+        .instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(resumeSnapshotChannel, null));
+    final store = await VocaStore.load();
+    final word =
+        Word(id: 9150, term: 'resume', reading: 'reading', meaning: 'meaning');
+    await tester.pumpWidget(MaterialApp(
+      home: CardStudyPage(store: store, words: [word]),
+    ));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('study-card')));
+    await tester.pumpAndSettle();
+
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpAndSettle();
+
+    expect(find.text('resume'), findsOneWidget);
+    expect(find.text('meaning'), findsOneWidget);
+    expect(
+        calls.any((call) =>
+            call.method == 'capture' && call.arguments['target'] == 'study'),
+        isTrue);
+  });
+
+  testWidgets('study card follows the pointer beyond the old drag clamp',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final words = [
+      Word(id: 9201, term: 'first', reading: '', meaning: 'one'),
+      Word(id: 9202, term: 'second', reading: '', meaning: 'two'),
+    ];
+    await tester.pumpWidget(MaterialApp(
+      home: CardStudyPage(store: store, words: words),
+    ));
+    await tester.pumpAndSettle();
+
+    final card = find.byKey(const ValueKey('study-card'));
+    final gesture = await tester.startGesture(tester.getCenter(card));
+    await gesture.moveBy(const Offset(0, -20));
+    await gesture.moveBy(const Offset(0, -160));
+    await gesture.moveBy(const Offset(0, -160));
+    await tester.pump();
+
+    final surface = tester
+        .widget<Transform>(find.byKey(const ValueKey('study-card-surface')));
+    expect(surface.transform.storage[13], lessThan(-300));
+    await gesture.cancel();
+    await tester.pumpAndSettle();
+    final reset = tester
+        .widget<Transform>(find.byKey(const ValueKey('study-card-surface')));
+    expect(reset.transform.storage[12], closeTo(0, .01));
+    expect(reset.transform.storage[13], closeTo(0, .01));
+  });
+
+  testWidgets('the waiting card stays fixed while it becomes the front card',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final words = [
+      Word(id: 9301, term: 'front', reading: '', meaning: 'one'),
+      Word(id: 9302, term: 'waiting', reading: '', meaning: 'two'),
+      Word(id: 9303, term: 'third', reading: '', meaning: 'three'),
+    ];
+    await tester.pumpWidget(MaterialApp(
+      home: CardStudyPage(store: store, words: words),
+    ));
+    await tester.pumpAndSettle();
+
+    final waiting = find.byKey(const ValueKey('next-study-card'));
+    final waitingRect = tester.getRect(waiting);
+    final card = find.byKey(const ValueKey('study-card'));
+    final gesture = await tester.startGesture(tester.getCenter(card));
+    await gesture.moveBy(const Offset(0, -80));
+    await gesture.moveBy(const Offset(0, -80));
+    await gesture.moveBy(const Offset(0, -80));
+    await gesture.up();
+    await tester.pump(const Duration(milliseconds: 120));
+    expect(tester.getRect(waiting), waitingRect);
+
+    await tester.pumpAndSettle();
+    expect(find.text('waiting'), findsOneWidget);
+    final promoted = tester
+        .widget<Transform>(find.byKey(const ValueKey('study-card-surface')));
+    expect(tester.getRect(find.byKey(const ValueKey('study-card-surface'))),
+        waitingRect);
+    expect(promoted.transform.storage[12], closeTo(0, .01));
+    expect(promoted.transform.storage[13], closeTo(0, .01));
+  });
+
+  testWidgets('the next card does not wait for decision persistence',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final write = Completer<void>();
+    final words = [
+      Word(id: 9401, term: 'front', reading: '', meaning: 'one'),
+      Word(id: 9402, term: 'next', reading: '', meaning: 'two'),
+      Word(id: 9403, term: 'third', reading: '', meaning: 'three'),
+    ];
+    await tester.pumpWidget(MaterialApp(
+      home: CardStudyPage(
+        store: store,
+        words: words,
+        decisionWriter: (_, __) => write.future,
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    final card = find.byKey(const ValueKey('study-card'));
+    final gesture = await tester.startGesture(tester.getCenter(card));
+    await gesture.moveBy(const Offset(0, -80));
+    await gesture.moveBy(const Offset(0, -80));
+    await gesture.moveBy(const Offset(0, -80));
+    await gesture.up();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump();
+
+    final surface = find.byKey(const ValueKey('study-card-surface'));
+    expect(find.descendant(of: surface, matching: find.text('next')),
+        findsOneWidget);
+    expect(write.isCompleted, isFalse);
+
+    write.complete();
     await tester.pumpAndSettle();
   });
 
@@ -430,8 +600,6 @@ void main() {
     await tester.pumpAndSettle();
     await tester.pumpWidget(const VocaFlowApp());
     await tester.pumpAndSettle();
-    await tester.tap(find.text('단어장'));
-    await tester.pumpAndSettle();
     final completedBookCard = find.byKey(const ValueKey('book-card-default'));
     expect(
         tester.widget<Card>(completedBookCard).color, const Color(0xFFEDEDED));
@@ -649,8 +817,8 @@ void main() {
     await gesture.moveBy(const Offset(25, 0));
     await gesture.moveBy(const Offset(25, 0));
     await tester.pump();
-    final moved = tester.widget<AnimatedContainer>(surface);
-    expect(moved.transform!.storage[12], greaterThan(0));
+    final moved = tester.widget<Transform>(surface);
+    expect(moved.transform.storage[12], greaterThan(0));
     await gesture.cancel();
   });
 

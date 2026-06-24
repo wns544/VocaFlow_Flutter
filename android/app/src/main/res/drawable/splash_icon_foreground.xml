@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <inset xmlns:android="http://schemas.android.com/apk/res/android"
-    android:drawable="@mipmap/ic_launcher"
-    android:insetLeft="10%"
-    android:insetTop="10%"
-    android:insetRight="10%"
-    android:insetBottom="10%" />
+    android:drawable="@mipmap/splash_translation_cards"
+    android:insetLeft="0%"
+    android:insetTop="0%"
+    android:insetRight="0%"
+    android:insetBottom="0%" />

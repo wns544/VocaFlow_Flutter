@@ -22,6 +22,7 @@ class ActiveStudy {
     this.undoHistory = const [],
     this.sessionSelections = const {},
     this.lastWordBookId,
+    this.updatedAt,
   });
 
   final List<int> queueIds;
@@ -37,6 +38,7 @@ class ActiveStudy {
   final List<StudyDecision> undoHistory;
   final Map<String, List<int>> sessionSelections;
   final String? lastWordBookId;
+  final DateTime? updatedAt;
 
   Map<String, dynamic> toJson() => {
         'queueIds': queueIds,
@@ -52,6 +54,7 @@ class ActiveStudy {
         'undoHistory': undoHistory.map((item) => item.toJson()).toList(),
         'sessionSelections': sessionSelections,
         'lastWordBookId': lastWordBookId,
+        'updatedAt': (updatedAt ?? DateTime.now()).toIso8601String(),
       };
 
   factory ActiveStudy.fromJson(Map<String, dynamic> json) => ActiveStudy(
@@ -82,6 +85,9 @@ class ActiveStudy {
           ),
         ),
         lastWordBookId: json['lastWordBookId'] as String?,
+        updatedAt: json['updatedAt'] == null
+            ? null
+            : DateTime.tryParse(json['updatedAt'] as String),
       );
 }
 
@@ -135,6 +141,7 @@ class VocaStore {
   static const _showExamplesKey = 'showExamples';
   static const _flipCardKey = 'flipCard';
   static const _activeStudyKey = 'activeStudy';
+  static const _lastMainTabKey = 'lastMainTab';
   static const _japaneseFontKey = 'japaneseFont';
   static const _termFontSizeKey = 'termFontSize';
   static const _readingFontSizeKey = 'readingFontSize';
@@ -167,6 +174,7 @@ class VocaStore {
   }
 
   int get sessionSize => _prefs.getInt(_sessionSizeKey) ?? 10;
+  int get lastMainTab => (_prefs.getInt(_lastMainTabKey) ?? 0).clamp(0, 2);
   bool get horizontalSwipe => _prefs.getBool(_horizontalSwipeKey) ?? false;
   bool get reverseSwipe => _prefs.getBool(_reverseSwipeKey) ?? false;
   bool get readingAboveTerm => _prefs.getBool(_readingAboveTermKey) ?? false;
@@ -189,7 +197,37 @@ class VocaStore {
     return value == null ? null : DateTime.tryParse(value);
   }
 
-  ActiveStudy? get activeStudy {
+  static const _activeStudiesKey = 'activeStudies';
+
+  Map<String, ActiveStudy> get activeStudies {
+    final saved = _prefs.getString(_activeStudiesKey);
+    if (saved == null) {
+      final oldActive = _loadOldActiveStudy();
+      if (oldActive != null) {
+        final key = activeStudyKeyFor(
+          bookId: oldActive.bookId,
+          sessionIndexes: oldActive.sessionIndexes,
+          sessionSelections: oldActive.sessionSelections,
+        );
+        return {key: oldActive};
+      }
+      return const {};
+    }
+    try {
+      final decoded = jsonDecode(saved) as Map<String, dynamic>;
+      return decoded.map((key, value) {
+        return MapEntry(
+          key,
+          ActiveStudy.fromJson(value as Map<String, dynamic>),
+        );
+      });
+    } catch (e, stack) {
+      print('activeStudies parsing exception: $e\n$stack');
+      return const {};
+    }
+  }
+
+  ActiveStudy? _loadOldActiveStudy() {
     final saved = _prefs.getString(_activeStudyKey);
     if (saved == null) return null;
     try {
@@ -199,6 +237,99 @@ class VocaStore {
     } catch (_) {
       return null;
     }
+  }
+
+  String activeStudyKeyFor({
+    required String? bookId,
+    required List<int> sessionIndexes,
+    required Map<String, List<int>> sessionSelections,
+  }) {
+    if (sessionSelections.isNotEmpty) {
+      final sortedKeys = sessionSelections.keys.toList()..sort();
+      final parts = sortedKeys.map((k) {
+        final vals = List<int>.from(sessionSelections[k]!)..sort();
+        return '$k:$vals';
+      });
+      return parts.join(';');
+    }
+    final sortedIdx = sessionIndexes.toList()..sort();
+    return '${bookId ?? "unknown"}:$sortedIdx';
+  }
+
+  ActiveStudy? getActiveStudyFor(String key) {
+    return activeStudies[key];
+  }
+
+  Future<void> saveActiveStudyFor(String key, ActiveStudy active,
+      {bool markCloudChange = true}) async {
+    final studies = Map<String, ActiveStudy>.from(activeStudies);
+    final updatedActive = ActiveStudy(
+      queueIds: active.queueIds,
+      queueBookIds: active.queueBookIds,
+      total: active.total,
+      memorized: active.memorized,
+      reviewed: active.reviewed,
+      revealed: active.revealed,
+      sessionIndexes: active.sessionIndexes,
+      bookId: active.bookId,
+      lastWordId: active.lastWordId,
+      lastState: active.lastState,
+      undoHistory: active.undoHistory,
+      sessionSelections: active.sessionSelections,
+      lastWordBookId: active.lastWordBookId,
+      updatedAt: DateTime.now(),
+    );
+    studies[key] = updatedActive;
+    if (studies.length > 20) {
+      final sortedKeys = studies.keys.toList()
+        ..sort((a, b) {
+          final timeA = studies[a]?.updatedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+          final timeB = studies[b]?.updatedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+          return timeA.compareTo(timeB);
+        });
+      while (studies.length > 20) {
+        studies.remove(sortedKeys.removeAt(0));
+      }
+    }
+    await _prefs.setString(
+      _activeStudiesKey,
+      jsonEncode(studies.map((k, v) => MapEntry(k, v.toJson()))),
+    );
+    if (markCloudChange) await cloudChanges.markProfile();
+  }
+
+  Future<void> clearActiveStudyFor(String key,
+      {bool markCloudChange = true}) async {
+    final studies = Map<String, ActiveStudy>.from(activeStudies);
+    if (studies.containsKey(key)) {
+      studies.remove(key);
+      await _prefs.setString(
+        _activeStudiesKey,
+        jsonEncode(studies.map((k, v) => MapEntry(k, v.toJson()))),
+      );
+      if (markCloudChange) await cloudChanges.markProfile();
+    }
+  }
+
+  Future<void> clearAllActiveStudies({bool markCloudChange = true}) async {
+    await _prefs.remove(_activeStudiesKey);
+    await _prefs.remove(_activeStudyKey);
+    if (markCloudChange) await cloudChanges.markProfile();
+  }
+
+  ActiveStudy? get activeStudy {
+    final studies = activeStudies;
+    if (studies.isEmpty) return null;
+    ActiveStudy? latest;
+    for (final active in studies.values) {
+      if (latest == null ||
+          (active.updatedAt != null &&
+              (latest.updatedAt == null ||
+                  active.updatedAt!.isAfter(latest.updatedAt!)))) {
+        latest = active;
+      }
+    }
+    return latest;
   }
 
   List<Word> resolveActiveWords(ActiveStudy active) {
@@ -225,11 +356,58 @@ class VocaStore {
     return active.queueIds.map((id) => byId[id]).whereType<Word>().toList();
   }
 
-  Future<void> saveActiveStudy(ActiveStudy active) async {
-    await _prefs.setString(_activeStudyKey, jsonEncode(active.toJson()));
+  Future<void> saveActiveStudy(ActiveStudy active,
+      {bool markCloudChange = true}) async {
+    final key = activeStudyKeyFor(
+      bookId: active.bookId,
+      sessionIndexes: active.sessionIndexes,
+      sessionSelections: active.sessionSelections,
+    );
+    await saveActiveStudyFor(key, active, markCloudChange: markCloudChange);
   }
 
-  Future<void> clearActiveStudy() => _prefs.remove(_activeStudyKey);
+  Future<void> clearActiveStudy({bool markCloudChange = true}) async {
+    final current = activeStudy;
+    if (current != null) {
+      final key = activeStudyKeyFor(
+        bookId: current.bookId,
+        sessionIndexes: current.sessionIndexes,
+        sessionSelections: current.sessionSelections,
+      );
+      await clearActiveStudyFor(key, markCloudChange: markCloudChange);
+    }
+  }
+
+  Future<ActiveStudy?> restoreActiveStudyFromBackupJson(
+      Map<String, dynamic> json) async {
+    if (json.containsKey('activeStudies')) {
+      final studiesData =
+          json['activeStudies'] as Map<String, dynamic>? ?? const {};
+      final studies = Map<String, ActiveStudy>.from(activeStudies);
+      studiesData.forEach((k, v) {
+        final active = _activeStudyFromBackupJson(v);
+        if (active != null &&
+            resolveActiveWords(active).length == active.queueIds.length) {
+          studies[k] = active;
+        }
+      });
+      await _prefs.setString(
+        _activeStudiesKey,
+        jsonEncode(studies.map((k, v) => MapEntry(k, v.toJson()))),
+      );
+      return activeStudy;
+    }
+    final active = _activeStudyFromBackupJson(json['activeStudy']);
+    if (active == null ||
+        resolveActiveWords(active).length != active.queueIds.length) {
+      return null;
+    }
+    await saveActiveStudy(active, markCloudChange: false);
+    return active;
+  }
+
+  Future<void> setLastMainTab(int index) =>
+      _prefs.setInt(_lastMainTabKey, index.clamp(0, 2));
 
   int get streak {
     final days = (_prefs.getStringList(_studyDaysKey) ?? []).toSet();
@@ -454,7 +632,13 @@ class VocaStore {
   Future<void> deleteBook(String id) async {
     final wasSelected = quickBook.id == id;
     final deleted = books.where((book) => book.id == id).firstOrNull;
-    if (activeStudy?.bookId == id) await clearActiveStudy();
+    final studiesToClear = activeStudies.entries
+        .where((entry) => entry.value.bookId == id)
+        .map((entry) => entry.key)
+        .toList();
+    for (final key in studiesToClear) {
+      await clearActiveStudyFor(key);
+    }
     books.removeWhere((book) => book.id == id && id != 'default');
     if (wasSelected) await selectQuickBook('default');
     await _saveBooks();
@@ -492,7 +676,7 @@ class VocaStore {
     }
     await _prefs.remove(_completedKey);
     await _prefs.remove(_studyDaysKey);
-    await clearActiveStudy();
+    await clearAllActiveStudies();
     await _saveBooks();
     await cloudChanges.markProfile();
     for (final book in books) {
@@ -526,10 +710,13 @@ class VocaStore {
           'fontWeight': meaningFontWeight,
           'opacity': meaningOpacity,
         },
+        'activeStudy': activeStudy?.toJson(),
+        'activeStudies': activeStudies.map((k, v) => MapEntry(k, v.toJson())),
       };
 
   Future<void> replaceWithBackupJson(Map<String, dynamic> json) async {
-    await clearActiveStudy();
+    await _prefs.remove(_activeStudyKey);
+    await _prefs.remove(_activeStudiesKey);
     final decodedBooks = (json['books'] as List<dynamic>? ?? [])
         .map((item) => WordBook.fromJson(item as Map<String, dynamic>))
         .toList();
@@ -586,6 +773,18 @@ class VocaStore {
       await _prefs.remove(_targetDateKey);
     } else {
       await _prefs.setString(_targetDateKey, targetDate);
+    }
+    await restoreActiveStudyFromBackupJson(json);
+  }
+
+  ActiveStudy? _activeStudyFromBackupJson(dynamic value) {
+    if (value is! Map) return null;
+    try {
+      final active = ActiveStudy.fromJson(Map<String, dynamic>.from(value));
+      return active.queueIds.isEmpty ? null : active;
+    } catch (e, stack) {
+      print('Backup ActiveStudy parsing exception: $e\n$stack');
+      return null;
     }
   }
 

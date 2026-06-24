@@ -218,4 +218,15 @@ void main() {
     expect(preferences.getBool('readingMeaningMigrationV1'), isTrue);
     expect(store.cloudChanges.snapshot.wordIdsByBook['japanese'], {88});
   });
+
+  test('last main tab persists and clamps invalid values', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+
+    await store.setLastMainTab(2);
+    expect((await VocaStore.load()).lastMainTab, 2);
+
+    await store.setLastMainTab(99);
+    expect((await VocaStore.load()).lastMainTab, 2);
+  });
 }
