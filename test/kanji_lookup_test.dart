@@ -71,6 +71,12 @@ void main() {
     );
     expect(normalizeChatGptConversationUrl('https://example.com/c/id'), isNull);
     expect(normalizeChatGptConversationUrl('https://chatgpt.com/'), isNull);
+    final chatGptUri = chatGptPromptUri(
+      uri: Uri.parse('https://chatgpt.com/c/conversation-id'),
+      prompt: '질문 테스트',
+    );
+    expect(chatGptUri.toString(),
+        'https://chatgpt.com/c/conversation-id?q=%EC%A7%88%EB%AC%B8+%ED%85%8C%EC%8A%A4%ED%8A%B8');
 
     final prompt = buildChatGptKanjiPrompt(
       character: '新',

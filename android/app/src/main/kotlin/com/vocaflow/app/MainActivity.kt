@@ -83,22 +83,6 @@ class MainActivity : FlutterActivity() {
                         }
                         result.success(openUrl(uri))
                     }
-                    "openChatGptWithPrompt" -> {
-                        val uri = Uri.parse(call.argument<String>("url").orEmpty())
-                        val prompt = call.argument<String>("prompt").orEmpty()
-                        if (uri.scheme != "https" || prompt.isBlank()) {
-                            result.success(false)
-                            return@setMethodCallHandler
-                        }
-                        val opened = openUrl(uri)
-                        if (!opened) {
-                            result.success(false)
-                            return@setMethodCallHandler
-                        }
-                        mainHandler.postDelayed({
-                            result.success(sendTextToChatGpt(prompt))
-                        }, CHATGPT_PROCESS_TEXT_DELAY_MS)
-                    }
                     else -> result.notImplemented()
                 }
             }
@@ -269,24 +253,6 @@ class MainActivity : FlutterActivity() {
         false
     }
 
-    private fun sendTextToChatGpt(text: String): Boolean = try {
-        val intent = Intent(Intent.ACTION_PROCESS_TEXT).apply {
-            type = "text/plain"
-            setClassName("com.openai.chatgpt", "com.openai.chatgpt.TextProcessorActivity")
-            putExtra(Intent.EXTRA_PROCESS_TEXT, text)
-            putExtra(Intent.EXTRA_PROCESS_TEXT_READONLY, true)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        startActivity(intent)
-        true
-    } catch (_: ActivityNotFoundException) {
-        false
-    } catch (_: SecurityException) {
-        false
-    } catch (_: IllegalArgumentException) {
-        false
-    }
-
     private fun speak(text: String, language: String) {
         val engine = textToSpeech ?: return
         val locale = Locale.forLanguageTag(language)
@@ -311,6 +277,5 @@ class MainActivity : FlutterActivity() {
         private const val SNAPSHOT_MAX_WIDTH = 1600
         private const val SNAPSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000L
         private const val SNAPSHOT_TIMEOUT_MS = 3000L
-        private const val CHATGPT_PROCESS_TEXT_DELAY_MS = 1200L
     }
 }

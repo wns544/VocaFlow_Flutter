@@ -124,25 +124,21 @@ Future<bool> openChatGptWithPrompt({
   required String prompt,
 }) async {
   if (uri.scheme != 'https' || prompt.trim().isEmpty) return false;
-  try {
-    return await externalLinkChannel.invokeMethod<bool>(
-          'openChatGptWithPrompt',
-          {
-            'url': uri.toString(),
-            'prompt': prompt,
-          },
-        ) ??
-        false;
-  } on MissingPluginException {
-    return false;
-  } on PlatformException {
-    return false;
-  }
+  return openExternalUrl(chatGptPromptUri(uri: uri, prompt: prompt));
 }
 
 Uri naverHanjaSearchUri(String character) => Uri.parse(
       'https://hanja.dict.naver.com/#/search?query=${Uri.encodeComponent(character)}',
     );
+
+Uri chatGptPromptUri({
+  required Uri uri,
+  required String prompt,
+}) =>
+    uri.replace(queryParameters: {
+      ...uri.queryParameters,
+      'q': prompt,
+    });
 
 String? normalizeChatGptConversationUrl(String value) {
   final uri = Uri.tryParse(value.trim());
