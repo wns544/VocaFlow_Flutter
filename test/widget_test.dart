@@ -737,6 +737,12 @@ void main() {
     expect(chatGptUrl.host, 'chatgpt.com');
     expect(chatGptUrl.path, '/c/study-kanji');
     expect(chatGptUrl.queryParameters['q'], contains('遺跡'));
+    await tester.tap(find.byKey(const ValueKey('open-chatgpt-word')));
+    await tester.pump(const Duration(milliseconds: 100));
+    final wordChatGptUrl =
+        Uri.parse((externalCalls.last.arguments as Map)['url'] as String);
+    expect(wordChatGptUrl.path, '/c/study-kanji');
+    expect(wordChatGptUrl.queryParameters['q'], contains('한자 조합'));
     await tester.pump(const Duration(seconds: 2));
   });
 

@@ -2296,18 +2296,29 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
   }
 
   Future<void> openChatGpt() async {
+    await openChatGptPrompt(buildChatGptKanjiPrompt(
+      character: widget.character,
+      term: widget.word.term,
+      reading: widget.word.reading,
+      meaning: widget.word.meaning,
+    ));
+  }
+
+  Future<void> openChatGptWord() async {
+    await openChatGptPrompt(buildChatGptWordPrompt(
+      term: widget.word.term,
+      reading: widget.word.reading,
+      meaning: widget.word.meaning,
+    ));
+  }
+
+  Future<void> openChatGptPrompt(String prompt) async {
     final configured = widget.store.chatGptConversationUrl;
     final uri = Uri.tryParse(configured);
     if (uri == null) {
       showMessage('설정 탭에서 ChatGPT 전용 대화 URL을 먼저 등록해 주세요.');
       return;
     }
-    final prompt = buildChatGptKanjiPrompt(
-      character: widget.character,
-      term: widget.word.term,
-      reading: widget.word.reading,
-      meaning: widget.word.meaning,
-    );
     final inserted = await openChatGptWithPrompt(uri: uri, prompt: prompt);
     if (inserted) {
       showMessage('ChatGPT 입력창에 질문을 넣었습니다.');
@@ -2394,7 +2405,14 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
                 key: const ValueKey('open-chatgpt-kanji'),
                 onPressed: openChatGpt,
                 icon: const Icon(Icons.forum_outlined, size: 18),
-                label: const Text('ChatGPT에 질문'),
+                label: const Text('이 한자 ChatGPT에 질문'),
+              ),
+              const SizedBox(height: 8),
+              FilledButton.icon(
+                key: const ValueKey('open-chatgpt-word'),
+                onPressed: openChatGptWord,
+                icon: const Icon(Icons.auto_awesome, size: 18),
+                label: const Text('이 단어 ChatGPT에 질문'),
               ),
               if (widget.store.chatGptConversationUrl.isEmpty) ...[
                 const SizedBox(height: 6),
@@ -4564,10 +4582,28 @@ class _SettingsPageState extends State<SettingsPage> {
             subtitle: Text(widget.store.chatGptConversationUrl.isEmpty
                 ? '한자 질문을 이어갈 기존 대화 URL을 등록합니다.'
                 : '전용 대화 URL이 이 기기에 등록되어 있습니다.'),
-            trailing: Text(
-              widget.store.chatGptConversationUrl.isEmpty ? '등록' : '변경',
-              style: const TextStyle(
-                  color: sea, fontSize: 12, fontWeight: FontWeight.w700),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Tooltip(
+                  message:
+                      '컴퓨터 브라우저에서 같은 ChatGPT 계정으로 로그인한 뒤, 사용할 대화방을 열고 주소창의 https://chatgpt.com/c/... URL을 복사해 붙여넣어 주세요.',
+                  triggerMode: TooltipTriggerMode.tap,
+                  child: const Padding(
+                    padding: EdgeInsets.all(8),
+                    child: Icon(
+                      Icons.help_outline,
+                      size: 20,
+                      color: Color(0xFF8E8E93),
+                    ),
+                  ),
+                ),
+                Text(
+                  widget.store.chatGptConversationUrl.isEmpty ? '등록' : '변경',
+                  style: const TextStyle(
+                      color: sea, fontSize: 12, fontWeight: FontWeight.w700),
+                ),
+              ],
             ),
             onTap: editChatGptConversationUrl,
           ),

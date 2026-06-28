@@ -171,6 +171,18 @@ String buildChatGptKanjiPrompt({
 
 이 한자의 한국식 훈음, 일본어 음독·훈독, 이 단어에서의 의미, 다른 대표 단어, 기억하기 쉬운 암기법을 알려 줘.''';
 
+String buildChatGptWordPrompt({
+  required String term,
+  required String reading,
+  required String meaning,
+}) =>
+    '''일본어 단어 "$term"을 한국어로 자세히 설명해 줘.
+
+발음: $reading
+뜻: $meaning
+
+이 단어를 한자 조합 단위로 쪼개서 각 한자의 역할, 단어 전체 의미가 만들어지는 방식, 비슷한 단어와 헷갈리기 쉬운 점, 기억하기 쉬운 암기법을 알려 줘.''';
+
 Map<String, String> _decodeKoreanTable(String source) {
   final decoded = jsonDecode(source) as Map<String, dynamic>;
   return decoded.map((key, value) => MapEntry(key, value.toString()));
