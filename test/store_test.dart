@@ -269,6 +269,26 @@ void main() {
     expect(store.activeStudy, isNull);
   });
 
+  test('finds active study for a specific session', () async {
+    final store = await VocaStore.load();
+    final book = store.books.first;
+    final active = ActiveStudy(
+      queueIds: book.words.take(4).map((word) => word.id).toList(),
+      queueBookIds: book.words.take(4).map((_) => book.id).toList(),
+      total: 10,
+      memorized: 6,
+      reviewed: const [],
+      revealed: false,
+      bookId: book.id,
+      sessionIndexes: const [0],
+    );
+
+    await store.saveActiveStudy(active, markCloudChange: false);
+
+    expect(store.getActiveStudyForSession(book.id, 0)?.memorized, 6);
+    expect(store.getActiveStudyForSession(book.id, 1), isNull);
+  });
+
   test('repairs clearly swapped Japanese reading and Korean meaning once',
       () async {
     final book = WordBook(

@@ -128,10 +128,11 @@ void main() {
 
     await tester.tap(find.byIcon(Icons.edit_outlined));
     await tester.pumpAndSettle();
-    await tester.enterText(find.byKey(const ValueKey('word-meaning')), '수정된 뜻');
+    await tester.enterText(
+        find.byKey(const ValueKey('word-meaning')), '수정된 뜻\n두 번째 줄');
     await tester.tap(find.text('저장'));
     await tester.pumpAndSettle();
-    expect(find.text('수정된 뜻'), findsOneWidget);
+    expect(find.text('수정된 뜻\n두 번째 줄'), findsOneWidget);
 
     final gesture = await tester.startGesture(tester.getCenter(card));
     await gesture.moveBy(const Offset(0, -50));

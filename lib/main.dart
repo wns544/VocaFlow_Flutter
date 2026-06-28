@@ -1021,8 +1021,11 @@ class _ReferenceHomePageState extends State<HomePage> {
                                               style: const TextStyle(
                                                   fontSize: 13,
                                                   fontWeight: FontWeight.w700)),
-                                          subtitle: Text(
-                                              '${session.memorizedCount}/${session.words.length} 단어'),
+                                          subtitle: _SessionProgressSubtitle(
+                                            store: widget.store,
+                                            book: favorite,
+                                            session: session,
+                                          ),
                                           trailing: multiSessionSelectionMode
                                               ? null
                                               : Container(
@@ -2412,7 +2415,7 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
                 key: const ValueKey('open-chatgpt-word'),
                 onPressed: openChatGptWord,
                 icon: const Icon(Icons.auto_awesome, size: 18),
-                label: const Text('이 단어 ChatGPT에 질문'),
+                label: Text('「${widget.word.term}」 단어 ChatGPT에 질문'),
               ),
               if (widget.store.chatGptConversationUrl.isEmpty) ...[
                 const SizedBox(height: 6),
@@ -2875,6 +2878,59 @@ class _SmoothBookExpansion extends StatelessWidget {
       );
 }
 
+class _SessionProgressSubtitle extends StatelessWidget {
+  const _SessionProgressSubtitle({
+    required this.store,
+    required this.book,
+    required this.session,
+  });
+
+  final VocaStore store;
+  final WordBook book;
+  final StudySession session;
+
+  @override
+  Widget build(BuildContext context) {
+    final active = store.getActiveStudyForSession(book.id, session.index);
+    final total = active?.total ?? 0;
+    final learned = active?.memorized ?? 0;
+    final progress = total <= 0 ? 0.0 : (learned / total).clamp(0.0, 1.0);
+    return Column(
+      key: ValueKey('session-progress-${book.id}-${session.index}'),
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text('${session.memorizedCount}/${session.words.length} 단어'),
+        if (active != null) ...[
+          const SizedBox(height: 7),
+          Row(children: [
+            Expanded(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(99),
+                child: LinearProgressIndicator(
+                  minHeight: 5,
+                  value: progress,
+                  backgroundColor: const Color(0xFFE5E5EA),
+                  valueColor: const AlwaysStoppedAnimation<Color>(sea),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              '$learned/$total',
+              style: const TextStyle(
+                color: Color(0xFF8E8E93),
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ]),
+        ],
+      ],
+    );
+  }
+}
+
 class _BooksPageState extends State<BooksPage> {
   var editMode = false;
   var searchQuery = '';
@@ -3192,8 +3248,11 @@ class _BooksPageState extends State<BooksPage> {
                           title: Text(session.label,
                               style: const TextStyle(
                                   fontSize: 13, fontWeight: FontWeight.w700)),
-                          subtitle: Text(
-                              '${session.memorizedCount}/${session.words.length} 단어'),
+                          subtitle: _SessionProgressSubtitle(
+                            store: widget.store,
+                            book: book,
+                            session: session,
+                          ),
                           trailing: const Icon(Icons.chevron_right,
                               color: Color(0xFF8E8E93), size: 18),
                           onTap: () => openSession(book, session.index),
@@ -3620,8 +3679,11 @@ class _BookDetailPageState extends State<BookDetailPage> {
                                 title: Text(session.label,
                                     style: const TextStyle(
                                         fontWeight: FontWeight.w700)),
-                                subtitle: Text(
-                                    '${session.memorizedCount}/${session.words.length} 단어'),
+                                subtitle: _SessionProgressSubtitle(
+                                  store: widget.store,
+                                  book: book,
+                                  session: session,
+                                ),
                                 trailing: completed
                                     ? Container(
                                         padding: const EdgeInsets.symmetric(
@@ -4544,8 +4606,8 @@ class _SettingsPageState extends State<SettingsPage> {
               title: const Text('카드 플립 효과',
                   style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
               subtitle: Text(widget.store.flipCard
-                  ? '탭하면 카드를 뒤집어 정답을 표시합니다.'
-                  : '탭하면 정답이 부드럽게 나타납니다.'),
+                  ? '현재 켜짐\n탭하면 카드가 뒤집히며 정답을 보여줍니다.'
+                  : '현재 꺼짐\n탭하면 정답이 카드 안에서 부드럽게 나타납니다.'),
               value: widget.store.flipCard,
               onChanged: (value) async {
                 await widget.store.setFlipCard(value);
@@ -4586,8 +4648,9 @@ class _SettingsPageState extends State<SettingsPage> {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Tooltip(
-                  message:
-                      '컴퓨터 브라우저에서 같은 ChatGPT 계정으로 로그인한 뒤, 사용할 대화방을 열고 주소창의 https://chatgpt.com/c/... URL을 복사해 붙여넣어 주세요.',
+                  message: '컴퓨터 브라우저에서 같은 ChatGPT 계정으로 로그인하세요.\n'
+                      '사용할 대화방을 열고 주소창의\n'
+                      'https://chatgpt.com/c/... URL을 복사해 붙여넣어 주세요.',
                   triggerMode: TooltipTriggerMode.tap,
                   child: const Padding(
                     padding: EdgeInsets.all(8),
@@ -4762,7 +4825,9 @@ class _SettingsPageState extends State<SettingsPage> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                'ChatGPT 앱의 공유 링크가 아니라, 브라우저 주소창에 보이는 chatgpt.com/c/... 대화 URL을 입력해 주세요.',
+                'ChatGPT 앱의 공유 링크가 아니라,\n'
+                '브라우저 주소창에 보이는\n'
+                'chatgpt.com/c/... 대화 URL을 입력해 주세요.',
                 style: TextStyle(color: Color(0xFF6E6E73), fontSize: 12),
               ),
               const SizedBox(height: 12),
@@ -4951,6 +5016,13 @@ class _CloudBackupOverviewSheet extends StatelessWidget {
         '${two(value.hour)}:${two(value.minute)}';
   }
 
+  String activeUpdatedAtLabel(DateTime? updatedAt) {
+    final value = updatedAt?.toLocal();
+    if (value == null) return '저장 시간 없음';
+    String two(int number) => number.toString().padLeft(2, '0');
+    return '${value.month}.${two(value.day)} ${two(value.hour)}:${two(value.minute)}';
+  }
+
   @override
   Widget build(BuildContext context) => FractionallySizedBox(
         heightFactor: .84,
@@ -5006,6 +5078,58 @@ class _CloudBackupOverviewSheet extends StatelessWidget {
                     ]),
               ),
             ),
+            const SizedBox(height: 18),
+            const Text('서버에 저장된 학습 진행',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 8),
+            if (overview.activeStudies.isEmpty)
+              const Card(
+                child: Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Text('진행 중으로 저장된 학습이 없습니다.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Color(0xFF8E8E93))),
+                ),
+              )
+            else
+              ...overview.activeStudies.map((active) {
+                final progress = active.progress.clamp(0.0, 1.0);
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(active.title,
+                              style:
+                                  const TextStyle(fontWeight: FontWeight.w800)),
+                          const SizedBox(height: 8),
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(99),
+                            child: LinearProgressIndicator(
+                              minHeight: 7,
+                              value: progress,
+                              backgroundColor: const Color(0xFFE5E5EA),
+                              valueColor:
+                                  const AlwaysStoppedAnimation<Color>(sea),
+                            ),
+                          ),
+                          const SizedBox(height: 7),
+                          Text(
+                            '${active.memorized}/${active.total} 외움 · '
+                            '${active.remaining}개 남음 · '
+                            '${activeUpdatedAtLabel(active.updatedAt)}',
+                            style: const TextStyle(
+                                color: Color(0xFF8E8E93), fontSize: 12),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              }),
             const SizedBox(height: 18),
             const Text('저장된 단어장',
                 style: TextStyle(fontSize: 15, fontWeight: FontWeight.w800)),
@@ -5301,8 +5425,9 @@ Future<bool> showCardFontSizeEditor(
                     key: const ValueKey('preview-flip-card-setting'),
                     contentPadding: EdgeInsets.zero,
                     title: const Text('카드 플립 효과'),
-                    subtitle: Text(
-                        flipCard ? '탭하면 카드를 뒤집습니다.' : '탭하면 정답이 페이드 인 됩니다.'),
+                    subtitle: Text(flipCard
+                        ? '현재 켜짐\n탭하면 카드가 뒤집히며 정답을 보여줍니다.'
+                        : '현재 꺼짐\n탭하면 정답이 카드 안에서 부드럽게 나타납니다.'),
                     value: flipCard,
                     onChanged: (value) => setModalState(() => flipCard = value),
                   ),
@@ -5587,7 +5712,12 @@ class _WordEditorSheetState extends State<_WordEditorSheet> {
             TextField(
                 key: const ValueKey('word-meaning'),
                 controller: meaning,
-                decoration: const InputDecoration(labelText: '뜻')),
+                keyboardType: TextInputType.multiline,
+                textInputAction: TextInputAction.newline,
+                minLines: 3,
+                maxLines: null,
+                decoration: const InputDecoration(
+                    labelText: '뜻', alignLabelWithHint: true)),
             const SizedBox(height: 10),
             TextField(
                 key: const ValueKey('word-example'),

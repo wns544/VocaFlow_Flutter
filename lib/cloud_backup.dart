@@ -7,20 +7,41 @@ import 'store.dart';
 
 class CloudBookOverview {
   const CloudBookOverview({
+    required this.id,
     required this.name,
     required this.wordCount,
     required this.isFavorite,
   });
 
+  final String id;
   final String name;
   final int wordCount;
   final bool isFavorite;
+}
+
+class CloudActiveStudyOverview {
+  const CloudActiveStudyOverview({
+    required this.title,
+    required this.memorized,
+    required this.total,
+    required this.remaining,
+    required this.updatedAt,
+  });
+
+  final String title;
+  final int memorized;
+  final int total;
+  final int remaining;
+  final DateTime? updatedAt;
+
+  double get progress => total <= 0 ? 0 : memorized / total;
 }
 
 class CloudBackupOverview {
   const CloudBackupOverview({
     required this.updatedAt,
     required this.books,
+    required this.activeStudies,
     required this.completedSessionCount,
     required this.studyDayCount,
     required this.sessionSize,
@@ -30,6 +51,7 @@ class CloudBackupOverview {
 
   final DateTime? updatedAt;
   final List<CloudBookOverview> books;
+  final List<CloudActiveStudyOverview> activeStudies;
   final int completedSessionCount;
   final int studyDayCount;
   final int sessionSize;
@@ -245,6 +267,8 @@ class CloudBackup {
       'chatGptConversationUrl':
           profileData['chatGptConversationUrl'] as String? ?? '',
       'activeStudy': profileData['activeStudy'] as Map<String, dynamic>?,
+      'activeStudies':
+          profileData['activeStudies'] as Map<String, dynamic>? ?? {},
     };
   }
 
@@ -255,16 +279,37 @@ class CloudBackup {
     }
     final profileData = profile.data()!;
     final booksSnapshot = await _booksRef.orderBy('order').get();
+    final books = booksSnapshot.docs.map((document) {
+      final data = document.data();
+      return CloudBookOverview(
+        id: document.id,
+        name: data['name'] as String? ?? '',
+        wordCount: (data['wordCount'] as num?)?.toInt() ?? 0,
+        isFavorite: data['isFavorite'] as bool? ?? false,
+      );
+    }).toList();
+    final booksById = {for (final book in books) book.id: book};
+    final activeStudyItems = <Map<String, dynamic>>[];
+    final activeStudies =
+        profileData['activeStudies'] as Map<String, dynamic>? ?? const {};
+    for (final value in activeStudies.values) {
+      if (value is Map<String, dynamic>) activeStudyItems.add(value);
+    }
+    final legacyActive = profileData['activeStudy'];
+    if (activeStudyItems.isEmpty && legacyActive is Map<String, dynamic>) {
+      activeStudyItems.add(legacyActive);
+    }
     return CloudBackupOverview(
       updatedAt: (profileData['updatedAt'] as Timestamp?)?.toDate(),
-      books: booksSnapshot.docs.map((document) {
-        final data = document.data();
-        return CloudBookOverview(
-          name: data['name'] as String? ?? '',
-          wordCount: (data['wordCount'] as num?)?.toInt() ?? 0,
-          isFavorite: data['isFavorite'] as bool? ?? false,
-        );
-      }).toList(),
+      books: books,
+      activeStudies: activeStudyItems
+          .map((data) => _activeStudyOverview(
+                data,
+                booksById,
+                profileData['sessionSize'] as int? ?? 10,
+              ))
+          .whereType<CloudActiveStudyOverview>()
+          .toList(),
       completedSessionCount:
           (profileData['completed'] as List<dynamic>? ?? []).length,
       studyDayCount: (profileData['studyDays'] as List<dynamic>? ?? []).length,
@@ -272,6 +317,68 @@ class CloudBackup {
       targetName: profileData['targetName'] as String? ?? '',
       japaneseFont: profileData['japaneseFont'] as String? ?? 'system',
     );
+  }
+
+  CloudActiveStudyOverview? _activeStudyOverview(
+    Map<String, dynamic> data,
+    Map<String, CloudBookOverview> booksById,
+    int sessionSize,
+  ) {
+    final total = (data['total'] as num?)?.toInt() ?? 0;
+    if (total <= 0) return null;
+    final memorized = (data['memorized'] as num?)?.toInt() ?? 0;
+    final queueIds = data['queueIds'] as List<dynamic>? ?? const [];
+    final selections = (data['sessionSelections'] as Map<String, dynamic>?)
+            ?.map((key, value) => MapEntry(
+                  key,
+                  (value as List<dynamic>? ?? const [])
+                      .map((item) => (item as num).toInt())
+                      .toList(),
+                )) ??
+        const <String, List<int>>{};
+    final bookId = data['bookId'] as String?;
+    final sessionIndexes =
+        (data['sessionIndexes'] as List<dynamic>? ?? const [])
+            .map((item) => (item as num).toInt())
+            .toList();
+    final title = _activeStudyTitle(
+      selections.isNotEmpty
+          ? selections
+          : bookId == null
+              ? const <String, List<int>>{}
+              : {bookId: sessionIndexes},
+      booksById,
+      sessionSize,
+    );
+    return CloudActiveStudyOverview(
+      title: title,
+      memorized: memorized,
+      total: total,
+      remaining: queueIds.length,
+      updatedAt: DateTime.tryParse(data['updatedAt'] as String? ?? ''),
+    );
+  }
+
+  String _activeStudyTitle(
+    Map<String, List<int>> selections,
+    Map<String, CloudBookOverview> booksById,
+    int sessionSize,
+  ) {
+    if (selections.length == 1 && selections.values.first.length == 1) {
+      final bookId = selections.keys.first;
+      final book = booksById[bookId];
+      final index = selections.values.first.first;
+      final start = index * sessionSize + 1;
+      final end = book == null
+          ? (index + 1) * sessionSize
+          : start + sessionSize - 1 > book.wordCount
+              ? book.wordCount
+              : start + sessionSize - 1;
+      return '${book?.name ?? '단어장'} · 단어 $start~$end';
+    }
+    final count = selections.values
+        .fold<int>(0, (total, indexes) => total + indexes.length);
+    return count <= 1 ? '진행 중인 학습' : '여러 세션 학습 · $count개 세션';
   }
 
   Map<String, dynamic> _wordData(Map<String, dynamic> data) => {
@@ -304,6 +411,7 @@ class CloudBackup {
         'cardMeaningStyle': backup['cardMeaningStyle'],
         'chatGptConversationUrl': backup['chatGptConversationUrl'],
         'activeStudy': backup['activeStudy'],
+        'activeStudies': backup['activeStudies'],
         'bookOrder': store.books.map((book) => book.id).toList(),
         'updatedAt': FieldValue.serverTimestamp(),
       };

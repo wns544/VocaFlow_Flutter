@@ -261,6 +261,34 @@ class VocaStore {
     return active;
   }
 
+  ActiveStudy? getActiveStudyForSession(String bookId, int sessionIndex) {
+    final exactKey = activeStudyKeyFor(
+      bookId: bookId,
+      sessionIndexes: [sessionIndex],
+      sessionSelections: const {},
+    );
+    final exact = getActiveStudyFor(exactKey);
+    if (exact != null) return exact;
+
+    ActiveStudy? latest;
+    for (final active in activeStudies.values) {
+      if (isActiveStudyCompleted(active)) continue;
+      final selections = active.sessionSelections.isNotEmpty
+          ? active.sessionSelections
+          : active.bookId == null
+              ? const <String, List<int>>{}
+              : {active.bookId!: active.sessionIndexes};
+      if (!(selections[bookId]?.contains(sessionIndex) ?? false)) continue;
+      if (latest == null ||
+          (active.updatedAt != null &&
+              (latest.updatedAt == null ||
+                  active.updatedAt!.isAfter(latest.updatedAt!)))) {
+        latest = active;
+      }
+    }
+    return latest;
+  }
+
   Future<void> saveActiveStudyFor(String key, ActiveStudy active,
       {bool markCloudChange = true}) async {
     final studies = Map<String, ActiveStudy>.from(activeStudies);
