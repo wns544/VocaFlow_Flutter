@@ -145,18 +145,20 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     onChanged?.call();
   }
 
-  void requestImmediateBackup() => _schedule(Duration.zero);
+  void requestImmediateBackup({bool ignoreMinimumInterval = false}) =>
+      _schedule(Duration.zero, ignoreMinimumInterval: ignoreMinimumInterval);
 
   void _handleTrackedChange() {
     onChanged?.call();
     if (enabled && pendingCount > 0 && !_uploading) _schedule(idleDelay);
   }
 
-  void _schedule(Duration requestedDelay) {
+  void _schedule(Duration requestedDelay,
+      {bool ignoreMinimumInterval = false}) {
     if (!enabled || pendingCount == 0) return;
     final last = lastSuccess;
     var delay = requestedDelay;
-    if (last != null) {
+    if (!ignoreMinimumInterval && last != null) {
       final untilAllowed = last.add(minimumInterval).difference(_now());
       if (untilAllowed > delay) delay = untilAllowed;
     }

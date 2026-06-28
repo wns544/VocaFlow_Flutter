@@ -221,8 +221,7 @@ class VocaStore {
           ActiveStudy.fromJson(value as Map<String, dynamic>),
         );
       });
-    } catch (e, stack) {
-      print('activeStudies parsing exception: $e\n$stack');
+    } catch (_) {
       return const {};
     }
   }
@@ -257,7 +256,9 @@ class VocaStore {
   }
 
   ActiveStudy? getActiveStudyFor(String key) {
-    return activeStudies[key];
+    final active = activeStudies[key];
+    if (active == null || isActiveStudyCompleted(active)) return null;
+    return active;
   }
 
   Future<void> saveActiveStudyFor(String key, ActiveStudy active,
@@ -283,8 +284,10 @@ class VocaStore {
     if (studies.length > 20) {
       final sortedKeys = studies.keys.toList()
         ..sort((a, b) {
-          final timeA = studies[a]?.updatedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
-          final timeB = studies[b]?.updatedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+          final timeA =
+              studies[a]?.updatedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+          final timeB =
+              studies[b]?.updatedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
           return timeA.compareTo(timeB);
         });
       while (studies.length > 20) {
@@ -322,6 +325,7 @@ class VocaStore {
     if (studies.isEmpty) return null;
     ActiveStudy? latest;
     for (final active in studies.values) {
+      if (isActiveStudyCompleted(active)) continue;
       if (latest == null ||
           (active.updatedAt != null &&
               (latest.updatedAt == null ||
@@ -330,6 +334,22 @@ class VocaStore {
       }
     }
     return latest;
+  }
+
+  bool isActiveStudyCompleted(ActiveStudy active,
+      {Set<String>? completedOverride}) {
+    final selections = active.sessionSelections.isNotEmpty
+        ? active.sessionSelections
+        : active.bookId == null || active.sessionIndexes.isEmpty
+            ? const <String, List<int>>{}
+            : {active.bookId!: active.sessionIndexes};
+    if (selections.isEmpty) return false;
+    final completed = completedOverride ??
+        (_prefs.getStringList(_completedKey) ?? []).toSet();
+    return selections.entries.every((entry) =>
+        entry.value.isNotEmpty &&
+        entry.value
+            .every((index) => completed.contains('${entry.key}:$index')));
   }
 
   List<Word> resolveActiveWords(ActiveStudy active) {
@@ -380,6 +400,9 @@ class VocaStore {
 
   Future<ActiveStudy?> restoreActiveStudyFromBackupJson(
       Map<String, dynamic> json) async {
+    final backupCompleted = (json['completed'] as List<dynamic>? ?? const [])
+        .cast<String>()
+        .toSet();
     if (json.containsKey('activeStudies')) {
       final studiesData =
           json['activeStudies'] as Map<String, dynamic>? ?? const {};
@@ -387,6 +410,8 @@ class VocaStore {
       studiesData.forEach((k, v) {
         final active = _activeStudyFromBackupJson(v);
         if (active != null &&
+            !isActiveStudyCompleted(active,
+                completedOverride: backupCompleted) &&
             resolveActiveWords(active).length == active.queueIds.length) {
           studies[k] = active;
         }
@@ -399,6 +424,7 @@ class VocaStore {
     }
     final active = _activeStudyFromBackupJson(json['activeStudy']);
     if (active == null ||
+        isActiveStudyCompleted(active, completedOverride: backupCompleted) ||
         resolveActiveWords(active).length != active.queueIds.length) {
       return null;
     }
@@ -558,7 +584,7 @@ class VocaStore {
 
   Future<void> addBook(String name, List<Word> words) async {
     books.add(WordBook(
-      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      id: _newBookId(),
       name: name.trim().isEmpty ? '가져온 단어장' : name.trim(),
       words: words,
     ));
@@ -619,12 +645,14 @@ class VocaStore {
   }
 
   Future<void> completeSessions(String bookId, Iterable<int> indexes) async {
+    final completedIndexes = indexes.toSet();
     final completed = (_prefs.getStringList(_completedKey) ?? []).toSet();
-    completed.addAll(indexes.map((index) => '$bookId:$index'));
+    completed.addAll(completedIndexes.map((index) => '$bookId:$index'));
     await _prefs.setStringList(_completedKey, completed.toList());
     final days = (_prefs.getStringList(_studyDaysKey) ?? []).toSet()
       ..add(_dayKey(DateTime.now()));
     await _prefs.setStringList(_studyDaysKey, days.toList());
+    await _clearActiveStudiesForSessions(bookId, completedIndexes);
     await cloudChanges.markProfile();
     onSessionCompleted?.call();
   }
@@ -658,12 +686,14 @@ class VocaStore {
   }
 
   Future<void> completeCurrentSession() async {
+    final completedIndex = nextSessionIndex(quickBook);
     final completed = (_prefs.getStringList(_completedKey) ?? []).toSet();
-    completed.add('${quickBook.id}:${nextSessionIndex(quickBook)}');
+    completed.add('${quickBook.id}:$completedIndex');
     await _prefs.setStringList(_completedKey, completed.toList());
     final days = (_prefs.getStringList(_studyDaysKey) ?? []).toSet()
       ..add(_dayKey(DateTime.now()));
     await _prefs.setStringList(_studyDaysKey, days.toList());
+    await _clearActiveStudiesForSessions(quickBook.id, {completedIndex});
     await cloudChanges.markProfile();
     onSessionCompleted?.call();
   }
@@ -782,8 +812,7 @@ class VocaStore {
     try {
       final active = ActiveStudy.fromJson(Map<String, dynamic>.from(value));
       return active.queueIds.isEmpty ? null : active;
-    } catch (e, stack) {
-      print('Backup ActiveStudy parsing exception: $e\n$stack');
+    } catch (_) {
       return null;
     }
   }
@@ -806,6 +835,35 @@ class VocaStore {
         _booksKey,
         jsonEncode(books.map((book) => book.toJson()).toList()),
       );
+
+  String _newBookId() {
+    var id = DateTime.now().microsecondsSinceEpoch.toString();
+    while (books.any((book) => book.id == id)) {
+      id = (int.parse(id) + 1).toString();
+    }
+    return id;
+  }
+
+  Future<void> _clearActiveStudiesForSessions(
+      String bookId, Set<int> sessionIndexes) async {
+    if (sessionIndexes.isEmpty) return;
+    final keysToClear = activeStudies.entries
+        .where((entry) {
+          final active = entry.value;
+          final selected = active.sessionSelections.isNotEmpty
+              ? active.sessionSelections[bookId]
+              : active.bookId == bookId
+                  ? active.sessionIndexes
+                  : null;
+          return selected != null &&
+              selected.any((index) => sessionIndexes.contains(index));
+        })
+        .map((entry) => entry.key)
+        .toList();
+    for (final key in keysToClear) {
+      await clearActiveStudyFor(key);
+    }
+  }
 
   Future<void> _repairSwappedJapaneseFields() async {
     if (_prefs.getBool(_readingMeaningMigrationKey) ?? false) return;

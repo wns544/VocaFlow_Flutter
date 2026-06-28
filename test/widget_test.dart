@@ -367,7 +367,7 @@ void main() {
     expect(find.textContaining('단어 1~10 + 단어 11~'), findsOneWidget);
   });
 
-  testWidgets('asks before leaving an active study from either back action',
+  testWidgets('leaving an active study saves progress immediately',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({});
     await tester.pumpWidget(const VocaFlowApp());
@@ -377,17 +377,17 @@ void main() {
 
     await tester.binding.handlePopRoute();
     await tester.pumpAndSettle();
-    expect(find.text('학습을 나갈까요?'), findsOneWidget);
-    await tester.tap(find.text('계속 학습'));
-    await tester.pumpAndSettle();
-    expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
+    expect(find.text('학습을 나갈까요?'), findsNothing);
+    expect(find.byKey(const ValueKey('study-card')), findsNothing);
+    expect((await VocaStore.load()).activeStudy, isNotNull);
 
+    await tester.tap(find.text('이어서 학습'));
+    await tester.pumpAndSettle();
     await tester.tap(find.byIcon(Icons.arrow_back));
     await tester.pumpAndSettle();
-    expect(find.text('학습을 나갈까요?'), findsOneWidget);
-    await tester.tap(find.byKey(const ValueKey('confirm-exit-study')));
-    await tester.pumpAndSettle();
+    expect(find.text('학습을 나갈까요?'), findsNothing);
     expect(find.byKey(const ValueKey('study-card')), findsNothing);
+    expect((await VocaStore.load()).activeStudy, isNotNull);
   });
 
   testWidgets('selects sessions across multiple favorite word books',
@@ -511,6 +511,38 @@ void main() {
     await tester.tap(favoriteHeader);
     await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey('favorite-default-session-0')),
+        findsOneWidget);
+  });
+
+  testWidgets('completed favorite session ignores stale saved resume',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({
+      'completed': ['default:0'],
+    });
+    final store = await VocaStore.load();
+    final book = store.books.first..isFavorite = true;
+    await store.updateBook(book);
+    final firstSession = book.sessions(store.sessionSize).first;
+    await store.saveActiveStudy(ActiveStudy(
+      queueIds: firstSession.words.skip(6).map((word) => word.id).toList(),
+      queueBookIds: firstSession.words.skip(6).map((_) => book.id).toList(),
+      total: firstSession.words.length,
+      memorized: 6,
+      reviewed: const [],
+      revealed: false,
+      bookId: book.id,
+      sessionIndexes: const [0],
+    ));
+
+    await tester.pumpWidget(const VocaFlowApp());
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('favorite-sessions-default')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('favorite-default-session-0')));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('4개 남음'), findsNothing);
+    expect(find.textContaining('${firstSession.words.length}개 남음'),
         findsOneWidget);
   });
 

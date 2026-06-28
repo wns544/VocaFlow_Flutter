@@ -242,8 +242,7 @@ class CloudBackup {
       'cardMeaningStyle':
           profileData['cardMeaningStyle'] as Map<String, dynamic>? ??
               <String, dynamic>{},
-      'activeStudy':
-          profileData['activeStudy'] as Map<String, dynamic>? ?? null,
+      'activeStudy': profileData['activeStudy'] as Map<String, dynamic>?,
     };
   }
 

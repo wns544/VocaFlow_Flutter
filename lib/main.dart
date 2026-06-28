@@ -32,8 +32,6 @@ final defaultKanjiLookupService = KanjiLookupService();
 final resumeSnapshotNavigatorObserver = _ResumeSnapshotNavigatorObserver();
 final resumeRouteObserver = RouteObserver<ModalRoute<dynamic>>();
 
-enum StudyExitChoice { save, discard }
-
 class _ResumeSnapshotNavigatorObserver extends NavigatorObserver {
   @override
   void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) {
@@ -799,90 +797,91 @@ class _ReferenceHomePageState extends State<HomePage> {
                                     crossAxisAlignment:
                                         CrossAxisAlignment.start,
                                     children: [
-                                       const Text('현재 학습 단어장',
-                                           style: TextStyle(
-                                               color: Color(0xFF8E8E93),
-                                               fontSize: 10,
-                                               fontWeight: FontWeight.w600)),
-                                       const SizedBox(height: 1),
-                                       Text(book.name,
-                                           overflow: TextOverflow.ellipsis,
-                                           style: const TextStyle(
-                                               color: ink,
-                                               fontSize: 17,
-                                               fontWeight: FontWeight.w800)),
-                                     ]),
-                               ),
-                               const SizedBox(width: 12),
-                               Text(
-                                   '${book.words.isEmpty ? 0 : (memorized / book.words.length * 100).round()}%',
-                                   style: const TextStyle(
-                                       color: sea,
-                                       fontSize: 12,
-                                       fontWeight: FontWeight.w800)),
-                             ]),
-                         const SizedBox(height: 7),
-                         LinearProgressIndicator(
-                             value: book.words.isEmpty
-                                 ? 0
-                                 : memorized / book.words.length,
-                             minHeight: 6,
-                             borderRadius: BorderRadius.circular(99),
-                             backgroundColor: const Color(0xFFE5E5EA)),
-                         const SizedBox(height: 5),
-                         Align(
-                             alignment: Alignment.centerLeft,
-                             child: Text('$memorized/${book.words.length} 외움',
-                                 style: const TextStyle(
-                                     color: Color(0xFF8E8E93), fontSize: 11))),
-                       ]),
-                     ),
-                   ),
-                   const SizedBox(height: 12),
-                   Row(children: [
-                     Expanded(
-                         child: _QuickAction(
-                       icon: Icons.history,
-                       iconColor: const Color(0xFFFB923C),
-                       iconBackground: const Color(0xFFFFF7ED),
-                       title: '복습하기',
-                       subtitle: reviewWords.isEmpty
-                           ? '기록 없음'
-                           : '${reviewWords.length}개 단어',
-                       onTap: reviewWords.isEmpty
-                           ? null
-                           : () => _openReview(context, reviewWords),
-                     )),
-                     const SizedBox(width: 8),
-                     Expanded(
-                         child: _QuickAction(
-                       icon: Icons.play_circle_outline,
-                       iconColor: sea,
-                       iconBackground: const Color(0x1A34C759),
-                       title: activeNext != null ? '이어서 학습' : '학습하기',
-                       subtitle: activeNext != null
-                           ? '${activeNext.memorized}/${activeNext.total} 외움'
-                           : '처음부터',
-                       onTap: sessions.isEmpty
-                           ? null
-                           : () async {
-                               if (activeNext != null) {
-                                 await Navigator.of(context).push(MaterialPageRoute(
-                                   builder: (_) => CardStudyPage(
-                                     store: widget.store,
-                                     resume: activeNext,
-                                   ),
-                                 ));
-                                 if (!mounted) return;
-                                 setState(() {});
-                                 widget.refresh();
-                               } else {
-                                 await _startNext(context, sessions);
-                               }
-                             },
-                     )),
-                   ]),
-                 ]),
+                                      const Text('현재 학습 단어장',
+                                          style: TextStyle(
+                                              color: Color(0xFF8E8E93),
+                                              fontSize: 10,
+                                              fontWeight: FontWeight.w600)),
+                                      const SizedBox(height: 1),
+                                      Text(book.name,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(
+                                              color: ink,
+                                              fontSize: 17,
+                                              fontWeight: FontWeight.w800)),
+                                    ]),
+                              ),
+                              const SizedBox(width: 12),
+                              Text(
+                                  '${book.words.isEmpty ? 0 : (memorized / book.words.length * 100).round()}%',
+                                  style: const TextStyle(
+                                      color: sea,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w800)),
+                            ]),
+                        const SizedBox(height: 7),
+                        LinearProgressIndicator(
+                            value: book.words.isEmpty
+                                ? 0
+                                : memorized / book.words.length,
+                            minHeight: 6,
+                            borderRadius: BorderRadius.circular(99),
+                            backgroundColor: const Color(0xFFE5E5EA)),
+                        const SizedBox(height: 5),
+                        Align(
+                            alignment: Alignment.centerLeft,
+                            child: Text('$memorized/${book.words.length} 외움',
+                                style: const TextStyle(
+                                    color: Color(0xFF8E8E93), fontSize: 11))),
+                      ]),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(children: [
+                    Expanded(
+                        child: _QuickAction(
+                      icon: Icons.history,
+                      iconColor: const Color(0xFFFB923C),
+                      iconBackground: const Color(0xFFFFF7ED),
+                      title: '복습하기',
+                      subtitle: reviewWords.isEmpty
+                          ? '기록 없음'
+                          : '${reviewWords.length}개 단어',
+                      onTap: reviewWords.isEmpty
+                          ? null
+                          : () => _openReview(context, reviewWords),
+                    )),
+                    const SizedBox(width: 8),
+                    Expanded(
+                        child: _QuickAction(
+                      icon: Icons.play_circle_outline,
+                      iconColor: sea,
+                      iconBackground: const Color(0x1A34C759),
+                      title: activeNext != null ? '이어서 학습' : '학습하기',
+                      subtitle: activeNext != null
+                          ? '${activeNext.memorized}/${activeNext.total} 외움'
+                          : '처음부터',
+                      onTap: sessions.isEmpty
+                          ? null
+                          : () async {
+                              if (activeNext != null) {
+                                await Navigator.of(context)
+                                    .push(MaterialPageRoute(
+                                  builder: (_) => CardStudyPage(
+                                    store: widget.store,
+                                    resume: activeNext,
+                                  ),
+                                ));
+                                if (!mounted) return;
+                                setState(() {});
+                                widget.refresh();
+                              } else {
+                                await _startNext(context, sessions);
+                              }
+                            },
+                    )),
+                  ]),
+                ]),
         ),
         const SizedBox(height: 8),
         SizedBox(
@@ -930,6 +929,9 @@ class _ReferenceHomePageState extends State<HomePage> {
                     final completedCount =
                         widget.store.completedCount(favorite);
                     final sessionCount = widget.store.sessionCount(favorite);
+                    final memorizedWordCount = favorite.words
+                        .where((word) => word.state == StudyState.memorized)
+                        .length;
                     final expanded = expandedFavoriteIds.contains(favorite.id);
                     final favoriteSessions =
                         favorite.sessions(widget.store.sessionSize);
@@ -960,7 +962,7 @@ class _ReferenceHomePageState extends State<HomePage> {
                                     fontSize: 14,
                                     fontWeight: FontWeight.w800)),
                             subtitle: Text(
-                                '$completedCount/$sessionCount 세션 완료 · ${favorite.words.length}단어',
+                                '$completedCount/$sessionCount 세션 완료 · $memorizedWordCount/${favorite.words.length}단어',
                                 style: const TextStyle(
                                     color: Color(0xFF8E8E93), fontSize: 12)),
                             trailing: IconButton(
@@ -1105,6 +1107,8 @@ class _ReferenceHomePageState extends State<HomePage> {
   Future<void> _openFavoriteSession(
       WordBook favorite, StudySession session) async {
     await widget.store.selectQuickBook(favorite.id);
+    final sessionCompleted =
+        widget.store.isSessionCompleted(favorite.id, session.index);
     if (!mounted) return;
     setState(() => selectedBookId = favorite.id);
     await Navigator.of(context).push(MaterialPageRoute(
@@ -1113,6 +1117,7 @@ class _ReferenceHomePageState extends State<HomePage> {
         words: session.words,
         bookId: favorite.id,
         sessionIndexes: [session.index],
+        useSavedResume: !sessionCompleted,
       ),
     ));
     if (!mounted) return;
@@ -1239,6 +1244,7 @@ class CardStudyPage extends StatefulWidget {
       this.sessionIndexes = const [],
       this.sessionSelections = const {},
       this.resume,
+      this.useSavedResume = true,
       this.kanjiLookupService,
       this.decisionWriter});
   final VocaStore store;
@@ -1247,6 +1253,7 @@ class CardStudyPage extends StatefulWidget {
   final List<int> sessionIndexes;
   final Map<String, List<int>> sessionSelections;
   final ActiveStudy? resume;
+  final bool useSavedResume;
   final KanjiLookupService? kanjiLookupService;
   final Future<void> Function(Word word, StudyState state)? decisionWriter;
 
@@ -1265,8 +1272,7 @@ class _CardStudyPageState extends State<CardStudyPage>
   var memorized = 0;
   var revealed = false;
   var exiting = false;
-  var confirmingExit = false;
-  var _cardsStudiedSinceSync = 0;
+  var finishingStudy = false;
   Word? lastWord;
   StudyState? lastState;
   final undoHistory = <StudyDecision>[];
@@ -1301,7 +1307,7 @@ class _CardStudyPageState extends State<CardStudyPage>
         for (final word in book.words) word: book.id,
     };
     ActiveStudy? resolvedResume = widget.resume;
-    if (resolvedResume == null) {
+    if (resolvedResume == null && widget.useSavedResume) {
       final key = widget.store.activeStudyKeyFor(
         bookId: widget.bookId,
         sessionIndexes: widget.sessionIndexes,
@@ -1380,7 +1386,7 @@ class _CardStudyPageState extends State<CardStudyPage>
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached ||
         state == AppLifecycleState.hidden) {
-      unawaited(_flushStudyPersistence());
+      unawaited(_flushStudyPersistence(requestBackup: true));
     }
   }
 
@@ -1391,21 +1397,23 @@ class _CardStudyPageState extends State<CardStudyPage>
       sessionIndexes: activeSessionIndexes,
       sessionSelections: activeSessionSelections,
     );
-    await widget.store.saveActiveStudyFor(key, ActiveStudy(
-      queueIds: queue.map((word) => word.id).toList(),
-      queueBookIds: queue.map(_bookIdForWord).whereType<String>().toList(),
-      total: total,
-      memorized: memorized,
-      reviewed: reviewed.toList(),
-      revealed: revealed,
-      bookId: activeBookId,
-      sessionIndexes: activeSessionIndexes,
-      lastWordId: lastWord?.id,
-      lastState: lastState,
-      undoHistory: undoHistory,
-      sessionSelections: activeSessionSelections,
-      lastWordBookId: lastWord == null ? null : _bookIdForWord(lastWord!),
-    ));
+    await widget.store.saveActiveStudyFor(
+        key,
+        ActiveStudy(
+          queueIds: queue.map((word) => word.id).toList(),
+          queueBookIds: queue.map(_bookIdForWord).whereType<String>().toList(),
+          total: total,
+          memorized: memorized,
+          reviewed: reviewed.toList(),
+          revealed: revealed,
+          bookId: activeBookId,
+          sessionIndexes: activeSessionIndexes,
+          lastWordId: lastWord?.id,
+          lastState: lastState,
+          undoHistory: undoHistory,
+          sessionSelections: activeSessionSelections,
+          lastWordBookId: lastWord == null ? null : _bookIdForWord(lastWord!),
+        ));
   }
 
   String? _bookIdForWord(Word word) => _bookIdsByWord[word];
@@ -1413,9 +1421,13 @@ class _CardStudyPageState extends State<CardStudyPage>
   String _cardIdentity(Word word) =>
       '${_bookIdForWord(word) ?? activeBookId ?? 'unknown'}:${word.id}';
 
-  Future<void> _flushStudyPersistence() async {
+  Future<void> _flushStudyPersistence({bool requestBackup = false}) async {
     await _persistenceChain;
     if (queue.isNotEmpty && !exiting) await persistStudy();
+    if (requestBackup) {
+      AutoBackupCoordinator.activeInstance
+          ?.requestImmediateBackup(ignoreMinimumInterval: true);
+    }
   }
 
   void _scheduleDecisionPersistence(Word word, StudyState state) {
@@ -1428,99 +1440,17 @@ class _CardStudyPageState extends State<CardStudyPage>
   }
 
   Future<void> requestExitStudy() async {
-    if (exiting || confirmingExit) return;
-    setState(() => confirmingExit = true);
-    final choice = await showDialog<StudyExitChoice>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('학습을 나갈까요?'),
-        content: const Text('현재 학습 진행상태를 저장해두면 다음에 이어서 볼 수 있어요.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('계속 학습'),
-          ),
-          TextButton(
-            key: const ValueKey('discard-exit-study'),
-            onPressed: () => Navigator.pop(context, StudyExitChoice.discard),
-            child: const Text('저장 안 함'),
-          ),
-          FilledButton(
-            key: const ValueKey('save-exit-study'),
-            onPressed: () => Navigator.pop(context, StudyExitChoice.save),
-            child: const Text('저장하고 나가기'),
-          ),
-        ],
-      ),
-    );
-    if (!mounted) return;
-    setState(() => confirmingExit = false);
-    if (choice == StudyExitChoice.save) {
-      await exitStudy(saveProgress: true);
-    } else if (choice == StudyExitChoice.discard) {
-      await exitStudy(saveProgress: false);
-    }
+    if (exiting) return;
+    await exitStudy();
   }
 
-  Future<void> exitStudy({required bool saveProgress}) async {
+  Future<void> exitStudy() async {
     if (exiting) return;
     await _persistenceChain;
-    if (saveProgress) {
-      await persistStudy();
-      scheduleResumeSnapshotCapture('study');
-    } else {
-      final key = widget.store.activeStudyKeyFor(
-        bookId: activeBookId,
-        sessionIndexes: activeSessionIndexes,
-        sessionSelections: activeSessionSelections,
-      );
-      await widget.store.clearActiveStudyFor(key);
-      unawaited(deleteResumeSnapshot());
-    }
-    if (!mounted) return;
-    setState(() => exiting = true);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) Navigator.of(context).pop();
-    });
-  }
-
-  Future<void> _legacyRequestExitStudy() async {
-    if (exiting || confirmingExit) return;
-    setState(() => confirmingExit = true);
-    final confirmed = await showDialog<bool>(
-          context: context,
-          builder: (context) => AlertDialog(
-            title: const Text('학습을 나갈까요?'),
-            content: const Text('현재 학습을 종료하고 이전 화면으로 돌아갑니다.'),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('계속 학습'),
-              ),
-              FilledButton(
-                key: const ValueKey('confirm-exit-study'),
-                onPressed: () => Navigator.pop(context, true),
-                child: const Text('나가기'),
-              ),
-            ],
-          ),
-        ) ??
-        false;
-    if (!mounted) return;
-    setState(() => confirmingExit = false);
-    if (confirmed) await _legacyExitStudy();
-  }
-
-  Future<void> _legacyExitStudy() async {
-    if (exiting) return;
-    await _persistenceChain;
-    final key = widget.store.activeStudyKeyFor(
-      bookId: activeBookId,
-      sessionIndexes: activeSessionIndexes,
-      sessionSelections: activeSessionSelections,
-    );
-    await widget.store.clearActiveStudyFor(key);
-    unawaited(deleteResumeSnapshot());
+    await persistStudy();
+    scheduleResumeSnapshotCapture('study');
+    AutoBackupCoordinator.activeInstance
+        ?.requestImmediateBackup(ignoreMinimumInterval: true);
     if (!mounted) return;
     setState(() => exiting = true);
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1549,12 +1479,8 @@ class _CardStudyPageState extends State<CardStudyPage>
     }
     word.state = state;
     revealed = false;
-    _cardsStudiedSinceSync++;
-    if (_cardsStudiedSinceSync >= 5) {
-      _cardsStudiedSinceSync = 0;
-      AutoBackupCoordinator.activeInstance?.requestImmediateBackup();
-    }
-    if (queue.isEmpty) {
+    if (queue.isEmpty && !finishingStudy) {
+      finishingStudy = true;
       _persistenceChain = _persistenceChain.then((_) async {
         await (widget.decisionWriter?.call(word, state) ??
             widget.store.mark(word, state));
@@ -1572,6 +1498,8 @@ class _CardStudyPageState extends State<CardStudyPage>
         );
         await widget.store.clearActiveStudyFor(key);
         unawaited(deleteResumeSnapshot());
+        AutoBackupCoordinator.activeInstance
+            ?.requestImmediateBackup(ignoreMinimumInterval: true);
       });
     } else {
       _scheduleDecisionPersistence(word, state);
@@ -2899,7 +2827,7 @@ class _SmoothBookExpansion extends StatelessWidget {
           );
           return SizeTransition(
             sizeFactor: curved,
-            axisAlignment: -1,
+            alignment: Alignment.topCenter,
             child: FadeTransition(
               opacity: curved,
               child: SlideTransition(
@@ -3708,12 +3636,13 @@ class _BookDetailPageState extends State<BookDetailPage> {
                                         context,
                                         MaterialPageRoute(
                                             builder: (_) => CardStudyPage(
-                                                    store: widget.store,
-                                                    words: session.words,
-                                                    bookId: book.id,
-                                                    sessionIndexes: [
-                                                      session.index
-                                                    ])));
+                                                store: widget.store,
+                                                words: session.words,
+                                                bookId: book.id,
+                                                sessionIndexes: [session.index],
+                                                useSavedResume: !widget.store
+                                                    .isSessionCompleted(book.id,
+                                                        session.index))));
                                     if (mounted) setState(() {});
                                   },
                                   icon: const Icon(Icons.style, size: 17),
@@ -3989,6 +3918,35 @@ class SettingsPage extends StatefulWidget {
   State<SettingsPage> createState() => _SettingsPageState();
 }
 
+class _InitialSyncActionLabel extends StatelessWidget {
+  const _InitialSyncActionLabel({
+    required this.title,
+    required this.description,
+  });
+
+  final String title;
+  final String description;
+
+  @override
+  Widget build(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+    final foreground = IconTheme.of(context).color;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(title),
+        const SizedBox(height: 2),
+        Text(
+          description,
+          style: textTheme.bodySmall?.copyWith(color: foreground),
+          softWrap: true,
+        ),
+      ],
+    );
+  }
+}
+
 class _SettingsPageState extends State<SettingsPage> {
   var signingIn = false;
   var syncing = false;
@@ -4070,22 +4028,30 @@ class _SettingsPageState extends State<SettingsPage> {
           builder: (context) => AlertDialog(
             title: const Text('자동 백업 처음 설정'),
             content: const Text(
-              '이 계정에 기존 백업이 있습니다. 이 기기의 데이터와 어떻게 맞출까요?',
+              '이 Google 계정에 기존 백업이 있습니다.\n현재 기기 데이터와 어떻게 맞출까요?',
             ),
             actions: [
               TextButton(
                 onPressed: () => Navigator.pop(context),
                 child: const Text('취소'),
               ),
-              OutlinedButton(
+              OutlinedButton.icon(
                 onPressed: () =>
                     Navigator.pop(context, InitialSyncChoice.merge),
-                child: const Text('클라우드 + 이 기기 합치기'),
+                icon: const Icon(CupertinoIcons.arrow_2_squarepath, size: 18),
+                label: const _InitialSyncActionLabel(
+                  title: '클라우드 데이터와 병합',
+                  description: '이 기기 데이터와 클라우드 백업을 합쳐 저장합니다.',
+                ),
               ),
-              FilledButton(
+              FilledButton.icon(
                 onPressed: () =>
                     Navigator.pop(context, InitialSyncChoice.cloudReplace),
-                child: const Text('클라우드로 이 기기 교체'),
+                icon: const Icon(CupertinoIcons.cloud_download, size: 18),
+                label: const _InitialSyncActionLabel(
+                  title: '클라우드 데이터로 복원',
+                  description: '현재 기기 데이터를 지우고 클라우드 백업을 가져옵니다.',
+                ),
               ),
             ],
           ),
@@ -4750,17 +4716,28 @@ class _SettingsPageState extends State<SettingsPage> {
       builder: (context) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
           title: const Text('ChatGPT 전용 대화 URL'),
-          content: TextFormField(
-            key: const ValueKey('chatgpt-conversation-url-input'),
-            initialValue: input,
-            onChanged: (value) => input = value,
-            autofocus: true,
-            keyboardType: TextInputType.url,
-            autocorrect: false,
-            decoration: InputDecoration(
-              hintText: 'https://chatgpt.com/c/...',
-              errorText: errorText,
-            ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'ChatGPT 앱의 공유 링크가 아니라, 브라우저 주소창에 보이는 chatgpt.com/c/... 대화 URL을 입력해 주세요.',
+                style: TextStyle(color: Color(0xFF6E6E73), fontSize: 12),
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                key: const ValueKey('chatgpt-conversation-url-input'),
+                initialValue: input,
+                onChanged: (value) => input = value,
+                autofocus: true,
+                keyboardType: TextInputType.url,
+                autocorrect: false,
+                decoration: InputDecoration(
+                  hintText: 'https://chatgpt.com/c/...',
+                  errorText: errorText,
+                ),
+              ),
+            ],
           ),
           actions: [
             TextButton(
@@ -4913,7 +4890,6 @@ class _SessionSizeDialogState extends State<_SessionSizeDialog> {
     );
   }
 }
-
 
 class _CloudBackupOverviewSheet extends StatelessWidget {
   const _CloudBackupOverviewSheet({required this.overview});

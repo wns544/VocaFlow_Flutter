@@ -6,6 +6,10 @@ import 'package:vocaflow/models.dart';
 import 'package:vocaflow/store.dart';
 
 void main() {
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+  });
+
   test('book sorting and custom order persist', () async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();
@@ -196,6 +200,61 @@ void main() {
       first.id: [0],
       second.id: [0],
     });
+  });
+
+  test('completed sessions ignore stale active study resumes', () async {
+    final store = await VocaStore.load();
+    final book = store.books.first;
+    await store.saveActiveStudy(ActiveStudy(
+      queueIds: book.words.skip(3).map((word) => word.id).toList(),
+      queueBookIds: book.words.skip(3).map((_) => book.id).toList(),
+      total: book.words.length,
+      memorized: 3,
+      reviewed: const [],
+      revealed: false,
+      bookId: book.id,
+      sessionIndexes: const [0],
+    ));
+    final key = store.activeStudyKeyFor(
+      bookId: book.id,
+      sessionIndexes: const [0],
+      sessionSelections: const {},
+    );
+
+    await store.completeSessions(book.id, const [0]);
+
+    expect(store.getActiveStudyFor(key), isNull);
+    expect(store.activeStudy, isNull);
+  });
+
+  test('cloud restore ignores active study for completed sessions', () async {
+    final store = await VocaStore.load();
+    final book = store.books.first;
+    final active = ActiveStudy(
+      queueIds: book.words.skip(3).map((word) => word.id).toList(),
+      queueBookIds: book.words.skip(3).map((_) => book.id).toList(),
+      total: book.words.length,
+      memorized: 3,
+      reviewed: const [],
+      revealed: false,
+      bookId: book.id,
+      sessionIndexes: const [0],
+    );
+
+    final restored = await store.restoreActiveStudyFromBackupJson({
+      'completed': ['${book.id}:0'],
+      'activeStudy': active.toJson(),
+      'activeStudies': {
+        store.activeStudyKeyFor(
+          bookId: book.id,
+          sessionIndexes: const [0],
+          sessionSelections: const {},
+        ): active.toJson(),
+      },
+    });
+
+    expect(restored, isNull);
+    expect(store.activeStudy, isNull);
   });
 
   test('repairs clearly swapped Japanese reading and Korean meaning once',
