@@ -660,10 +660,33 @@ class HomePage extends StatefulWidget {
 
 class _ReferenceHomePageState extends State<HomePage> {
   late String selectedBookId = widget.store.quickBook.id;
+  final favoriteScrollController = ScrollController();
   final selectedSessions = <int>{};
   final expandedFavoriteIds = <String>{};
   final selectedFavoriteSessions = <String, Set<int>>{};
   var multiSessionSelectionMode = false;
+  var homeHeaderCollapsed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    favoriteScrollController.addListener(_handleFavoriteScroll);
+  }
+
+  @override
+  void dispose() {
+    favoriteScrollController
+      ..removeListener(_handleFavoriteScroll)
+      ..dispose();
+    super.dispose();
+  }
+
+  void _handleFavoriteScroll() {
+    final shouldCollapse = favoriteScrollController.hasClients &&
+        favoriteScrollController.offset > 24;
+    if (shouldCollapse == homeHeaderCollapsed) return;
+    setState(() => homeHeaderCollapsed = shouldCollapse);
+  }
 
   WordBook get book => widget.store.books.firstWhere(
         (item) => item.id == selectedBookId,
@@ -719,6 +742,25 @@ class _ReferenceHomePageState extends State<HomePage> {
           );
     final activeNext =
         next == null ? null : widget.store.getActiveStudyFor(nextKey);
+    final progress = book.words.isEmpty ? 0.0 : memorized / book.words.length;
+    final progressPercent = book.words.isEmpty ? 0 : (progress * 100).round();
+    final canStudy = sessions.isNotEmpty;
+    Future<void> openNextStudy() async {
+      if (!canStudy) return;
+      if (activeNext != null) {
+        await Navigator.of(context).push(MaterialPageRoute(
+          builder: (_) => CardStudyPage(
+            store: widget.store,
+            resume: activeNext,
+          ),
+        ));
+        if (!mounted) return;
+        setState(() {});
+        widget.refresh();
+      } else {
+        await _startNext(context, sessions);
+      }
+    }
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 28, 20, 12),
@@ -751,7 +793,7 @@ class _ReferenceHomePageState extends State<HomePage> {
         ]),
         AnimatedSize(
           key: const ValueKey('home-study-controls'),
-          duration: const Duration(milliseconds: 320),
+          duration: const Duration(milliseconds: 220),
           curve: Curves.easeInOutCubic,
           alignment: Alignment.topCenter,
           child: multiSessionSelectionMode
@@ -793,133 +835,82 @@ class _ReferenceHomePageState extends State<HomePage> {
                   ),
                 )
               : Column(children: [
-                  const SizedBox(height: 12),
-                  Card(
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 11, 16, 10),
-                      child: Column(children: [
-                        Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Expanded(
-                                child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      const Text('현재 학습 단어장',
-                                          style: TextStyle(
-                                              color: Color(0xFF8E8E93),
-                                              fontSize: 10,
-                                              fontWeight: FontWeight.w600)),
-                                      const SizedBox(height: 1),
-                                      Text(book.name,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: const TextStyle(
-                                              color: ink,
-                                              fontSize: 17,
-                                              fontWeight: FontWeight.w800)),
-                                    ]),
-                              ),
-                              const SizedBox(width: 12),
-                              Text(
-                                  '${book.words.isEmpty ? 0 : (memorized / book.words.length * 100).round()}%',
-                                  style: const TextStyle(
-                                      color: sea,
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w800)),
-                            ]),
-                        const SizedBox(height: 7),
-                        LinearProgressIndicator(
-                            value: book.words.isEmpty
-                                ? 0
-                                : memorized / book.words.length,
-                            minHeight: 6,
-                            borderRadius: BorderRadius.circular(99),
-                            backgroundColor: const Color(0xFFE5E5EA)),
-                        const SizedBox(height: 5),
-                        Align(
-                            alignment: Alignment.centerLeft,
-                            child: Text('$memorized/${book.words.length} 외움',
-                                style: const TextStyle(
-                                    color: Color(0xFF8E8E93), fontSize: 11))),
-                      ]),
-                    ),
+                  SizedBox(height: homeHeaderCollapsed ? 8 : 12),
+                  AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 180),
+                    switchInCurve: Curves.easeOutCubic,
+                    switchOutCurve: Curves.easeInCubic,
+                    child: homeHeaderCollapsed
+                        ? _CollapsedStudySummary(
+                            key: const ValueKey('home-study-summary-collapsed'),
+                            bookName: book.name,
+                            progressPercent: progressPercent,
+                            progressLabel: '$memorized/${book.words.length} 외움',
+                          )
+                        : _ExpandedStudySummary(
+                            key: const ValueKey('home-study-summary-expanded'),
+                            bookName: book.name,
+                            progress: progress,
+                            progressPercent: progressPercent,
+                            progressLabel: '$memorized/${book.words.length} 외움',
+                          ),
                   ),
-                  const SizedBox(height: 12),
-                  Row(children: [
-                    Expanded(
-                        child: _QuickAction(
-                      icon: Icons.history,
-                      iconColor: const Color(0xFFFB923C),
-                      iconBackground: const Color(0xFFFFF7ED),
-                      title: '복습하기',
-                      subtitle: reviewWords.isEmpty
-                          ? '기록 없음'
-                          : '${reviewWords.length}개 단어',
-                      onTap: reviewWords.isEmpty
-                          ? null
-                          : () => _openReview(context, reviewWords),
-                    )),
-                    const SizedBox(width: 8),
-                    Expanded(
-                        child: _QuickAction(
-                      icon: Icons.play_circle_outline,
-                      iconColor: sea,
-                      iconBackground: const Color(0x1A34C759),
-                      title: activeNext != null ? '이어서 학습' : '학습하기',
-                      subtitle: activeNext != null
-                          ? '${activeNext.memorized}/${activeNext.total} 외움'
-                          : '처음부터',
-                      onTap: sessions.isEmpty
-                          ? null
-                          : () async {
-                              if (activeNext != null) {
+                  SizedBox(height: homeHeaderCollapsed ? 6 : 8),
+                  _HomeActionSegmentBar(
+                    items: [
+                      _HomeActionItem(
+                        key: const ValueKey('home-action-review'),
+                        icon: Icons.history,
+                        iconColor: const Color(0xFFFB923C),
+                        label: '복습',
+                        value: reviewWords.isEmpty
+                            ? '없음'
+                            : '${reviewWords.length}개',
+                        onTap: reviewWords.isEmpty
+                            ? null
+                            : () => _openReview(context, reviewWords),
+                      ),
+                      _HomeActionItem(
+                        key: const ValueKey('home-action-study'),
+                        icon: Icons.play_circle_outline,
+                        iconColor: sea,
+                        label: activeNext != null ? '이어서' : '학습',
+                        value: activeNext != null
+                            ? '${activeNext.memorized}/${activeNext.total}'
+                            : '시작',
+                        onTap: canStudy ? openNextStudy : null,
+                      ),
+                      _HomeActionItem(
+                        key: const ValueKey('home-action-wrong'),
+                        icon: Icons.error_outline,
+                        iconColor: coral,
+                        label: '오답',
+                        value:
+                            wrongWords.isEmpty ? '없음' : '${wrongWords.length}개',
+                        onTap: wrongWords.isEmpty
+                            ? null
+                            : () async {
                                 await Navigator.of(context)
                                     .push(MaterialPageRoute(
                                   builder: (_) => CardStudyPage(
                                     store: widget.store,
-                                    resume: activeNext,
+                                    words: wrongWords,
+                                    bookId: book.id,
                                   ),
                                 ));
                                 if (!mounted) return;
                                 setState(() {});
                                 widget.refresh();
-                              } else {
-                                await _startNext(context, sessions);
-                              }
-                            },
-                    )),
-                  ]),
-                  const SizedBox(height: 8),
-                  _QuickAction(
-                    icon: Icons.error_outline,
-                    iconColor: coral,
-                    iconBackground: const Color(0xFFFFEBEE),
-                    title: '오답 테스트',
-                    subtitle: wrongWords.isEmpty
-                        ? '누적 오답 없음'
-                        : '${wrongWords.length}개 단어',
-                    onTap: wrongWords.isEmpty
-                        ? null
-                        : () async {
-                            await Navigator.of(context).push(MaterialPageRoute(
-                              builder: (_) => CardStudyPage(
-                                store: widget.store,
-                                words: wrongWords,
-                                bookId: book.id,
-                              ),
-                            ));
-                            if (!mounted) return;
-                            setState(() {});
-                            widget.refresh();
-                          },
+                              },
+                      ),
+                    ],
                   ),
                 ]),
         ),
-        const SizedBox(height: 8),
+        SizedBox(height: homeHeaderCollapsed ? 6 : 8),
         SizedBox(
           width: double.infinity,
-          height: 42,
+          height: homeHeaderCollapsed ? 36 : 42,
           child: OutlinedButton.icon(
             key: const ValueKey('multi-session-study'),
             onPressed: favoriteBooks.any((item) => item.words.isNotEmpty)
@@ -936,7 +927,7 @@ class _ReferenceHomePageState extends State<HomePage> {
             ),
           ),
         ),
-        const SizedBox(height: 12),
+        SizedBox(height: homeHeaderCollapsed ? 8 : 12),
         const Text('즐겨찾기 단어장',
             style: TextStyle(
                 color: Color(0xFF8E8E93),
@@ -954,6 +945,7 @@ class _ReferenceHomePageState extends State<HomePage> {
                 )
               : ListView.separated(
                   key: const ValueKey('favorite-books-list'),
+                  controller: favoriteScrollController,
                   padding: EdgeInsets.zero,
                   itemCount: favoriteBooks.length,
                   separatorBuilder: (_, __) => const SizedBox(height: 7),
@@ -1215,57 +1207,174 @@ class _ReferenceHomePageState extends State<HomePage> {
   }
 }
 
-class _QuickAction extends StatelessWidget {
-  const _QuickAction({
+class _ExpandedStudySummary extends StatelessWidget {
+  const _ExpandedStudySummary({
+    super.key,
+    required this.bookName,
+    required this.progress,
+    required this.progressPercent,
+    required this.progressLabel,
+  });
+
+  final String bookName;
+  final double progress;
+  final int progressPercent;
+  final String progressLabel;
+
+  @override
+  Widget build(BuildContext context) => Card(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 11, 16, 10),
+          child: Column(children: [
+            Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+              Expanded(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('현재 학습 단어장',
+                          style: TextStyle(
+                              color: Color(0xFF8E8E93),
+                              fontSize: 10,
+                              fontWeight: FontWeight.w600)),
+                      const SizedBox(height: 1),
+                      Text(bookName,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              color: ink,
+                              fontSize: 17,
+                              fontWeight: FontWeight.w800)),
+                    ]),
+              ),
+              const SizedBox(width: 12),
+              Text('$progressPercent%',
+                  style: const TextStyle(
+                      color: sea, fontSize: 12, fontWeight: FontWeight.w800)),
+            ]),
+            const SizedBox(height: 7),
+            LinearProgressIndicator(
+                value: progress,
+                minHeight: 6,
+                borderRadius: BorderRadius.circular(99),
+                backgroundColor: const Color(0xFFE5E5EA)),
+            const SizedBox(height: 5),
+            Align(
+                alignment: Alignment.centerLeft,
+                child: Text(progressLabel,
+                    style: const TextStyle(
+                        color: Color(0xFF8E8E93), fontSize: 11))),
+          ]),
+        ),
+      );
+}
+
+class _CollapsedStudySummary extends StatelessWidget {
+  const _CollapsedStudySummary({
+    super.key,
+    required this.bookName,
+    required this.progressPercent,
+    required this.progressLabel,
+  });
+
+  final String bookName;
+  final int progressPercent;
+  final String progressLabel;
+
+  @override
+  Widget build(BuildContext context) => Card(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 8),
+          child: Row(children: [
+            const Icon(Icons.menu_book_outlined, color: sea, size: 17),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(bookName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      fontSize: 13, fontWeight: FontWeight.w800)),
+            ),
+            const SizedBox(width: 8),
+            Text('$progressPercent%',
+                style: const TextStyle(
+                    color: sea, fontSize: 12, fontWeight: FontWeight.w800)),
+            const SizedBox(width: 8),
+            Text(progressLabel,
+                style: const TextStyle(
+                    color: Color(0xFF8E8E93),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600)),
+          ]),
+        ),
+      );
+}
+
+class _HomeActionSegmentBar extends StatelessWidget {
+  const _HomeActionSegmentBar({required this.items});
+
+  final List<_HomeActionItem> items;
+
+  @override
+  Widget build(BuildContext context) => Card(
+        child: Padding(
+          padding: const EdgeInsets.all(4),
+          child: Row(children: [
+            for (var index = 0; index < items.length; index++) ...[
+              Expanded(child: items[index]),
+              if (index != items.length - 1)
+                Container(width: 1, height: 28, color: const Color(0xFFE5E5EA)),
+            ],
+          ]),
+        ),
+      );
+}
+
+class _HomeActionItem extends StatelessWidget {
+  const _HomeActionItem({
+    super.key,
     required this.icon,
     required this.iconColor,
-    required this.iconBackground,
-    required this.title,
-    required this.subtitle,
+    required this.label,
+    required this.value,
     required this.onTap,
   });
 
   final IconData icon;
   final Color iconColor;
-  final Color iconBackground;
-  final String title;
-  final String subtitle;
+  final String label;
+  final String value;
   final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) => Opacity(
-        opacity: onTap == null ? .4 : 1,
-        child: Card(
-          child: InkWell(
-            onTap: onTap,
-            borderRadius: BorderRadius.circular(16),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
-              child: Row(children: [
-                Container(
-                    width: 36,
-                    height: 36,
-                    decoration: BoxDecoration(
-                        color: iconBackground,
-                        borderRadius: BorderRadius.circular(12)),
-                    child: Icon(icon, color: iconColor, size: 19)),
-                const SizedBox(width: 11),
-                Expanded(
-                    child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                      Text(title,
-                          style: const TextStyle(
-                              fontSize: 14, fontWeight: FontWeight.w800)),
-                      const SizedBox(height: 2),
-                      Text(subtitle,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                              color: Color(0xFF8E8E93), fontSize: 11)),
-                    ])),
+        opacity: onTap == null ? .42 : 1,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(10),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 7),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                Icon(icon, color: iconColor, size: 16),
+                const SizedBox(width: 4),
+                Flexible(
+                  child: Text(label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          color: ink,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w800)),
+                ),
               ]),
-            ),
+              const SizedBox(height: 1),
+              Text(value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      color: Color(0xFF8E8E93),
+                      fontSize: 10,
+                      fontWeight: FontWeight.w700)),
+            ]),
           ),
         ),
       );

@@ -118,7 +118,7 @@ void main() {
     await tester.pumpWidget(const VocaFlowApp());
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('학습하기'));
+    await tester.tap(find.byKey(const ValueKey('home-action-study')));
     await tester.pumpAndSettle();
 
     final card = find.byKey(const ValueKey('study-card'));
@@ -159,7 +159,7 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     await tester.pumpWidget(const VocaFlowApp());
     await tester.pumpAndSettle();
-    await tester.tap(find.text('학습하기'));
+    await tester.tap(find.byKey(const ValueKey('home-action-study')));
     await tester.pumpAndSettle();
 
     final card = find.byKey(const ValueKey('study-card'));
@@ -375,7 +375,7 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     await tester.pumpWidget(const VocaFlowApp());
     await tester.pumpAndSettle();
-    await tester.tap(find.text('학습하기'));
+    await tester.tap(find.byKey(const ValueKey('home-action-study')));
     await tester.pumpAndSettle();
 
     await tester.binding.handlePopRoute();
@@ -384,7 +384,7 @@ void main() {
     expect(find.byKey(const ValueKey('study-card')), findsNothing);
     expect((await VocaStore.load()).activeStudy, isNotNull);
 
-    await tester.tap(find.text('이어서 학습'));
+    await tester.tap(find.byKey(const ValueKey('home-action-study')));
     await tester.pumpAndSettle();
     await tester.tap(find.byIcon(Icons.arrow_back));
     await tester.pumpAndSettle();
@@ -517,6 +517,87 @@ void main() {
         findsOneWidget);
   });
 
+  testWidgets('favorite list scroll collapses and restores the home header',
+      (WidgetTester tester) async {
+    final books = List.generate(9, (bookIndex) {
+      return WordBook(
+        id: 'favorite-$bookIndex',
+        name: 'Favorite $bookIndex',
+        isFavorite: true,
+        words: List.generate(
+          20,
+          (wordIndex) => Word(
+            id: bookIndex * 100 + wordIndex,
+            term: 'term-$bookIndex-$wordIndex',
+            reading: '',
+            meaning: 'meaning',
+          ),
+        ),
+      );
+    });
+    SharedPreferences.setMockInitialValues({
+      'books': jsonEncode(books.map((book) => book.toJson()).toList()),
+      'quickBook': books.first.id,
+    });
+    await tester.pumpWidget(const VocaFlowApp());
+    await tester.pumpAndSettle();
+
+    final list = find.byKey(const ValueKey('favorite-books-list'));
+    final expandedSummary =
+        find.byKey(const ValueKey('home-study-summary-expanded'));
+    final collapsedSummary =
+        find.byKey(const ValueKey('home-study-summary-collapsed'));
+    final expandedListTop = tester.getTopLeft(list).dy;
+
+    expect(expandedSummary, findsOneWidget);
+    expect(collapsedSummary, findsNothing);
+
+    await tester.drag(list, const Offset(0, -220));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 260));
+
+    expect(collapsedSummary, findsOneWidget);
+    expect(expandedSummary, findsNothing);
+    expect(tester.getTopLeft(list).dy, lessThan(expandedListTop));
+
+    await tester.drag(list, const Offset(0, 420));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 260));
+
+    expect(expandedSummary, findsOneWidget);
+    expect(collapsedSummary, findsNothing);
+  });
+
+  testWidgets('home action segment opens wrong word study',
+      (WidgetTester tester) async {
+    final wrongWord = Word(
+      id: 9201,
+      term: 'mistake',
+      reading: '',
+      meaning: 'wrong answer',
+      wrongCount: 2,
+      lastWrongAt: DateTime(2026, 6, 28),
+    );
+    final book = WordBook(
+      id: 'wrong-book',
+      name: 'Wrong Book',
+      isFavorite: true,
+      words: [wrongWord],
+    );
+    SharedPreferences.setMockInitialValues({
+      'books': jsonEncode([book.toJson()]),
+      'quickBook': book.id,
+    });
+    await tester.pumpWidget(const VocaFlowApp());
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('home-action-wrong')));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
+    expect(find.text('mistake'), findsOneWidget);
+  });
+
   testWidgets('completed favorite session ignores stale saved resume',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({
@@ -558,7 +639,7 @@ void main() {
     await tester.pumpWidget(const VocaFlowApp());
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('학습하기'));
+    await tester.tap(find.byKey(const ValueKey('home-action-study')));
     await tester.pumpAndSettle();
 
     expect(find.byIcon(Icons.keyboard_arrow_left), findsOneWidget);
@@ -949,7 +1030,7 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     await tester.pumpWidget(const VocaFlowApp());
     await tester.pumpAndSettle();
-    await tester.tap(find.text('학습하기'));
+    await tester.tap(find.byKey(const ValueKey('home-action-study')));
     await tester.pumpAndSettle();
 
     Future<void> swipeUp() async {
@@ -987,7 +1068,7 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     await tester.pumpWidget(const VocaFlowApp());
     await tester.pumpAndSettle();
-    await tester.tap(find.text('학습하기'));
+    await tester.tap(find.byKey(const ValueKey('home-action-study')));
     await tester.pumpAndSettle();
 
     final card = find.byKey(const ValueKey('study-card'));
