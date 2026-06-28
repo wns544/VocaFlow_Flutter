@@ -730,9 +730,21 @@ void main() {
 
     await tester.tap(find.byKey(const ValueKey('open-chatgpt-kanji')));
     await tester.pump(const Duration(milliseconds: 100));
-    expect(externalCalls.last.arguments, {
-      'url': 'https://chatgpt.com/c/study-kanji',
-    });
+    expect(externalCalls.last.method, 'openChatGptWithPrompt');
+    expect(
+        externalCalls.last.arguments,
+        containsPair(
+          'url',
+          'https://chatgpt.com/c/study-kanji',
+        ));
+    expect(
+      (externalCalls.last.arguments as Map<Object?, Object?>)['prompt'],
+      isA<String>().having(
+        (value) => value,
+        'prompt',
+        contains('遺跡'),
+      ),
+    );
     await tester.pump(const Duration(seconds: 2));
   });
 

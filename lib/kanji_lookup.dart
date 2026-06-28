@@ -119,6 +119,27 @@ Future<bool> openExternalUrl(Uri uri) async {
   }
 }
 
+Future<bool> openChatGptWithPrompt({
+  required Uri uri,
+  required String prompt,
+}) async {
+  if (uri.scheme != 'https' || prompt.trim().isEmpty) return false;
+  try {
+    return await externalLinkChannel.invokeMethod<bool>(
+          'openChatGptWithPrompt',
+          {
+            'url': uri.toString(),
+            'prompt': prompt,
+          },
+        ) ??
+        false;
+  } on MissingPluginException {
+    return false;
+  } on PlatformException {
+    return false;
+  }
+}
+
 Uri naverHanjaSearchUri(String character) => Uri.parse(
       'https://hanja.dict.naver.com/#/search?query=${Uri.encodeComponent(character)}',
     );

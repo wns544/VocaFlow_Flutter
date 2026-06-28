@@ -2308,6 +2308,11 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
       reading: widget.word.reading,
       meaning: widget.word.meaning,
     );
+    final inserted = await openChatGptWithPrompt(uri: uri, prompt: prompt);
+    if (inserted) {
+      showMessage('ChatGPT 입력창에 질문을 넣었습니다.');
+      return;
+    }
     await Clipboard.setData(ClipboardData(text: prompt));
     final opened = await openExternalUrl(uri);
     showMessage(opened
