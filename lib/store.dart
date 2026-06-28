@@ -740,6 +740,7 @@ class VocaStore {
           'fontWeight': meaningFontWeight,
           'opacity': meaningOpacity,
         },
+        'chatGptConversationUrl': chatGptConversationUrl,
         'activeStudy': activeStudy?.toJson(),
         'activeStudies': activeStudies.map((k, v) => MapEntry(k, v.toJson())),
       };
@@ -797,6 +798,9 @@ class VocaStore {
     await setMeaningStyle(
       fontWeight: (meaningStyle['fontWeight'] as num?)?.toInt() ?? 500,
       opacity: (meaningStyle['opacity'] as num?)?.toDouble() ?? .70,
+    );
+    await setChatGptConversationUrl(
+      json['chatGptConversationUrl'] as String? ?? '',
     );
     final targetDate = json['targetDate'] as String?;
     if (targetDate == null || DateTime.tryParse(targetDate) == null) {

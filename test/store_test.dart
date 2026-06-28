@@ -145,7 +145,7 @@ void main() {
     });
   });
 
-  test('ChatGPT conversation URL stays local and is not backed up', () async {
+  test('ChatGPT conversation URL is backed up and restored', () async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();
 
@@ -156,7 +156,11 @@ void main() {
       isTrue,
     );
     expect(store.chatGptConversationUrl, 'https://chatgpt.com/c/private-id');
-    expect(store.toBackupJson(), isNot(contains('chatGptConversationUrl')));
+    final backup = store.toBackupJson();
+    expect(
+      backup['chatGptConversationUrl'],
+      'https://chatgpt.com/c/private-id',
+    );
     expect(
       await store.setChatGptConversationUrl('https://example.com/c/id'),
       isFalse,
@@ -164,6 +168,14 @@ void main() {
 
     final reloaded = await VocaStore.load();
     expect(reloaded.chatGptConversationUrl, 'https://chatgpt.com/c/private-id');
+
+    SharedPreferences.setMockInitialValues({});
+    final restored = await VocaStore.load();
+    await restored.replaceWithBackupJson(backup);
+    expect(
+      restored.chatGptConversationUrl,
+      'https://chatgpt.com/c/private-id',
+    );
   });
 
   test('mixed-book active study preserves word ownership and selections',
