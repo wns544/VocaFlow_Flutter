@@ -50,7 +50,7 @@ List<T> shuffledStudyQueue<T>(Iterable<T> items, {Random? random}) =>
 
 int reviewReinsertIndex(int remainingCards, {Random? random}) {
   if (remainingCards <= 0) return 0;
-  final minimumGap = min(3, remainingCards);
+  final minimumGap = remainingCards < 6 ? min(2, remainingCards) : 6;
   final maximumGap = min(10, remainingCards);
   return minimumGap + (random ?? Random()).nextInt(maximumGap - minimumGap + 1);
 }
@@ -214,25 +214,26 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
     coordinator.start();
     autoBackup = coordinator;
     autoBackupNotifier.value = coordinator;
-    unawaited(_restoreCloudActiveStudy(coordinator));
+    unawaited(_mergeCloudBackup(coordinator));
   }
 
-  Future<void> _restoreCloudActiveStudy(
-      AutoBackupCoordinator coordinator) async {
-    if (initialStudy != null || store?.activeStudy != null) return;
+  Future<void> _mergeCloudBackup(AutoBackupCoordinator coordinator) async {
     if (!coordinator.enabled || !coordinator.initialized) return;
+    final hadInitialStudy = initialStudy != null || store?.activeStudy != null;
     try {
-      final backup = await coordinator.cloud.downloadBackupJson();
-      final restored = await store?.restoreActiveStudyFromBackupJson(backup);
-      if (!mounted || restored == null || initialStudy != null) return;
-      setState(() => initialStudy = restored);
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        final navigator = navigatorKey.currentState;
-        if (!mounted || navigator == null) return;
-        navigator.pushNamed('/study');
-      });
+      await coordinator.mergeFromCloud();
+      final restored = store?.activeStudy;
+      if (!mounted) return;
+      setState(() => initialStudy = restored ?? initialStudy);
+      if (!hadInitialStudy && restored != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          final navigator = navigatorKey.currentState;
+          if (!mounted || navigator == null) return;
+          navigator.pushNamed('/study');
+        });
+      }
     } catch (_) {
-      // Cloud resume is opportunistic; local startup must stay instant.
+      // Cloud merge is opportunistic; local startup must stay instant.
     }
   }
 
@@ -694,6 +695,14 @@ class _ReferenceHomePageState extends State<HomePage> {
         book.words.where((word) => word.state == StudyState.memorized).length;
     final reviewWords =
         book.words.where((word) => word.state == StudyState.review).toList();
+    final wrongWords = book.words.where((word) => word.wrongCount > 0).toList()
+      ..sort((a, b) {
+        final wrongCompare = b.wrongCount.compareTo(a.wrongCount);
+        if (wrongCompare != 0) return wrongCompare;
+        final aLast = a.lastWrongAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+        final bLast = b.lastWrongAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+        return bLast.compareTo(aLast);
+      });
     final favoriteBooks =
         widget.store.books.where((item) => item.isFavorite).toList();
 
@@ -881,6 +890,30 @@ class _ReferenceHomePageState extends State<HomePage> {
                             },
                     )),
                   ]),
+                  const SizedBox(height: 8),
+                  _QuickAction(
+                    icon: Icons.error_outline,
+                    iconColor: coral,
+                    iconBackground: const Color(0xFFFFEBEE),
+                    title: '오답 테스트',
+                    subtitle: wrongWords.isEmpty
+                        ? '누적 오답 없음'
+                        : '${wrongWords.length}개 단어',
+                    onTap: wrongWords.isEmpty
+                        ? null
+                        : () async {
+                            await Navigator.of(context).push(MaterialPageRoute(
+                              builder: (_) => CardStudyPage(
+                                store: widget.store,
+                                words: wrongWords,
+                                bookId: book.id,
+                              ),
+                            ));
+                            if (!mounted) return;
+                            setState(() {});
+                            widget.refresh();
+                          },
+                  ),
                 ]),
         ),
         const SizedBox(height: 8),
@@ -1705,7 +1738,7 @@ class _CardStudyPageState extends State<CardStudyPage>
             item.wordId == word.id && item.decision == StudyState.review)) {
       reviewed.remove(word.term);
     }
-    await widget.store.mark(word, undone.previousState);
+    await widget.store.mark(word, undone.previousState, recordAttempt: false);
     final previous = undoHistory.lastOrNull;
     lastWord = previous == null
         ? null

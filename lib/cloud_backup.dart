@@ -250,6 +250,7 @@ class CloudBackup {
       'quickBook': profileData['quickBook'] as String? ?? 'default',
       'sessionSize': profileData['sessionSize'] as int? ?? 10,
       'completed': profileData['completed'] as List<dynamic>? ?? <String>[],
+      'completedAt': profileData['completedAt'] as Map<String, dynamic>? ?? {},
       'studyDays': profileData['studyDays'] as List<dynamic>? ?? <String>[],
       'targetName': profileData['targetName'] as String? ?? '',
       'targetDate': profileData['targetDate'] as String?,
@@ -269,6 +270,8 @@ class CloudBackup {
       'activeStudy': profileData['activeStudy'] as Map<String, dynamic>?,
       'activeStudies':
           profileData['activeStudies'] as Map<String, dynamic>? ?? {},
+      'resetMarkers':
+          profileData['resetMarkers'] as Map<String, dynamic>? ?? {},
     };
   }
 
@@ -389,6 +392,10 @@ class CloudBackup {
         'example': data['example'] as String? ?? '',
         'exampleMeaning': data['exampleMeaning'] as String? ?? '',
         'state': data['state'] as String? ?? StudyState.fresh.name,
+        'correctCount': (data['correctCount'] as num?)?.toInt() ?? 0,
+        'wrongCount': (data['wrongCount'] as num?)?.toInt() ?? 0,
+        'lastStudiedAt': data['lastStudiedAt'] as String?,
+        'lastWrongAt': data['lastWrongAt'] as String?,
       };
 
   Map<String, dynamic> _profileData(
@@ -398,6 +405,7 @@ class CloudBackup {
         'quickBook': backup['quickBook'],
         'sessionSize': backup['sessionSize'],
         'completed': backup['completed'],
+        'completedAt': backup['completedAt'],
         'studyDays': backup['studyDays'],
         'targetName': backup['targetName'],
         'targetDate': backup['targetDate'],
@@ -412,6 +420,7 @@ class CloudBackup {
         'chatGptConversationUrl': backup['chatGptConversationUrl'],
         'activeStudy': backup['activeStudy'],
         'activeStudies': backup['activeStudies'],
+        'resetMarkers': backup['resetMarkers'],
         'bookOrder': store.books.map((book) => book.id).toList(),
         'updatedAt': FieldValue.serverTimestamp(),
       };

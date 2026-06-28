@@ -132,6 +132,7 @@ class VocaStore {
   static const _quickBookKey = 'quickBook';
   static const _sessionSizeKey = 'sessionSize';
   static const _completedKey = 'completed';
+  static const _completedAtKey = 'completedAt';
   static const _studyDaysKey = 'studyDays';
   static const _targetNameKey = 'targetName';
   static const _targetDateKey = 'targetDate';
@@ -198,6 +199,7 @@ class VocaStore {
   }
 
   static const _activeStudiesKey = 'activeStudies';
+  static const _resetMarkersKey = 'resetMarkers';
 
   Map<String, ActiveStudy> get activeStudies {
     final saved = _prefs.getString(_activeStudiesKey);
@@ -224,6 +226,58 @@ class VocaStore {
     } catch (_) {
       return const {};
     }
+  }
+
+  Map<String, DateTime> get resetMarkers {
+    final saved = _prefs.getString(_resetMarkersKey);
+    if (saved == null) return const {};
+    try {
+      final decoded = jsonDecode(saved) as Map<String, dynamic>;
+      return decoded.map((key, value) => MapEntry(
+            key,
+            DateTime.tryParse(value as String? ?? '') ??
+                DateTime.fromMillisecondsSinceEpoch(0),
+          ));
+    } catch (_) {
+      return const {};
+    }
+  }
+
+  Map<String, DateTime> get completedAt {
+    final saved = _prefs.getString(_completedAtKey);
+    if (saved == null) return const {};
+    try {
+      final decoded = jsonDecode(saved) as Map<String, dynamic>;
+      return decoded.map((key, value) => MapEntry(
+            key,
+            DateTime.tryParse(value as String? ?? '') ??
+                DateTime.fromMillisecondsSinceEpoch(0),
+          ));
+    } catch (_) {
+      return const {};
+    }
+  }
+
+  Future<void> _saveCompletedAt(Map<String, DateTime> values) =>
+      _prefs.setString(
+        _completedAtKey,
+        jsonEncode(values.map(
+          (key, value) => MapEntry(key, value.toIso8601String()),
+        )),
+      );
+
+  Future<void> _saveResetMarkers(Map<String, DateTime> markers) =>
+      _prefs.setString(
+        _resetMarkersKey,
+        jsonEncode(markers.map(
+          (key, value) => MapEntry(key, value.toIso8601String()),
+        )),
+      );
+
+  Future<void> _markReset(String key) async {
+    final markers = Map<String, DateTime>.from(resetMarkers);
+    markers[key] = DateTime.now();
+    await _saveResetMarkers(markers);
   }
 
   ActiveStudy? _loadOldActiveStudy() {
@@ -677,6 +731,12 @@ class VocaStore {
     final completed = (_prefs.getStringList(_completedKey) ?? []).toSet();
     completed.addAll(completedIndexes.map((index) => '$bookId:$index'));
     await _prefs.setStringList(_completedKey, completed.toList());
+    final completedTimes = Map<String, DateTime>.from(completedAt);
+    final now = DateTime.now();
+    for (final index in completedIndexes) {
+      completedTimes['$bookId:$index'] = now;
+    }
+    await _saveCompletedAt(completedTimes);
     final days = (_prefs.getStringList(_studyDaysKey) ?? []).toSet()
       ..add(_dayKey(DateTime.now()));
     await _prefs.setStringList(_studyDaysKey, days.toList());
@@ -704,8 +764,19 @@ class VocaStore {
     }
   }
 
-  Future<void> mark(Word word, StudyState state) async {
+  Future<void> mark(Word word, StudyState state,
+      {bool recordAttempt = true}) async {
     word.state = state;
+    if (recordAttempt) {
+      final now = DateTime.now();
+      word.lastStudiedAt = now;
+      if (state == StudyState.memorized) {
+        word.correctCount++;
+      } else if (state == StudyState.review) {
+        word.wrongCount++;
+        word.lastWrongAt = now;
+      }
+    }
     await _saveBooks();
     final book = books
         .where((candidate) => candidate.words.any((item) => item.id == word.id))
@@ -716,8 +787,12 @@ class VocaStore {
   Future<void> completeCurrentSession() async {
     final completedIndex = nextSessionIndex(quickBook);
     final completed = (_prefs.getStringList(_completedKey) ?? []).toSet();
-    completed.add('${quickBook.id}:$completedIndex');
+    final completedKey = '${quickBook.id}:$completedIndex';
+    completed.add(completedKey);
     await _prefs.setStringList(_completedKey, completed.toList());
+    final completedTimes = Map<String, DateTime>.from(completedAt);
+    completedTimes[completedKey] = DateTime.now();
+    await _saveCompletedAt(completedTimes);
     final days = (_prefs.getStringList(_studyDaysKey) ?? []).toSet()
       ..add(_dayKey(DateTime.now()));
     await _prefs.setStringList(_studyDaysKey, days.toList());
@@ -727,12 +802,18 @@ class VocaStore {
   }
 
   Future<void> resetProgress() async {
+    await _markReset('all');
     for (final book in books) {
       for (final word in book.words) {
         word.state = StudyState.fresh;
+        word.correctCount = 0;
+        word.wrongCount = 0;
+        word.lastStudiedAt = null;
+        word.lastWrongAt = null;
       }
     }
     await _prefs.remove(_completedKey);
+    await _prefs.remove(_completedAtKey);
     await _prefs.remove(_studyDaysKey);
     await clearAllActiveStudies();
     await _saveBooks();
@@ -748,6 +829,9 @@ class VocaStore {
         'quickBook': _prefs.getString(_quickBookKey) ?? 'default',
         'sessionSize': sessionSize,
         'completed': _prefs.getStringList(_completedKey) ?? <String>[],
+        'completedAt': completedAt.map(
+          (key, value) => MapEntry(key, value.toIso8601String()),
+        ),
         'studyDays': _prefs.getStringList(_studyDaysKey) ?? <String>[],
         'targetName': targetName,
         'targetDate': _prefs.getString(_targetDateKey),
@@ -771,6 +855,9 @@ class VocaStore {
         'chatGptConversationUrl': chatGptConversationUrl,
         'activeStudy': activeStudy?.toJson(),
         'activeStudies': activeStudies.map((k, v) => MapEntry(k, v.toJson())),
+        'resetMarkers': resetMarkers.map(
+          (key, value) => MapEntry(key, value.toIso8601String()),
+        ),
       };
 
   Future<void> replaceWithBackupJson(Map<String, dynamic> json) async {
@@ -796,6 +883,15 @@ class VocaStore {
     await _prefs.setStringList(
       _completedKey,
       (json['completed'] as List<dynamic>? ?? []).cast<String>(),
+    );
+    await _saveCompletedAt(
+      (json['completedAt'] as Map<String, dynamic>? ?? const {}).map(
+        (key, value) => MapEntry(
+          key,
+          DateTime.tryParse(value as String? ?? '') ??
+              DateTime.fromMillisecondsSinceEpoch(0),
+        ),
+      ),
     );
     await _prefs.setStringList(
       _studyDaysKey,
@@ -829,6 +925,15 @@ class VocaStore {
     );
     await setChatGptConversationUrl(
       json['chatGptConversationUrl'] as String? ?? '',
+    );
+    await _saveResetMarkers(
+      (json['resetMarkers'] as Map<String, dynamic>? ?? const {}).map(
+        (key, value) => MapEntry(
+          key,
+          DateTime.tryParse(value as String? ?? '') ??
+              DateTime.fromMillisecondsSinceEpoch(0),
+        ),
+      ),
     );
     final targetDate = json['targetDate'] as String?;
     if (targetDate == null || DateTime.tryParse(targetDate) == null) {

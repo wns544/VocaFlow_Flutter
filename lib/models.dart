@@ -9,6 +9,10 @@ class Word {
     this.example = '',
     this.exampleMeaning = '',
     this.state = StudyState.fresh,
+    this.correctCount = 0,
+    this.wrongCount = 0,
+    this.lastStudiedAt,
+    this.lastWrongAt,
   }) : id = id ?? Object.hash(term, meaning, reading);
 
   final int id;
@@ -18,6 +22,10 @@ class Word {
   final String example;
   final String exampleMeaning;
   StudyState state;
+  int correctCount;
+  int wrongCount;
+  DateTime? lastStudiedAt;
+  DateTime? lastWrongAt;
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -27,6 +35,10 @@ class Word {
         'example': example,
         'exampleMeaning': exampleMeaning,
         'state': state.name,
+        'correctCount': correctCount,
+        'wrongCount': wrongCount,
+        'lastStudiedAt': lastStudiedAt?.toIso8601String(),
+        'lastWrongAt': lastWrongAt?.toIso8601String(),
       };
 
   factory Word.fromJson(Map<String, dynamic> json) => Word(
@@ -36,6 +48,10 @@ class Word {
         reading: json['reading'] as String? ?? '',
         example: json['example'] as String? ?? '',
         exampleMeaning: json['exampleMeaning'] as String? ?? '',
+        correctCount: (json['correctCount'] as num?)?.toInt() ?? 0,
+        wrongCount: (json['wrongCount'] as num?)?.toInt() ?? 0,
+        lastStudiedAt: _dateTimeFromJson(json['lastStudiedAt']),
+        lastWrongAt: _dateTimeFromJson(json['lastWrongAt']),
         state: StudyState.values.firstWhere(
           (value) => value.name == json['state'],
           orElse: () => StudyState.fresh,
@@ -49,6 +65,11 @@ class Word {
     String? example,
     String? exampleMeaning,
     StudyState? state,
+    int? correctCount,
+    int? wrongCount,
+    DateTime? lastStudiedAt,
+    DateTime? lastWrongAt,
+    bool clearStudyStats = false,
   }) =>
       Word(
         id: id,
@@ -58,8 +79,16 @@ class Word {
         example: example ?? this.example,
         exampleMeaning: exampleMeaning ?? this.exampleMeaning,
         state: state ?? this.state,
+        correctCount: correctCount ?? this.correctCount,
+        wrongCount: wrongCount ?? this.wrongCount,
+        lastStudiedAt:
+            clearStudyStats ? null : lastStudiedAt ?? this.lastStudiedAt,
+        lastWrongAt: clearStudyStats ? null : lastWrongAt ?? this.lastWrongAt,
       );
 }
+
+DateTime? _dateTimeFromJson(dynamic value) =>
+    value is String ? DateTime.tryParse(value) : null;
 
 class SessionOverride {
   const SessionOverride({this.size, this.name});

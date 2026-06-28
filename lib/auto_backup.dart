@@ -145,6 +145,20 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     onChanged?.call();
   }
 
+  Future<void> mergeFromCloud() async {
+    final current = user;
+    if (current == null || !enabled || !initialized) return;
+    final local = store.toBackupJson();
+    final remote = await cloud.downloadBackupJson();
+    final merged = mergeBackupJson(cloud: remote, local: local);
+    await store.replaceWithBackupJson(merged);
+    await cloud.upload(store);
+    await store.cloudChanges.clearPending();
+    await store.cloudChanges.recordSuccess(current.uid, _now());
+    _failureCount = 0;
+    onChanged?.call();
+  }
+
   void requestImmediateBackup({bool ignoreMinimumInterval = false}) =>
       _schedule(Duration.zero, ignoreMinimumInterval: ignoreMinimumInterval);
 

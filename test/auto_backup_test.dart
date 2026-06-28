@@ -131,6 +131,101 @@ void main() {
     expect(names, ['JLPT', 'JLPT (이 기기)', 'JLPT (이 기기) 2']);
   });
 
+  test('merge lets newer reset markers suppress old completed sessions', () {
+    final cloud = _backup(
+      [
+        _book('same', 'JLPT', [_word(1, 'cloud')])
+      ],
+      completed: ['same:0'],
+      completedAt: {'same:0': '2026-06-28T09:00:00.000'},
+    );
+    final local = _backup(
+      [
+        _book('same', 'JLPT', [_word(1, 'local')])
+      ],
+      resetMarkers: {'session:same:0': '2026-06-28T10:00:00.000'},
+    );
+
+    final merged = mergeBackupJson(cloud: cloud, local: local);
+
+    expect(merged['completed'], isNot(contains('same:0')));
+    expect(merged['resetMarkers'],
+        containsPair('session:same:0', '2026-06-28T10:00:00.000'));
+  });
+
+  test('merge keeps the more advanced active study for the same session', () {
+    final cloud = _backup(
+      [
+        _book('same', 'JLPT', [_word(1, 'cloud')])
+      ],
+      activeStudies: {
+        'same:[0]': {
+          'queueIds': [3, 4, 5],
+          'total': 5,
+          'memorized': 2,
+          'reviewed': [],
+          'revealed': false,
+          'bookId': 'same',
+          'sessionIndexes': [0],
+          'updatedAt': '2026-06-28T09:00:00.000',
+        }
+      },
+    );
+    final local = _backup(
+      [
+        _book('same', 'JLPT', [_word(1, 'local')])
+      ],
+      activeStudies: {
+        'same:[0]': {
+          'queueIds': [5],
+          'total': 5,
+          'memorized': 4,
+          'reviewed': [],
+          'revealed': false,
+          'bookId': 'same',
+          'sessionIndexes': [0],
+          'updatedAt': '2026-06-28T08:00:00.000',
+        }
+      },
+    );
+
+    final merged = mergeBackupJson(cloud: cloud, local: local);
+    final active = (merged['activeStudies'] as Map)['same:[0]'] as Map;
+
+    expect(active['memorized'], 4);
+    expect(active['queueIds'], [5]);
+  });
+
+  test('merge preserves higher wrong stats without double counting', () {
+    final cloudWord = _word(1, 'cloud')
+      ..['wrongCount'] = 2
+      ..['correctCount'] = 1
+      ..['lastWrongAt'] = '2026-06-28T09:00:00.000'
+      ..['state'] = 'review';
+    final localWord = _word(1, 'local')
+      ..['wrongCount'] = 3
+      ..['correctCount'] = 1
+      ..['lastWrongAt'] = '2026-06-28T10:00:00.000'
+      ..['state'] = 'memorized';
+
+    final merged = mergeBackupJson(
+      cloud: _backup([
+        _book('same', 'JLPT', [cloudWord])
+      ]),
+      local: _backup([
+        _book('same', 'JLPT', [localWord])
+      ]),
+    );
+    final book = WordBook.fromJson(
+        (merged['books'] as List<dynamic>).single as Map<String, dynamic>);
+    final word = book.words.single;
+
+    expect(word.wrongCount, 3);
+    expect(word.correctCount, 1);
+    expect(word.state, StudyState.memorized);
+    expect(word.lastWrongAt, DateTime.parse('2026-06-28T10:00:00.000'));
+  });
+
   test('automatic backup configuration is stored per account', () async {
     final tracker = await CloudChangeTracker.load();
     await tracker.setInitialized('a', true);
@@ -150,6 +245,9 @@ Map<String, dynamic> _backup(
   List<Map<String, dynamic>> books, {
   int sessionSize = 10,
   List<String> completed = const [],
+  Map<String, String> completedAt = const {},
+  Map<String, String> resetMarkers = const {},
+  Map<String, dynamic> activeStudies = const {},
   List<String> days = const [],
 }) =>
     {
@@ -158,6 +256,9 @@ Map<String, dynamic> _backup(
       'quickBook': books.first['id'],
       'sessionSize': sessionSize,
       'completed': completed,
+      'completedAt': completedAt,
+      'resetMarkers': resetMarkers,
+      'activeStudies': activeStudies,
       'studyDays': days,
       'targetName': '',
       'targetDate': null,
