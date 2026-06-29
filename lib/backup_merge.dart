@@ -66,6 +66,10 @@ Map<String, dynamic> mergeBackupJson({
       if (completedAt[key] != null) key: completedAt[key]!.toIso8601String()
   };
   result['studyDays'] = _union(cloud['studyDays'], local['studyDays']);
+  result['dailyStudyStats'] =
+      _mergeDailyStudyStats(cloud['dailyStudyStats'], local['dailyStudyStats']);
+  result['studyEventLog'] =
+      _mergeStudyEventLogs(cloud['studyEventLog'], local['studyEventLog']);
 
   final mergedStudies = <String, dynamic>{};
   final cloudStudies =
@@ -139,6 +143,65 @@ Map<String, DateTime> _mergeDateMap(
   }
   return result;
 }
+
+Map<String, dynamic> _mergeDailyStudyStats(dynamic cloud, dynamic local) {
+  final cloudStats = cloud as Map<dynamic, dynamic>? ?? const {};
+  final localStats = local as Map<dynamic, dynamic>? ?? const {};
+  final result = <String, dynamic>{};
+  for (final key in {...cloudStats.keys, ...localStats.keys}) {
+    final cloudValue = _statsMap(cloudStats[key]);
+    final localValue = _statsMap(localStats[key]);
+    result[key.toString()] = {
+      'studiedCards':
+          _maxInt(cloudValue['studiedCards'], localValue['studiedCards']),
+      'completedSessions': _maxInt(
+          cloudValue['completedSessions'], localValue['completedSessions']),
+      'correctCount':
+          _maxInt(cloudValue['correctCount'], localValue['correctCount']),
+      'wrongCount': _maxInt(cloudValue['wrongCount'], localValue['wrongCount']),
+    };
+  }
+  return result;
+}
+
+Map<String, dynamic> _statsMap(dynamic value) =>
+    value is Map ? Map<String, dynamic>.from(value) : const {};
+
+int _maxInt(dynamic left, dynamic right) {
+  final a = (left as num?)?.toInt() ?? 0;
+  final b = (right as num?)?.toInt() ?? 0;
+  return a > b ? a : b;
+}
+
+List<dynamic> _mergeStudyEventLogs(dynamic cloud, dynamic local) {
+  final events = <String, Map<String, dynamic>>{};
+  for (final raw in [
+    ...(cloud as List<dynamic>? ?? const []),
+    ...(local as List<dynamic>? ?? const []),
+  ]) {
+    if (raw is! Map) continue;
+    final event = Map<String, dynamic>.from(raw);
+    final id = event['id'] as String?;
+    if (id == null || id.isEmpty) continue;
+    final existing = events[id];
+    if (existing == null || _eventTime(event).isAfter(_eventTime(existing))) {
+      events[id] = event;
+    }
+  }
+  final referenceTime = events.values.map(_eventTime).fold<DateTime?>(null,
+      (latest, time) => latest == null || time.isAfter(latest) ? time : latest);
+  final cutoff =
+      (referenceTime ?? DateTime.now()).subtract(const Duration(days: 90));
+  final result = events.values
+      .where((event) => !_eventTime(event).isBefore(cutoff))
+      .toList()
+    ..sort((a, b) => _eventTime(b).compareTo(_eventTime(a)));
+  return result.take(3000).toList();
+}
+
+DateTime _eventTime(Map<String, dynamic> event) =>
+    DateTime.tryParse(event['timestamp'] as String? ?? '') ??
+    DateTime.fromMillisecondsSinceEpoch(0);
 
 Word _mergeWord(
   Word cloud,

@@ -252,6 +252,10 @@ class CloudBackup {
       'completed': profileData['completed'] as List<dynamic>? ?? <String>[],
       'completedAt': profileData['completedAt'] as Map<String, dynamic>? ?? {},
       'studyDays': profileData['studyDays'] as List<dynamic>? ?? <String>[],
+      'dailyStudyStats':
+          profileData['dailyStudyStats'] as Map<String, dynamic>? ?? {},
+      'studyEventLog':
+          profileData['studyEventLog'] as List<dynamic>? ?? <dynamic>[],
       'targetName': profileData['targetName'] as String? ?? '',
       'targetDate': profileData['targetDate'] as String?,
       'horizontalSwipe': profileData['horizontalSwipe'] as bool? ?? false,
@@ -407,6 +411,8 @@ class CloudBackup {
         'completed': backup['completed'],
         'completedAt': backup['completedAt'],
         'studyDays': backup['studyDays'],
+        'dailyStudyStats': backup['dailyStudyStats'],
+        'studyEventLog': backup['studyEventLog'],
         'targetName': backup['targetName'],
         'targetDate': backup['targetDate'],
         'horizontalSwipe': backup['horizontalSwipe'],

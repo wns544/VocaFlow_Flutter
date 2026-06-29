@@ -48,6 +48,9 @@ bool shuffleNewStudyQueues = true;
 List<T> shuffledStudyQueue<T>(Iterable<T> items, {Random? random}) =>
     List<T>.of(items)..shuffle(random);
 
+double _lerpDouble(num start, num end, double progress) =>
+    start + (end - start) * progress.clamp(0.0, 1.0);
+
 int reviewReinsertIndex(int remainingCards, {Random? random}) {
   if (remainingCards <= 0) return 0;
   final minimumGap = remainingCards < 6 ? min(2, remainingCards) : 6;
@@ -665,7 +668,7 @@ class _ReferenceHomePageState extends State<HomePage> {
   final expandedFavoriteIds = <String>{};
   final selectedFavoriteSessions = <String, Set<int>>{};
   var multiSessionSelectionMode = false;
-  var homeHeaderCollapsed = false;
+  var homeHeaderCollapseProgress = 0.0;
 
   @override
   void initState() {
@@ -682,10 +685,11 @@ class _ReferenceHomePageState extends State<HomePage> {
   }
 
   void _handleFavoriteScroll() {
-    final shouldCollapse = favoriteScrollController.hasClients &&
-        favoriteScrollController.offset > 24;
-    if (shouldCollapse == homeHeaderCollapsed) return;
-    setState(() => homeHeaderCollapsed = shouldCollapse);
+    final progress = favoriteScrollController.hasClients
+        ? (favoriteScrollController.offset / 72).clamp(0.0, 1.0).toDouble()
+        : 0.0;
+    if ((progress - homeHeaderCollapseProgress).abs() < .02) return;
+    setState(() => homeHeaderCollapseProgress = progress);
   }
 
   WordBook get book => widget.store.books.firstWhere(
@@ -766,13 +770,8 @@ class _ReferenceHomePageState extends State<HomePage> {
       padding: const EdgeInsets.fromLTRB(20, 28, 20, 12),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
-          const Expanded(
-              child: Text('VOCAFLOW',
-                  style: TextStyle(
-                      color: sea,
-                      fontSize: 11,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: 1.8))),
+          Expanded(child: _WeeklyStudyBar(store: widget.store)),
+          const SizedBox(width: 10),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
             decoration: BoxDecoration(
@@ -793,7 +792,7 @@ class _ReferenceHomePageState extends State<HomePage> {
         ]),
         AnimatedSize(
           key: const ValueKey('home-study-controls'),
-          duration: const Duration(milliseconds: 220),
+          duration: const Duration(milliseconds: 120),
           curve: Curves.easeInOutCubic,
           alignment: Alignment.topCenter,
           child: multiSessionSelectionMode
@@ -835,28 +834,20 @@ class _ReferenceHomePageState extends State<HomePage> {
                   ),
                 )
               : Column(children: [
-                  SizedBox(height: homeHeaderCollapsed ? 8 : 12),
-                  AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 180),
-                    switchInCurve: Curves.easeOutCubic,
-                    switchOutCurve: Curves.easeInCubic,
-                    child: homeHeaderCollapsed
-                        ? _CollapsedStudySummary(
-                            key: const ValueKey('home-study-summary-collapsed'),
-                            bookName: book.name,
-                            progressPercent: progressPercent,
-                            progressLabel: '$memorized/${book.words.length} 외움',
-                          )
-                        : _ExpandedStudySummary(
-                            key: const ValueKey('home-study-summary-expanded'),
-                            bookName: book.name,
-                            progress: progress,
-                            progressPercent: progressPercent,
-                            progressLabel: '$memorized/${book.words.length} 외움',
-                          ),
+                  SizedBox(
+                      height: _lerpDouble(12, 8, homeHeaderCollapseProgress)),
+                  _MorphingStudySummary(
+                    key: const ValueKey('home-study-summary-morph'),
+                    collapseProgress: homeHeaderCollapseProgress,
+                    bookName: book.name,
+                    progress: progress,
+                    progressPercent: progressPercent,
+                    progressLabel: '$memorized/${book.words.length} 외움',
                   ),
-                  SizedBox(height: homeHeaderCollapsed ? 6 : 8),
+                  SizedBox(
+                      height: _lerpDouble(8, 6, homeHeaderCollapseProgress)),
                   _HomeActionSegmentBar(
+                    collapseProgress: homeHeaderCollapseProgress,
                     items: [
                       _HomeActionItem(
                         key: const ValueKey('home-action-review'),
@@ -907,10 +898,10 @@ class _ReferenceHomePageState extends State<HomePage> {
                   ),
                 ]),
         ),
-        SizedBox(height: homeHeaderCollapsed ? 6 : 8),
+        SizedBox(height: _lerpDouble(8, 6, homeHeaderCollapseProgress)),
         SizedBox(
           width: double.infinity,
-          height: homeHeaderCollapsed ? 36 : 42,
+          height: _lerpDouble(42, 36, homeHeaderCollapseProgress),
           child: OutlinedButton.icon(
             key: const ValueKey('multi-session-study'),
             onPressed: favoriteBooks.any((item) => item.words.isNotEmpty)
@@ -927,7 +918,7 @@ class _ReferenceHomePageState extends State<HomePage> {
             ),
           ),
         ),
-        SizedBox(height: homeHeaderCollapsed ? 8 : 12),
+        SizedBox(height: _lerpDouble(12, 8, homeHeaderCollapseProgress)),
         const Text('즐겨찾기 단어장',
             style: TextStyle(
                 color: Color(0xFF8E8E93),
@@ -1207,116 +1198,205 @@ class _ReferenceHomePageState extends State<HomePage> {
   }
 }
 
-class _ExpandedStudySummary extends StatelessWidget {
-  const _ExpandedStudySummary({
+class _WeeklyStudyBar extends StatelessWidget {
+  const _WeeklyStudyBar({required this.store});
+
+  final VocaStore store;
+
+  @override
+  Widget build(BuildContext context) {
+    final days = store.recentDayKeys();
+    return SizedBox(
+      height: 30,
+      child: Row(children: [
+        for (var index = 0; index < days.length; index++) ...[
+          Expanded(
+            child: _DailyStudyIndicator(
+              label: index == days.length - 1
+                  ? '오늘'
+                  : '${days.length - index - 1}',
+              status: store.dailyStudyStatus(days[index]),
+              today: index == days.length - 1,
+            ),
+          ),
+          if (index != days.length - 1) const SizedBox(width: 3),
+        ],
+      ]),
+    );
+  }
+}
+
+class _DailyStudyIndicator extends StatelessWidget {
+  const _DailyStudyIndicator({
+    required this.label,
+    required this.status,
+    required this.today,
+  });
+
+  final String label;
+  final DailyStudyStatus status;
+  final bool today;
+
+  Color get color => switch (status) {
+        DailyStudyStatus.completed => sea,
+        DailyStudyStatus.medium => const Color(0xFFFFC107),
+        DailyStudyStatus.low => coral,
+        DailyStudyStatus.none => const Color(0xFFDADCE0),
+      };
+
+  @override
+  Widget build(BuildContext context) => Column(children: [
+        Expanded(
+          child: Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  color.withValues(alpha: .35),
+                  color.withValues(
+                      alpha: status == DailyStudyStatus.none ? .22 : .9),
+                ],
+              ),
+              borderRadius: BorderRadius.circular(99),
+              border:
+                  today ? Border.all(color: ink.withValues(alpha: .18)) : null,
+            ),
+          ),
+        ),
+        const SizedBox(height: 2),
+        Text(label,
+            maxLines: 1,
+            overflow: TextOverflow.clip,
+            style: TextStyle(
+                color: today ? ink : const Color(0xFF8E8E93),
+                fontSize: 8,
+                fontWeight: today ? FontWeight.w800 : FontWeight.w600)),
+      ]);
+}
+
+class _MorphingStudySummary extends StatelessWidget {
+  const _MorphingStudySummary({
     super.key,
+    required this.collapseProgress,
     required this.bookName,
     required this.progress,
     required this.progressPercent,
     required this.progressLabel,
   });
 
+  final double collapseProgress;
   final String bookName;
   final double progress;
   final int progressPercent;
   final String progressLabel;
 
   @override
-  Widget build(BuildContext context) => Card(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 11, 16, 10),
-          child: Column(children: [
-            Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-              Expanded(
-                child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text('현재 학습 단어장',
-                          style: TextStyle(
-                              color: Color(0xFF8E8E93),
-                              fontSize: 10,
-                              fontWeight: FontWeight.w600)),
-                      const SizedBox(height: 1),
-                      Text(bookName,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                              color: ink,
-                              fontSize: 17,
-                              fontWeight: FontWeight.w800)),
-                    ]),
-              ),
-              const SizedBox(width: 12),
-              Text('$progressPercent%',
-                  style: const TextStyle(
-                      color: sea, fontSize: 12, fontWeight: FontWeight.w800)),
-            ]),
-            const SizedBox(height: 7),
-            LinearProgressIndicator(
-                value: progress,
-                minHeight: 6,
-                borderRadius: BorderRadius.circular(99),
-                backgroundColor: const Color(0xFFE5E5EA)),
-            const SizedBox(height: 5),
-            Align(
-                alignment: Alignment.centerLeft,
-                child: Text(progressLabel,
-                    style: const TextStyle(
-                        color: Color(0xFF8E8E93), fontSize: 11))),
-          ]),
+  Widget build(BuildContext context) {
+    final t = Curves.easeOutCubic.transform(collapseProgress.clamp(0.0, 1.0));
+    final expandedOpacity = (1 - t * 1.4).clamp(0.0, 1.0);
+    return Card(
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(
+          _lerpDouble(16, 13, t),
+          _lerpDouble(11, 8, t),
+          _lerpDouble(16, 13, t),
+          _lerpDouble(10, 8, t),
         ),
-      );
-}
-
-class _CollapsedStudySummary extends StatelessWidget {
-  const _CollapsedStudySummary({
-    super.key,
-    required this.bookName,
-    required this.progressPercent,
-    required this.progressLabel,
-  });
-
-  final String bookName;
-  final int progressPercent;
-  final String progressLabel;
-
-  @override
-  Widget build(BuildContext context) => Card(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 8),
-          child: Row(children: [
-            const Icon(Icons.menu_book_outlined, color: sea, size: 17),
-            const SizedBox(width: 8),
+        child: Column(children: [
+          Row(children: [
+            Opacity(
+              opacity: t,
+              child: const Icon(Icons.menu_book_outlined, color: sea, size: 17),
+            ),
+            SizedBox(width: _lerpDouble(0, 8, t)),
             Expanded(
-              child: Text(bookName,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                      fontSize: 13, fontWeight: FontWeight.w800)),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  ClipRect(
+                    child: Align(
+                      heightFactor: expandedOpacity,
+                      alignment: Alignment.topCenter,
+                      child: Opacity(
+                        opacity: expandedOpacity,
+                        child: const Text('현재 학습 단어장',
+                            style: TextStyle(
+                                color: Color(0xFF8E8E93),
+                                fontSize: 10,
+                                fontWeight: FontWeight.w600)),
+                      ),
+                    ),
+                  ),
+                  SizedBox(height: _lerpDouble(1, 0, t)),
+                  Text(bookName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                          color: ink,
+                          fontSize: _lerpDouble(17, 13, t),
+                          fontWeight: FontWeight.w800)),
+                ],
+              ),
             ),
             const SizedBox(width: 8),
             Text('$progressPercent%',
-                style: const TextStyle(
-                    color: sea, fontSize: 12, fontWeight: FontWeight.w800)),
-            const SizedBox(width: 8),
-            Text(progressLabel,
-                style: const TextStyle(
-                    color: Color(0xFF8E8E93),
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600)),
+                style: TextStyle(
+                    color: sea,
+                    fontSize: _lerpDouble(12, 12, t),
+                    fontWeight: FontWeight.w800)),
+            SizedBox(width: _lerpDouble(0, 8, t)),
+            Opacity(
+              opacity: t,
+              child: Text(progressLabel,
+                  style: const TextStyle(
+                      color: Color(0xFF8E8E93),
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600)),
+            ),
           ]),
-        ),
-      );
+          ClipRect(
+            child: Align(
+              heightFactor: expandedOpacity,
+              alignment: Alignment.topCenter,
+              child: Opacity(
+                opacity: expandedOpacity,
+                child: Column(children: [
+                  const SizedBox(height: 7),
+                  LinearProgressIndicator(
+                      value: progress,
+                      minHeight: 6,
+                      borderRadius: BorderRadius.circular(99),
+                      backgroundColor: const Color(0xFFE5E5EA)),
+                  const SizedBox(height: 5),
+                  Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(progressLabel,
+                          style: const TextStyle(
+                              color: Color(0xFF8E8E93), fontSize: 11))),
+                ]),
+              ),
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
 }
 
 class _HomeActionSegmentBar extends StatelessWidget {
-  const _HomeActionSegmentBar({required this.items});
+  const _HomeActionSegmentBar({
+    required this.items,
+    required this.collapseProgress,
+  });
 
   final List<_HomeActionItem> items;
+  final double collapseProgress;
 
   @override
   Widget build(BuildContext context) => Card(
         child: Padding(
-          padding: const EdgeInsets.all(4),
+          padding: EdgeInsets.all(_lerpDouble(4, 3, collapseProgress)),
           child: Row(children: [
             for (var index = 0; index < items.length; index++) ...[
               Expanded(child: items[index]),
@@ -1563,6 +1643,25 @@ class _CardStudyPageState extends State<CardStudyPage>
 
   String? _bookIdForWord(Word word) => _bookIdsByWord[word];
 
+  List<int> _sessionIndexesForWord(Word word) {
+    final bookId = _bookIdForWord(word);
+    if (bookId == null) return activeSessionIndexes;
+    final selected = activeSessionSelections[bookId];
+    if (selected == null || selected.isEmpty) return activeSessionIndexes;
+    final selectedBook =
+        widget.store.books.where((book) => book.id == bookId).firstOrNull;
+    if (selectedBook == null) return selected;
+    final sessions = selectedBook.sessions(widget.store.sessionSize);
+    for (final index in selected) {
+      if (index >= 0 &&
+          index < sessions.length &&
+          sessions[index].words.any((item) => item.id == word.id)) {
+        return [index];
+      }
+    }
+    return selected;
+  }
+
   String _cardIdentity(Word word) =>
       '${_bookIdForWord(word) ?? activeBookId ?? 'unknown'}:${word.id}';
 
@@ -1579,7 +1678,12 @@ class _CardStudyPageState extends State<CardStudyPage>
     _persistenceChain = _persistenceChain.then((_) async {
       await WidgetsBinding.instance.endOfFrame;
       await (widget.decisionWriter?.call(word, state) ??
-          widget.store.mark(word, state));
+          widget.store.mark(
+            word,
+            state,
+            bookId: _bookIdForWord(word),
+            sessionIndexes: _sessionIndexesForWord(word),
+          ));
       if (queue.isNotEmpty && !exiting) await persistStudy();
     });
   }
@@ -1628,7 +1732,12 @@ class _CardStudyPageState extends State<CardStudyPage>
       finishingStudy = true;
       _persistenceChain = _persistenceChain.then((_) async {
         await (widget.decisionWriter?.call(word, state) ??
-            widget.store.mark(word, state));
+            widget.store.mark(
+              word,
+              state,
+              bookId: _bookIdForWord(word),
+              sessionIndexes: _sessionIndexesForWord(word),
+            ));
         if (activeSessionSelections.isNotEmpty) {
           for (final selection in activeSessionSelections.entries) {
             await widget.store.completeSessions(selection.key, selection.value);
@@ -2718,11 +2827,21 @@ class _QuizPageState extends State<QuizPage> {
         !dontKnow && word.meaning.toLowerCase().contains(input.toLowerCase());
     if (isCorrect) {
       correct++;
-      await widget.store.mark(word, StudyState.memorized);
+      await widget.store.mark(
+        word,
+        StudyState.memorized,
+        bookId: widget.bookId,
+        sessionIndexes: widget.sessionIndexes,
+      );
       feedback = '정답이에요!\n${word.meaning}  [${word.reading}]';
     } else {
       reviewed.add(word.term);
-      await widget.store.mark(word, StudyState.review);
+      await widget.store.mark(
+        word,
+        StudyState.review,
+        bookId: widget.bookId,
+        sessionIndexes: widget.sessionIndexes,
+      );
       queue.insert(
           queue.isEmpty ? 0 : Random().nextInt(queue.length) + 1, word);
       feedback = '다시 만나볼게요.\n정답: ${word.meaning}  [${word.reading}]';

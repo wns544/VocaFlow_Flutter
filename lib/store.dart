@@ -125,6 +125,96 @@ class StudyDecision {
       );
 }
 
+class DailyStudyStats {
+  const DailyStudyStats({
+    this.studiedCards = 0,
+    this.completedSessions = 0,
+    this.correctCount = 0,
+    this.wrongCount = 0,
+  });
+
+  final int studiedCards;
+  final int completedSessions;
+  final int correctCount;
+  final int wrongCount;
+
+  DailyStudyStats copyWith({
+    int? studiedCards,
+    int? completedSessions,
+    int? correctCount,
+    int? wrongCount,
+  }) =>
+      DailyStudyStats(
+        studiedCards: studiedCards ?? this.studiedCards,
+        completedSessions: completedSessions ?? this.completedSessions,
+        correctCount: correctCount ?? this.correctCount,
+        wrongCount: wrongCount ?? this.wrongCount,
+      );
+
+  Map<String, dynamic> toJson() => {
+        'studiedCards': studiedCards,
+        'completedSessions': completedSessions,
+        'correctCount': correctCount,
+        'wrongCount': wrongCount,
+      };
+
+  factory DailyStudyStats.fromJson(Map<String, dynamic> json) =>
+      DailyStudyStats(
+        studiedCards: (json['studiedCards'] as num?)?.toInt() ?? 0,
+        completedSessions: (json['completedSessions'] as num?)?.toInt() ?? 0,
+        correctCount: (json['correctCount'] as num?)?.toInt() ?? 0,
+        wrongCount: (json['wrongCount'] as num?)?.toInt() ?? 0,
+      );
+}
+
+class StudyEventLog {
+  const StudyEventLog({
+    required this.id,
+    required this.date,
+    required this.timestamp,
+    required this.bookId,
+    required this.wordId,
+    required this.sessionIndexes,
+    required this.decision,
+  });
+
+  final String id;
+  final String date;
+  final DateTime timestamp;
+  final String? bookId;
+  final int wordId;
+  final List<int> sessionIndexes;
+  final StudyState decision;
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'date': date,
+        'timestamp': timestamp.toIso8601String(),
+        'bookId': bookId,
+        'wordId': wordId,
+        'sessionIndexes': sessionIndexes,
+        'decision': decision.name,
+      };
+
+  factory StudyEventLog.fromJson(Map<String, dynamic> json) => StudyEventLog(
+        id: json['id'] as String? ?? '',
+        date: json['date'] as String? ?? '',
+        timestamp: DateTime.tryParse(json['timestamp'] as String? ?? '') ??
+            DateTime.fromMillisecondsSinceEpoch(0),
+        bookId: json['bookId'] as String?,
+        wordId: (json['wordId'] as num?)?.toInt() ?? 0,
+        sessionIndexes: (json['sessionIndexes'] as List<dynamic>? ?? [])
+            .map((item) => (item as num).toInt())
+            .toList(),
+        decision: StudyState.values.firstWhere(
+          (state) => state.name == json['decision'],
+          orElse: () => StudyState.fresh,
+        ),
+      );
+}
+
+enum DailyStudyStatus { none, low, medium, completed }
+
 class VocaStore {
   VocaStore._(this._prefs);
 
@@ -134,6 +224,8 @@ class VocaStore {
   static const _completedKey = 'completed';
   static const _completedAtKey = 'completedAt';
   static const _studyDaysKey = 'studyDays';
+  static const _dailyStudyStatsKey = 'dailyStudyStats';
+  static const _studyEventLogKey = 'studyEventLog';
   static const _targetNameKey = 'targetName';
   static const _targetDateKey = 'targetDate';
   static const _horizontalSwipeKey = 'horizontalSwipe';
@@ -153,6 +245,8 @@ class VocaStore {
   static const _exampleMeaningFontSizeKey = 'exampleMeaningFontSize';
   static const _chatGptConversationUrlKey = 'chatGptConversationUrl';
   static const _readingMeaningMigrationKey = 'readingMeaningMigrationV1';
+  static const studyEventLogMaxItems = 3000;
+  static const studyEventLogMaxAge = Duration(days: 90);
 
   final SharedPreferences _prefs;
   late List<WordBook> books;
@@ -196,6 +290,55 @@ class VocaStore {
   DateTime? get targetDate {
     final value = _prefs.getString(_targetDateKey);
     return value == null ? null : DateTime.tryParse(value);
+  }
+
+  Map<String, DailyStudyStats> get dailyStudyStats {
+    final saved = _prefs.getString(_dailyStudyStatsKey);
+    if (saved == null) return const {};
+    try {
+      final decoded = jsonDecode(saved) as Map<String, dynamic>;
+      return decoded.map((key, value) => MapEntry(
+            key,
+            DailyStudyStats.fromJson(
+                Map<String, dynamic>.from(value as Map<dynamic, dynamic>)),
+          ));
+    } catch (_) {
+      return const {};
+    }
+  }
+
+  List<StudyEventLog> get studyEventLog {
+    final saved = _prefs.getString(_studyEventLogKey);
+    if (saved == null) return const [];
+    try {
+      final decoded = jsonDecode(saved) as List<dynamic>;
+      return decoded
+          .map((item) => StudyEventLog.fromJson(
+              Map<String, dynamic>.from(item as Map<dynamic, dynamic>)))
+          .where((event) => event.id.isNotEmpty)
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  DailyStudyStatus dailyStudyStatus(String dayKey) {
+    final stats = dailyStudyStats[dayKey];
+    if (stats == null ||
+        stats.studiedCards <= 0 && stats.completedSessions <= 0) {
+      return DailyStudyStatus.none;
+    }
+    if (stats.completedSessions > 0) return DailyStudyStatus.completed;
+    if (stats.studiedCards >= 10) return DailyStudyStatus.medium;
+    return DailyStudyStatus.low;
+  }
+
+  List<String> recentDayKeys({int count = 7, DateTime? now}) {
+    final today = now ?? DateTime.now();
+    return List.generate(
+      count,
+      (index) => _dayKey(today.subtract(Duration(days: count - index - 1))),
+    );
   }
 
   static const _activeStudiesKey = 'activeStudies';
@@ -265,6 +408,74 @@ class VocaStore {
           (key, value) => MapEntry(key, value.toIso8601String()),
         )),
       );
+
+  Future<void> _saveDailyStudyStats(Map<String, DailyStudyStats> stats) =>
+      _prefs.setString(
+        _dailyStudyStatsKey,
+        jsonEncode(stats.map((key, value) => MapEntry(key, value.toJson()))),
+      );
+
+  Future<void> _saveStudyEventLog(List<StudyEventLog> events) =>
+      _prefs.setString(
+        _studyEventLogKey,
+        jsonEncode(events.map((event) => event.toJson()).toList()),
+      );
+
+  List<StudyEventLog> _prunedStudyEventLog(List<StudyEventLog> events,
+      {DateTime? now}) {
+    final cutoff = (now ?? DateTime.now()).subtract(studyEventLogMaxAge);
+    final deduped = <String, StudyEventLog>{};
+    for (final event in events) {
+      if (event.timestamp.isBefore(cutoff)) continue;
+      deduped[event.id] = event;
+    }
+    final result = deduped.values.toList()
+      ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
+    return result.take(studyEventLogMaxItems).toList();
+  }
+
+  Future<void> _recordStudyAttempt({
+    required Word word,
+    required StudyState decision,
+    required String? bookId,
+    required List<int> sessionIndexes,
+    required DateTime now,
+  }) async {
+    final day = _dayKey(now);
+    final stats = Map<String, DailyStudyStats>.from(dailyStudyStats);
+    final current = stats[day] ?? const DailyStudyStats();
+    stats[day] = current.copyWith(
+      studiedCards: current.studiedCards + 1,
+      correctCount:
+          current.correctCount + (decision == StudyState.memorized ? 1 : 0),
+      wrongCount: current.wrongCount + (decision == StudyState.review ? 1 : 0),
+    );
+    await _saveDailyStudyStats(stats);
+
+    final event = StudyEventLog(
+      id: '${now.microsecondsSinceEpoch}:${bookId ?? 'unknown'}:${word.id}:${decision.name}',
+      date: day,
+      timestamp: now,
+      bookId: bookId,
+      wordId: word.id,
+      sessionIndexes: sessionIndexes,
+      decision: decision,
+    );
+    await _saveStudyEventLog(
+        _prunedStudyEventLog([event, ...studyEventLog], now: now));
+  }
+
+  Future<void> _recordCompletedSessions(
+      DateTime now, int completedSessionCount) async {
+    if (completedSessionCount <= 0) return;
+    final day = _dayKey(now);
+    final stats = Map<String, DailyStudyStats>.from(dailyStudyStats);
+    final current = stats[day] ?? const DailyStudyStats();
+    stats[day] = current.copyWith(
+      completedSessions: current.completedSessions + completedSessionCount,
+    );
+    await _saveDailyStudyStats(stats);
+  }
 
   Future<void> _saveResetMarkers(Map<String, DateTime> markers) =>
       _prefs.setString(
@@ -737,6 +948,7 @@ class VocaStore {
       completedTimes['$bookId:$index'] = now;
     }
     await _saveCompletedAt(completedTimes);
+    await _recordCompletedSessions(now, completedIndexes.length);
     final days = (_prefs.getStringList(_studyDaysKey) ?? []).toSet()
       ..add(_dayKey(DateTime.now()));
     await _prefs.setStringList(_studyDaysKey, days.toList());
@@ -764,9 +976,21 @@ class VocaStore {
     }
   }
 
-  Future<void> mark(Word word, StudyState state,
-      {bool recordAttempt = true}) async {
+  Future<void> mark(
+    Word word,
+    StudyState state, {
+    bool recordAttempt = true,
+    String? bookId,
+    List<int> sessionIndexes = const [],
+  }) async {
     word.state = state;
+    WordBook? book;
+    for (final candidate in books) {
+      if (candidate.words.any((item) => item.id == word.id)) {
+        book = candidate;
+        break;
+      }
+    }
     if (recordAttempt) {
       final now = DateTime.now();
       word.lastStudiedAt = now;
@@ -776,12 +1000,17 @@ class VocaStore {
         word.wrongCount++;
         word.lastWrongAt = now;
       }
+      await _recordStudyAttempt(
+        word: word,
+        decision: state,
+        bookId: bookId ?? book?.id,
+        sessionIndexes: sessionIndexes,
+        now: now,
+      );
     }
     await _saveBooks();
-    final book = books
-        .where((candidate) => candidate.words.any((item) => item.id == word.id))
-        .firstOrNull;
     if (book != null) await cloudChanges.markWord(book.id, word.id);
+    if (recordAttempt) await cloudChanges.markProfile();
   }
 
   Future<void> completeCurrentSession() async {
@@ -791,8 +1020,10 @@ class VocaStore {
     completed.add(completedKey);
     await _prefs.setStringList(_completedKey, completed.toList());
     final completedTimes = Map<String, DateTime>.from(completedAt);
-    completedTimes[completedKey] = DateTime.now();
+    final now = DateTime.now();
+    completedTimes[completedKey] = now;
     await _saveCompletedAt(completedTimes);
+    await _recordCompletedSessions(now, 1);
     final days = (_prefs.getStringList(_studyDaysKey) ?? []).toSet()
       ..add(_dayKey(DateTime.now()));
     await _prefs.setStringList(_studyDaysKey, days.toList());
@@ -815,6 +1046,8 @@ class VocaStore {
     await _prefs.remove(_completedKey);
     await _prefs.remove(_completedAtKey);
     await _prefs.remove(_studyDaysKey);
+    await _prefs.remove(_dailyStudyStatsKey);
+    await _prefs.remove(_studyEventLogKey);
     await clearAllActiveStudies();
     await _saveBooks();
     await cloudChanges.markProfile();
@@ -833,6 +1066,10 @@ class VocaStore {
           (key, value) => MapEntry(key, value.toIso8601String()),
         ),
         'studyDays': _prefs.getStringList(_studyDaysKey) ?? <String>[],
+        'dailyStudyStats': dailyStudyStats.map(
+          (key, value) => MapEntry(key, value.toJson()),
+        ),
+        'studyEventLog': studyEventLog.map((event) => event.toJson()).toList(),
         'targetName': targetName,
         'targetDate': _prefs.getString(_targetDateKey),
         'horizontalSwipe': horizontalSwipe,
@@ -897,6 +1134,21 @@ class VocaStore {
       _studyDaysKey,
       (json['studyDays'] as List<dynamic>? ?? []).cast<String>(),
     );
+    await _saveDailyStudyStats(
+      (json['dailyStudyStats'] as Map<String, dynamic>? ?? const {}).map(
+        (key, value) => MapEntry(
+          key,
+          DailyStudyStats.fromJson(
+              Map<String, dynamic>.from(value as Map<dynamic, dynamic>)),
+        ),
+      ),
+    );
+    await _saveStudyEventLog(_prunedStudyEventLog(
+      (json['studyEventLog'] as List<dynamic>? ?? const [])
+          .map((item) => StudyEventLog.fromJson(
+              Map<String, dynamic>.from(item as Map<dynamic, dynamic>)))
+          .toList(),
+    ));
     await _prefs.setString(_targetNameKey, json['targetName'] as String? ?? '');
     await _prefs.setBool(
         _horizontalSwipeKey, json['horizontalSwipe'] as bool? ?? false);

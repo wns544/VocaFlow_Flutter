@@ -56,7 +56,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('오늘도 단어 정복 💪'), findsNothing);
-    expect(find.text('VOCAFLOW'), findsOneWidget);
+    expect(find.text('오늘'), findsOneWidget);
     expect(find.text('즐겨찾기 단어장'), findsOneWidget);
     expect(find.textContaining('즐겨찾기한 단어장이 없습니다.'), findsOneWidget);
   });
@@ -70,7 +70,7 @@ void main() {
         .pumpWidget(VocaFlowApp(firebaseInitialization: firebase.future));
     await tester.pumpAndSettle();
 
-    expect(find.text('VOCAFLOW'), findsOneWidget);
+    expect(find.text('오늘'), findsOneWidget);
     expect(firebase.isCompleted, isFalse);
     firebase.complete(false);
     await tester.pump();
@@ -543,29 +543,28 @@ void main() {
     await tester.pumpAndSettle();
 
     final list = find.byKey(const ValueKey('favorite-books-list'));
-    final expandedSummary =
-        find.byKey(const ValueKey('home-study-summary-expanded'));
-    final collapsedSummary =
-        find.byKey(const ValueKey('home-study-summary-collapsed'));
+    final summary = find.byKey(const ValueKey('home-study-summary-morph'));
     final expandedListTop = tester.getTopLeft(list).dy;
+    final expandedSummaryHeight = tester.getSize(summary).height;
 
-    expect(expandedSummary, findsOneWidget);
-    expect(collapsedSummary, findsNothing);
+    expect(summary, findsOneWidget);
+
+    await tester.drag(list, const Offset(0, -36));
+    await tester.pump();
+    final middleSummaryHeight = tester.getSize(summary).height;
+    expect(middleSummaryHeight, lessThan(expandedSummaryHeight));
+    expect(middleSummaryHeight, greaterThan(42));
 
     await tester.drag(list, const Offset(0, -220));
     await tester.pump();
-    await tester.pump(const Duration(milliseconds: 260));
-
-    expect(collapsedSummary, findsOneWidget);
-    expect(expandedSummary, findsNothing);
+    final collapsedSummaryHeight = tester.getSize(summary).height;
+    expect(collapsedSummaryHeight, lessThan(middleSummaryHeight));
     expect(tester.getTopLeft(list).dy, lessThan(expandedListTop));
 
     await tester.drag(list, const Offset(0, 420));
     await tester.pump();
-    await tester.pump(const Duration(milliseconds: 260));
 
-    expect(expandedSummary, findsOneWidget);
-    expect(collapsedSummary, findsNothing);
+    expect(tester.getSize(summary).height, closeTo(expandedSummaryHeight, 1));
   });
 
   testWidgets('home action segment opens wrong word study',

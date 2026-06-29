@@ -226,6 +226,54 @@ void main() {
     expect(word.lastWrongAt, DateTime.parse('2026-06-28T10:00:00.000'));
   });
 
+  test('merge keeps max daily stats and dedupes study events', () {
+    final cloud = _backup(
+      [
+        _book('same', 'JLPT', [_word(1, 'cloud')])
+      ],
+      dailyStudyStats: {
+        '2026-06-28': {
+          'studiedCards': 8,
+          'completedSessions': 1,
+          'correctCount': 5,
+          'wrongCount': 3,
+        }
+      },
+      studyEventLog: [
+        _event('same-event', '2026-06-28T09:00:00.000'),
+      ],
+    );
+    final local = _backup(
+      [
+        _book('same', 'JLPT', [_word(1, 'local')])
+      ],
+      dailyStudyStats: {
+        '2026-06-28': {
+          'studiedCards': 12,
+          'completedSessions': 0,
+          'correctCount': 9,
+          'wrongCount': 1,
+        }
+      },
+      studyEventLog: [
+        _event('same-event', '2026-06-28T10:00:00.000'),
+        _event('local-event', '2026-06-28T11:00:00.000'),
+      ],
+    );
+
+    final merged = mergeBackupJson(cloud: cloud, local: local);
+    final stats = (merged['dailyStudyStats'] as Map)['2026-06-28'] as Map;
+    final events = merged['studyEventLog'] as List<dynamic>;
+
+    expect(stats['studiedCards'], 12);
+    expect(stats['completedSessions'], 1);
+    expect(stats['correctCount'], 9);
+    expect(stats['wrongCount'], 3);
+    expect(events, hasLength(2));
+    expect((events.first as Map)['id'], 'local-event');
+    expect((events.last as Map)['timestamp'], '2026-06-28T10:00:00.000');
+  });
+
   test('automatic backup configuration is stored per account', () async {
     final tracker = await CloudChangeTracker.load();
     await tracker.setInitialized('a', true);
@@ -248,6 +296,8 @@ Map<String, dynamic> _backup(
   Map<String, String> completedAt = const {},
   Map<String, String> resetMarkers = const {},
   Map<String, dynamic> activeStudies = const {},
+  Map<String, dynamic> dailyStudyStats = const {},
+  List<Map<String, dynamic>> studyEventLog = const [],
   List<String> days = const [],
 }) =>
     {
@@ -259,6 +309,8 @@ Map<String, dynamic> _backup(
       'completedAt': completedAt,
       'resetMarkers': resetMarkers,
       'activeStudies': activeStudies,
+      'dailyStudyStats': dailyStudyStats,
+      'studyEventLog': studyEventLog,
       'studyDays': days,
       'targetName': '',
       'targetDate': null,
@@ -266,6 +318,16 @@ Map<String, dynamic> _backup(
       'reverseSwipe': false,
       'japaneseFont': 'system',
       'cardFontSizes': <String, dynamic>{},
+    };
+
+Map<String, dynamic> _event(String id, String timestamp) => {
+      'id': id,
+      'date': timestamp.substring(0, 10),
+      'timestamp': timestamp,
+      'bookId': 'same',
+      'wordId': 1,
+      'sessionIndexes': [0],
+      'decision': 'review',
     };
 
 Map<String, dynamic> _book(

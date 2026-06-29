@@ -40,6 +40,36 @@ void main() {
     expect(reloaded.completedCount(reloaded.quickBook), 1);
   });
 
+  test('study attempts and completed sessions update daily stats and log',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final word = store.books.first.words.first;
+
+    await store.mark(
+      word,
+      StudyState.review,
+      bookId: store.books.first.id,
+      sessionIndexes: const [0],
+    );
+
+    final today = store.recentDayKeys(count: 1).single;
+    expect(store.dailyStudyStats[today]?.studiedCards, 1);
+    expect(store.dailyStudyStats[today]?.wrongCount, 1);
+    expect(store.dailyStudyStatus(today), DailyStudyStatus.low);
+    expect(store.studyEventLog, hasLength(1));
+    expect(store.studyEventLog.single.wordId, word.id);
+    expect(store.studyEventLog.single.sessionIndexes, [0]);
+
+    await store.completeSessions(store.books.first.id, const [0]);
+    expect(store.dailyStudyStats[today]?.completedSessions, 1);
+    expect(store.dailyStudyStatus(today), DailyStudyStatus.completed);
+
+    await store.resetProgress();
+    expect(store.dailyStudyStats, isEmpty);
+    expect(store.studyEventLog, isEmpty);
+  });
+
   test('swipe direction settings persist', () async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();
