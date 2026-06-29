@@ -302,7 +302,7 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
         key: const ValueKey('loading-app'),
         debugShowCheckedModeBanner: false,
         theme: theme,
-        home: const ColoredBox(color: mist),
+        home: const _FlutterSplashScreen(),
       );
     }
     return MaterialApp(
@@ -334,6 +334,24 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
                   onChanged: () => setState(() {}),
                 ));
       },
+    );
+  }
+}
+
+class _FlutterSplashScreen extends StatelessWidget {
+  const _FlutterSplashScreen();
+
+  @override
+  Widget build(BuildContext context) {
+    return const ColoredBox(
+      color: Colors.white,
+      child: Center(
+        child: Image(
+          image: AssetImage('assets/splash_design.png'),
+          width: 240,
+          filterQuality: FilterQuality.high,
+        ),
+      ),
     );
   }
 }

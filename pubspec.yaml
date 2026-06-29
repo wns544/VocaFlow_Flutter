@@ -32,6 +32,7 @@ flutter:
   assets:
     - assets/data/hanja_ko.json
     - assets/licenses/hanjadict-LICENSE.txt
+    - assets/splash_design.png
   fonts:
     - family: Nunito
       fonts:
