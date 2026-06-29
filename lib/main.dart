@@ -6,6 +6,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_sign_in/google_sign_in.dart';
@@ -26,6 +27,7 @@ const ink = Color(0xFF1C1C1E);
 const sea = Color(0xFF34C759);
 const mist = Color(0xFFF2F2F7);
 const coral = Color(0xFFFF3B30);
+const flutterSplashMinimumDuration = Duration(milliseconds: 320);
 const studySpeechChannel = MethodChannel('com.vocaflow.app/study_speech');
 const resumeSnapshotChannel = MethodChannel('com.vocaflow.app/resume_snapshot');
 final defaultKanjiLookupService = KanjiLookupService();
@@ -187,7 +189,11 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
   }
 
   Future<void> _loadLocalState() async {
-    final value = await VocaStore.load();
+    final localState = VocaStore.load();
+    if (kReleaseMode) {
+      await Future<void>.delayed(flutterSplashMinimumDuration);
+    }
+    final value = await localState;
     var active = value.activeStudy;
     if (active != null &&
         value.resolveActiveWords(active).length != active.queueIds.length) {
