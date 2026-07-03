@@ -35,6 +35,8 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   final Duration minimumInterval;
 
   Timer? _timer;
+  DateTime? _scheduledUploadAt;
+  int? _scheduledGeneration;
   StreamSubscription<User?>? _authSubscription;
   bool _uploading = false;
   int _failureCount = 0;
@@ -59,7 +61,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     store.cloudChanges.onChanged = _handleTrackedChange;
     store.onSessionCompleted = requestImmediateBackup;
     _authSubscription = FirebaseAuth.instance.authStateChanges().listen((_) {
-      _timer?.cancel();
+      _cancelScheduledUpload();
       onChanged?.call();
       if (enabled && pendingCount > 0) requestImmediateBackup();
     });
@@ -73,7 +75,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       store.cloudChanges.onChanged = null;
     }
     store.onSessionCompleted = null;
-    _timer?.cancel();
+    _cancelScheduledUpload();
     _authSubscription?.cancel();
   }
 
@@ -109,7 +111,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     if (current == null) return;
     await store.cloudChanges.setEnabled(current.uid, value);
     if (!value) {
-      _timer?.cancel();
+      _cancelScheduledUpload();
     } else if (pendingCount > 0) {
       requestImmediateBackup();
     }
@@ -169,7 +171,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
 
   void _schedule(Duration requestedDelay,
       {bool ignoreMinimumInterval = false}) {
-    if (!enabled || pendingCount == 0) return;
+    if (_uploading || !enabled || pendingCount == 0) return;
     final last = lastSuccess;
     var delay = requestedDelay;
     if (!ignoreMinimumInterval && last != null) {
@@ -177,11 +179,28 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       if (untilAllowed > delay) delay = untilAllowed;
     }
     if (delay.isNegative) delay = Duration.zero;
-    _timer?.cancel();
-    _timer = Timer(delay, () => unawaited(_uploadPending()));
+    final generation = store.cloudChanges.snapshot.generation;
+    final scheduledAt = _now().add(delay);
+    final existingAt = _scheduledUploadAt;
+    if (_timer?.isActive == true &&
+        _scheduledGeneration == generation &&
+        existingAt != null &&
+        !existingAt.isAfter(scheduledAt)) {
+      return;
+    }
+    _cancelScheduledUpload();
+    _scheduledGeneration = generation;
+    _scheduledUploadAt = scheduledAt;
+    _timer = Timer(delay, () {
+      _scheduledGeneration = null;
+      _scheduledUploadAt = null;
+      unawaited(_uploadPending());
+    });
   }
 
   Future<void> _uploadPending() async {
+    _scheduledGeneration = null;
+    _scheduledUploadAt = null;
     final current = user;
     if (_uploading || current == null || !enabled || pendingCount == 0) return;
     bool networkAllowed;
@@ -225,8 +244,22 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     ];
     final index = _failureCount.clamp(0, retryDelays.length - 1);
     _failureCount++;
+    _cancelScheduledUpload();
+    final delay = retryDelays[index];
+    _scheduledGeneration = store.cloudChanges.snapshot.generation;
+    _scheduledUploadAt = _now().add(delay);
+    _timer = Timer(delay, () {
+      _scheduledGeneration = null;
+      _scheduledUploadAt = null;
+      unawaited(_uploadPending());
+    });
+  }
+
+  void _cancelScheduledUpload() {
     _timer?.cancel();
-    _timer = Timer(retryDelays[index], () => unawaited(_uploadPending()));
+    _timer = null;
+    _scheduledGeneration = null;
+    _scheduledUploadAt = null;
   }
 
   Future<bool> _networkAllowed() async {
@@ -249,6 +282,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       final recent = lastSuccess;
       if (enabled &&
           pendingCount > 0 &&
+          !_uploading &&
           (recent == null || _now().difference(recent) >= idleDelay)) {
         unawaited(_uploadPending());
       }

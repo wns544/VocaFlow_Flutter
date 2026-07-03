@@ -30,6 +30,21 @@ void main() {
     expect(snapshot.wordIdsByBook['book-a'], isNot(contains(1)));
   });
 
+  test('duplicate dirty marks do not rewrite the pending journal', () async {
+    final tracker = await CloudChangeTracker.load();
+
+    await tracker.markProfile();
+    await tracker.markProfile();
+    await tracker.markWord('book-a', 2);
+    await tracker.markWord('book-a', 2);
+
+    final snapshot = tracker.snapshot;
+    expect(snapshot.generation, 2);
+    expect(snapshot.profileDirty, isTrue);
+    expect(snapshot.wordIdsByBook['book-a'], {2});
+    expect(snapshot.pendingCount, 2);
+  });
+
   test('fifty studied words remain one profile plus fifty word writes',
       () async {
     final words = List.generate(

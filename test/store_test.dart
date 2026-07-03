@@ -70,6 +70,34 @@ void main() {
     expect(store.studyEventLog, isEmpty);
   });
 
+  test('backup restore prunes cached study event logs', () async {
+    final store = await VocaStore.load();
+    final now = DateTime(2026, 6, 29, 12);
+    final events = List.generate(3010, (index) {
+      final timestamp = now.subtract(Duration(minutes: index));
+      return {
+        'id': 'event-$index',
+        'date': '2026-06-29',
+        'timestamp': timestamp.toIso8601String(),
+        'bookId': 'default',
+        'wordId': index,
+        'sessionIndexes': [0],
+        'decision': StudyState.review.name,
+      };
+    });
+
+    await store.replaceWithBackupJson({
+      ...store.toBackupJson(),
+      'studyEventLog': events,
+    });
+
+    expect(store.studyEventLog, hasLength(VocaStore.studyEventLogMaxItems));
+    expect(store.toBackupJson()['studyEventLog'], hasLength(3000));
+
+    await store.resetProgress();
+    expect(store.studyEventLog, isEmpty);
+  });
+
   test('swipe direction settings persist', () async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();

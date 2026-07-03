@@ -253,6 +253,11 @@ class VocaStore {
   late CloudChangeTracker cloudChanges;
   late LocalWordSearchIndex wordSearch;
   void Function()? onSessionCompleted;
+  Map<String, DailyStudyStats>? _dailyStudyStatsCache;
+  List<StudyEventLog>? _studyEventLogCache;
+  Map<String, ActiveStudy>? _activeStudiesCache;
+  Map<String, DateTime>? _completedAtCache;
+  Map<String, DateTime>? _resetMarkersCache;
 
   static Future<VocaStore> load() async {
     final store = VocaStore._(await SharedPreferences.getInstance());
@@ -293,32 +298,36 @@ class VocaStore {
   }
 
   Map<String, DailyStudyStats> get dailyStudyStats {
+    final cached = _dailyStudyStatsCache;
+    if (cached != null) return cached;
     final saved = _prefs.getString(_dailyStudyStatsKey);
-    if (saved == null) return const {};
+    if (saved == null) return _dailyStudyStatsCache = const {};
     try {
       final decoded = jsonDecode(saved) as Map<String, dynamic>;
-      return decoded.map((key, value) => MapEntry(
+      return _dailyStudyStatsCache = decoded.map((key, value) => MapEntry(
             key,
             DailyStudyStats.fromJson(
                 Map<String, dynamic>.from(value as Map<dynamic, dynamic>)),
           ));
     } catch (_) {
-      return const {};
+      return _dailyStudyStatsCache = const {};
     }
   }
 
   List<StudyEventLog> get studyEventLog {
+    final cached = _studyEventLogCache;
+    if (cached != null) return cached;
     final saved = _prefs.getString(_studyEventLogKey);
-    if (saved == null) return const [];
+    if (saved == null) return _studyEventLogCache = const [];
     try {
       final decoded = jsonDecode(saved) as List<dynamic>;
-      return decoded
+      return _studyEventLogCache = decoded
           .map((item) => StudyEventLog.fromJson(
               Map<String, dynamic>.from(item as Map<dynamic, dynamic>)))
           .where((event) => event.id.isNotEmpty)
           .toList();
     } catch (_) {
-      return const [];
+      return _studyEventLogCache = const [];
     }
   }
 
@@ -345,6 +354,8 @@ class VocaStore {
   static const _resetMarkersKey = 'resetMarkers';
 
   Map<String, ActiveStudy> get activeStudies {
+    final cached = _activeStudiesCache;
+    if (cached != null) return cached;
     final saved = _prefs.getString(_activeStudiesKey);
     if (saved == null) {
       final oldActive = _loadOldActiveStudy();
@@ -354,72 +365,82 @@ class VocaStore {
           sessionIndexes: oldActive.sessionIndexes,
           sessionSelections: oldActive.sessionSelections,
         );
-        return {key: oldActive};
+        return _activeStudiesCache = {key: oldActive};
       }
-      return const {};
+      return _activeStudiesCache = const {};
     }
     try {
       final decoded = jsonDecode(saved) as Map<String, dynamic>;
-      return decoded.map((key, value) {
+      return _activeStudiesCache = decoded.map((key, value) {
         return MapEntry(
           key,
           ActiveStudy.fromJson(value as Map<String, dynamic>),
         );
       });
     } catch (_) {
-      return const {};
+      return _activeStudiesCache = const {};
     }
   }
 
   Map<String, DateTime> get resetMarkers {
+    final cached = _resetMarkersCache;
+    if (cached != null) return cached;
     final saved = _prefs.getString(_resetMarkersKey);
-    if (saved == null) return const {};
+    if (saved == null) return _resetMarkersCache = const {};
     try {
       final decoded = jsonDecode(saved) as Map<String, dynamic>;
-      return decoded.map((key, value) => MapEntry(
+      return _resetMarkersCache = decoded.map((key, value) => MapEntry(
             key,
             DateTime.tryParse(value as String? ?? '') ??
                 DateTime.fromMillisecondsSinceEpoch(0),
           ));
     } catch (_) {
-      return const {};
+      return _resetMarkersCache = const {};
     }
   }
 
   Map<String, DateTime> get completedAt {
+    final cached = _completedAtCache;
+    if (cached != null) return cached;
     final saved = _prefs.getString(_completedAtKey);
-    if (saved == null) return const {};
+    if (saved == null) return _completedAtCache = const {};
     try {
       final decoded = jsonDecode(saved) as Map<String, dynamic>;
-      return decoded.map((key, value) => MapEntry(
+      return _completedAtCache = decoded.map((key, value) => MapEntry(
             key,
             DateTime.tryParse(value as String? ?? '') ??
                 DateTime.fromMillisecondsSinceEpoch(0),
           ));
     } catch (_) {
-      return const {};
+      return _completedAtCache = const {};
     }
   }
 
-  Future<void> _saveCompletedAt(Map<String, DateTime> values) =>
-      _prefs.setString(
-        _completedAtKey,
-        jsonEncode(values.map(
-          (key, value) => MapEntry(key, value.toIso8601String()),
-        )),
-      );
+  Future<void> _saveCompletedAt(Map<String, DateTime> values) {
+    _completedAtCache = Map<String, DateTime>.from(values);
+    return _prefs.setString(
+      _completedAtKey,
+      jsonEncode(values.map(
+        (key, value) => MapEntry(key, value.toIso8601String()),
+      )),
+    );
+  }
 
-  Future<void> _saveDailyStudyStats(Map<String, DailyStudyStats> stats) =>
-      _prefs.setString(
-        _dailyStudyStatsKey,
-        jsonEncode(stats.map((key, value) => MapEntry(key, value.toJson()))),
-      );
+  Future<void> _saveDailyStudyStats(Map<String, DailyStudyStats> stats) {
+    _dailyStudyStatsCache = Map<String, DailyStudyStats>.from(stats);
+    return _prefs.setString(
+      _dailyStudyStatsKey,
+      jsonEncode(stats.map((key, value) => MapEntry(key, value.toJson()))),
+    );
+  }
 
-  Future<void> _saveStudyEventLog(List<StudyEventLog> events) =>
-      _prefs.setString(
-        _studyEventLogKey,
-        jsonEncode(events.map((event) => event.toJson()).toList()),
-      );
+  Future<void> _saveStudyEventLog(List<StudyEventLog> events) {
+    _studyEventLogCache = List<StudyEventLog>.of(events);
+    return _prefs.setString(
+      _studyEventLogKey,
+      jsonEncode(events.map((event) => event.toJson()).toList()),
+    );
+  }
 
   List<StudyEventLog> _prunedStudyEventLog(List<StudyEventLog> events,
       {DateTime? now}) {
@@ -477,13 +498,15 @@ class VocaStore {
     await _saveDailyStudyStats(stats);
   }
 
-  Future<void> _saveResetMarkers(Map<String, DateTime> markers) =>
-      _prefs.setString(
-        _resetMarkersKey,
-        jsonEncode(markers.map(
-          (key, value) => MapEntry(key, value.toIso8601String()),
-        )),
-      );
+  Future<void> _saveResetMarkers(Map<String, DateTime> markers) {
+    _resetMarkersCache = Map<String, DateTime>.from(markers);
+    return _prefs.setString(
+      _resetMarkersKey,
+      jsonEncode(markers.map(
+        (key, value) => MapEntry(key, value.toIso8601String()),
+      )),
+    );
+  }
 
   Future<void> _markReset(String key) async {
     final markers = Map<String, DateTime>.from(resetMarkers);
@@ -587,11 +610,16 @@ class VocaStore {
         studies.remove(sortedKeys.removeAt(0));
       }
     }
-    await _prefs.setString(
+    await _saveActiveStudies(studies);
+    if (markCloudChange) await cloudChanges.markProfile();
+  }
+
+  Future<void> _saveActiveStudies(Map<String, ActiveStudy> studies) {
+    _activeStudiesCache = Map<String, ActiveStudy>.from(studies);
+    return _prefs.setString(
       _activeStudiesKey,
       jsonEncode(studies.map((k, v) => MapEntry(k, v.toJson()))),
     );
-    if (markCloudChange) await cloudChanges.markProfile();
   }
 
   Future<void> clearActiveStudyFor(String key,
@@ -599,15 +627,13 @@ class VocaStore {
     final studies = Map<String, ActiveStudy>.from(activeStudies);
     if (studies.containsKey(key)) {
       studies.remove(key);
-      await _prefs.setString(
-        _activeStudiesKey,
-        jsonEncode(studies.map((k, v) => MapEntry(k, v.toJson()))),
-      );
+      await _saveActiveStudies(studies);
       if (markCloudChange) await cloudChanges.markProfile();
     }
   }
 
   Future<void> clearAllActiveStudies({bool markCloudChange = true}) async {
+    _activeStudiesCache = const {};
     await _prefs.remove(_activeStudiesKey);
     await _prefs.remove(_activeStudyKey);
     if (markCloudChange) await cloudChanges.markProfile();
@@ -709,10 +735,7 @@ class VocaStore {
           studies[k] = active;
         }
       });
-      await _prefs.setString(
-        _activeStudiesKey,
-        jsonEncode(studies.map((k, v) => MapEntry(k, v.toJson()))),
-      );
+      await _saveActiveStudies(studies);
       return activeStudy;
     }
     final active = _activeStudyFromBackupJson(json['activeStudy']);
@@ -1044,6 +1067,9 @@ class VocaStore {
       }
     }
     await _prefs.remove(_completedKey);
+    _completedAtCache = const {};
+    _dailyStudyStatsCache = const {};
+    _studyEventLogCache = const [];
     await _prefs.remove(_completedAtKey);
     await _prefs.remove(_studyDaysKey);
     await _prefs.remove(_dailyStudyStatsKey);
@@ -1069,7 +1095,9 @@ class VocaStore {
         'dailyStudyStats': dailyStudyStats.map(
           (key, value) => MapEntry(key, value.toJson()),
         ),
-        'studyEventLog': studyEventLog.map((event) => event.toJson()).toList(),
+        'studyEventLog': _prunedStudyEventLog(studyEventLog)
+            .map((event) => event.toJson())
+            .toList(),
         'targetName': targetName,
         'targetDate': _prefs.getString(_targetDateKey),
         'horizontalSwipe': horizontalSwipe,
@@ -1098,6 +1126,7 @@ class VocaStore {
       };
 
   Future<void> replaceWithBackupJson(Map<String, dynamic> json) async {
+    _activeStudiesCache = const {};
     await _prefs.remove(_activeStudyKey);
     await _prefs.remove(_activeStudiesKey);
     final decodedBooks = (json['books'] as List<dynamic>? ?? [])

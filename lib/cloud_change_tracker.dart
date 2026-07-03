@@ -66,49 +66,87 @@ class CloudChangeTracker {
 
   int get pendingCount => snapshot.pendingCount;
 
-  Future<void> markProfile() => _mutate(() => _profileDirty = true);
+  Future<void> markProfile() => _mutate(() {
+        if (_profileDirty) return false;
+        _profileDirty = true;
+        return true;
+      });
 
   Future<void> markBook(String bookId) => _mutate(() {
+        if (!_deletedBookIds.contains(bookId) && _bookIds.contains(bookId)) {
+          return false;
+        }
         _deletedBookIds.remove(bookId);
         _bookIds.add(bookId);
+        return true;
       });
 
   Future<void> markWord(String bookId, int wordId) => _mutate(() {
+        final existingDirty = _wordIdsByBook[bookId];
+        final wasDeleted = _deletedBookIds.contains(bookId) ||
+            (_deletedWordIdsByBook[bookId]?.contains(wordId) ?? false);
+        if ((existingDirty?.contains(wordId) ?? false) && !wasDeleted) {
+          return false;
+        }
         _deletedBookIds.remove(bookId);
         _deletedWordIdsByBook[bookId]?.remove(wordId);
-        _wordIdsByBook.putIfAbsent(bookId, () => {}).add(wordId);
+        final dirty = _wordIdsByBook.putIfAbsent(bookId, () => {});
+        dirty.add(wordId);
+        return true;
       });
 
   Future<void> markWords(String bookId, Iterable<int> wordIds) => _mutate(() {
+        final ids = wordIds.toSet();
+        final existingDirty = _wordIdsByBook[bookId] ?? const <int>{};
+        final deleted = _deletedWordIdsByBook[bookId] ?? const <int>{};
+        if (!_deletedBookIds.contains(bookId) &&
+            ids.every(existingDirty.contains) &&
+            ids.every((id) => !deleted.contains(id))) {
+          return false;
+        }
         _deletedBookIds.remove(bookId);
         final dirty = _wordIdsByBook.putIfAbsent(bookId, () => {});
-        for (final wordId in wordIds) {
+        for (final wordId in ids) {
           _deletedWordIdsByBook[bookId]?.remove(wordId);
           dirty.add(wordId);
         }
+        return true;
       });
 
   Future<void> deleteWord(String bookId, int wordId) => _mutate(() {
+        final wasPendingDelete =
+            _deletedWordIdsByBook[bookId]?.contains(wordId) ?? false;
+        final wasPendingWrite =
+            _wordIdsByBook[bookId]?.contains(wordId) ?? false;
+        if (wasPendingDelete && !wasPendingWrite) return false;
         _wordIdsByBook[bookId]?.remove(wordId);
         _deletedWordIdsByBook.putIfAbsent(bookId, () => {}).add(wordId);
         _bookIds.add(bookId);
+        return true;
       });
 
   Future<void> deleteBook(String bookId, Iterable<int> wordIds) => _mutate(() {
+        if (_deletedBookIds.contains(bookId)) return false;
         _bookIds.remove(bookId);
         _wordIdsByBook.remove(bookId);
         _deletedBookIds.add(bookId);
         _deletedWordIdsByBook[bookId] = wordIds.toSet();
         _profileDirty = true;
+        return true;
       });
 
   Future<void> markAll(Map<String, Iterable<int>> wordsByBook) => _mutate(() {
+        var changed = !_profileDirty;
         _profileDirty = true;
         for (final entry in wordsByBook.entries) {
           _deletedBookIds.remove(entry.key);
-          _bookIds.add(entry.key);
-          _wordIdsByBook.putIfAbsent(entry.key, () => {}).addAll(entry.value);
+          changed = _bookIds.add(entry.key) || changed;
+          final dirty = _wordIdsByBook.putIfAbsent(entry.key, () => {});
+          for (final wordId in entry.value) {
+            changed = dirty.add(wordId) || changed;
+          }
         }
+        return changed;
       });
 
   Future<void> acknowledge(CloudChangeSnapshot uploaded) async {
@@ -165,8 +203,8 @@ class CloudChangeTracker {
     onChanged?.call();
   }
 
-  Future<void> _mutate(void Function() mutation) async {
-    mutation();
+  Future<void> _mutate(bool Function() mutation) async {
+    if (!mutation()) return;
     _generation++;
     _removeEmptySets();
     await _persist();
