@@ -1899,11 +1899,10 @@ class _CardStudyPageState extends State<CardStudyPage>
                         fontSize: widget.store.termFontSize,
                         fontFamily: japaneseFontFamily(widget.store),
                         fontWeight: FontWeight.w800),
-                    onCharacterTap: copyText,
-                    onCharacterDoubleTap: (character) =>
+                    onCharacterTap: (character) =>
                         showKanjiDetails(character, word),
-                    onCharacterLongPress: (character) =>
-                        showKanjiDetails(character, word),
+                    onCharacterDoubleTap: copyText,
+                    onCharacterLongPress: copyText,
                   ),
                 ),
               ),

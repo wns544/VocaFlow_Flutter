@@ -746,7 +746,7 @@ void main() {
         greaterThan(termCenter.dx));
   });
 
-  testWidgets('kanji tap copies and long press opens lookup actions',
+  testWidgets('kanji tap opens lookup and double tap or long press copies',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();
@@ -761,12 +761,16 @@ void main() {
       },
     );
     final externalCalls = <MethodCall>[];
+    final copiedTexts = <String>[];
     final messenger = tester.binding.defaultBinaryMessenger;
     messenger.setMockMethodCallHandler(externalLinkChannel, (call) async {
       externalCalls.add(call);
       return true;
     });
     messenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+      if (call.method == 'Clipboard.setData') {
+        copiedTexts.add((call.arguments as Map)['text'] as String);
+      }
       if (call.method == 'Clipboard.getData') {
         return <String, dynamic>{'text': '遺'};
       }
@@ -792,12 +796,6 @@ void main() {
 
     final firstKanji = find.byKey(const ValueKey('copy-han-0'));
     await tester.tap(firstKanji);
-    await tester.pump(const Duration(milliseconds: 100));
-    expect(find.byKey(const ValueKey('kanji-detail-character')), findsNothing);
-    await tester.pump(const Duration(milliseconds: 1200));
-
-    await tester.longPress(firstKanji);
-    await tester.pump();
     await tester.pump(const Duration(milliseconds: 500));
     expect(
         find.byKey(const ValueKey('kanji-detail-character')), findsOneWidget);
@@ -826,7 +824,22 @@ void main() {
         Uri.parse((externalCalls.last.arguments as Map)['url'] as String);
     expect(wordChatGptUrl.path, '/c/study-kanji');
     expect(wordChatGptUrl.queryParameters['q'], contains('한자 조합'));
-    await tester.pump(const Duration(seconds: 2));
+
+    Navigator.of(tester.element(
+            find.byKey(const ValueKey('kanji-detail-character'))))
+        .pop();
+    await tester.pumpAndSettle();
+
+    await tester.tap(firstKanji);
+    await tester.pump(const Duration(milliseconds: 50));
+    await tester.tap(firstKanji);
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(copiedTexts, ['遺']);
+    expect(find.text('“遺” 복사 완료'), findsOneWidget);
+
+    await tester.longPress(firstKanji);
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(copiedTexts, ['遺', '遺']);
   });
 
   testWidgets('study card fades details in term-reading-meaning order',
