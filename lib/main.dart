@@ -18,6 +18,7 @@ import 'csv_parser.dart';
 import 'excel_exporter.dart';
 import 'excel_parser.dart';
 import 'firebase_options.dart';
+import 'in_app_browser.dart';
 import 'kanji_lookup.dart';
 import 'local_word_search.dart';
 import 'models.dart';
@@ -1998,7 +1999,7 @@ class _CardStudyPageState extends State<CardStudyPage>
     persistStudy();
     scheduleResumeSnapshotCapture('study');
     if (shouldReveal) {
-      speakStudyWord(word.term.isEmpty ? word.reading : word.term);
+      speakStudyWord(word.reading.trim().isEmpty ? word.term : word.reading);
     }
   }
 
@@ -2725,8 +2726,54 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
   }
 
   Future<void> openNaver() async {
-    final opened = await openExternalUrl(naverHanjaSearchUri(widget.character));
+    final uri = naverHanjaSearchUri(widget.character);
+    if (widget.store.openDictionaryInApp) {
+      await Navigator.of(context, rootNavigator: true).push(
+        MaterialPageRoute(
+          builder: (_) => InAppBrowserPage(
+            uri: uri,
+            title: '네이버 한자사전',
+          ),
+        ),
+      );
+      return;
+    }
+    final opened = await openExternalUrl(uri);
     if (!opened) showMessage('네이버 한자사전을 열 수 없습니다.');
+  }
+
+  Future<void> openTongHanja() async {
+    final uri = tongHanjaSearchUri(widget.character);
+    if (widget.store.openDictionaryInApp) {
+      await Navigator.of(context, rootNavigator: true).push(
+        MaterialPageRoute(
+          builder: (_) => InAppBrowserPage(
+            uri: uri,
+            title: '통용한자',
+          ),
+        ),
+      );
+      return;
+    }
+    final opened = await openExternalUrl(uri);
+    if (!opened) showMessage('통용한자 검색을 열 수 없습니다.');
+  }
+
+  Future<void> openNihongoKanji() async {
+    final uri = nihongoKanjiSearchUri(widget.character);
+    if (widget.store.openDictionaryInApp) {
+      await Navigator.of(context, rootNavigator: true).push(
+        MaterialPageRoute(
+          builder: (_) => InAppBrowserPage(
+            uri: uri,
+            title: '일본어 한자 공부방',
+          ),
+        ),
+      );
+      return;
+    }
+    final opened = await openExternalUrl(uri);
+    if (!opened) showMessage('일본어 한자 공부방 검색을 열 수 없습니다.');
   }
 
   Future<void> openChatGpt() async {
@@ -2833,6 +2880,20 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
                 onPressed: openNaver,
                 icon: const Icon(Icons.search, size: 19),
                 label: const Text('네이버 한자사전에서 보기'),
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                key: const ValueKey('open-tonghanja'),
+                onPressed: openTongHanja,
+                icon: const Icon(Icons.travel_explore_outlined, size: 19),
+                label: const Text('통용한자에서 바로 검색'),
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                key: const ValueKey('open-nihongokanji'),
+                onPressed: openNihongoKanji,
+                icon: const Icon(Icons.menu_book_outlined, size: 19),
+                label: const Text('일본어 한자 공부방에서 검색'),
               ),
               const SizedBox(height: 8),
               FilledButton.icon(
@@ -5340,6 +5401,24 @@ class _SettingsPageState extends State<SettingsPage> {
         ),
         const SizedBox(height: 20),
         const _SectionTitle('한자 상세 조회'),
+        Card(
+          child: SwitchListTile.adaptive(
+            key: const ValueKey('open-dictionary-in-app-setting'),
+            secondary: const Icon(Icons.language_outlined, color: sea),
+            title: const Text('사전을 앱 내부에서 열기',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+            subtitle: Text(widget.store.openDictionaryInApp
+                ? '네이버 한자사전을 VocaFlow 안에서 엽니다.'
+                : '네이버 한자사전을 기본 브라우저에서 엽니다.'),
+            value: widget.store.openDictionaryInApp,
+            onChanged: (value) async {
+              await widget.store.setOpenDictionaryInApp(value);
+              widget.refresh();
+              if (mounted) setState(() {});
+            },
+          ),
+        ),
+        const SizedBox(height: 10),
         Card(
           child: ListTile(
             key: const ValueKey('chatgpt-conversation-url-setting'),

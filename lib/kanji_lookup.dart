@@ -105,7 +105,9 @@ class KanjiLookupService {
 const externalLinkChannel = MethodChannel('com.vocaflow.app/external_links');
 
 Future<bool> openExternalUrl(Uri uri) async {
-  if (uri.scheme != 'https') return false;
+  final isTongHanjaHttp = uri.scheme == 'http' &&
+      (uri.host == 'tonghanja.com' || uri.host == 'www.tonghanja.com');
+  if (uri.scheme != 'https' && !isTongHanjaHttp) return false;
   try {
     return await externalLinkChannel.invokeMethod<bool>(
           'openUrl',
@@ -131,6 +133,17 @@ Uri naverHanjaSearchUri(String character) => Uri.parse(
       'https://hanja.dict.naver.com/#/search?query=${Uri.encodeComponent(character)}',
     );
 
+Uri tongHanjaSearchUri(String character) => Uri.http(
+      'tonghanja.com',
+      '/',
+      {'s': character},
+    );
+
+Uri nihongoKanjiSearchUri(String character) => Uri.https(
+      'nihongokanji.com',
+      '/',
+      {'s': character},
+    );
 Uri chatGptPromptUri({
   required Uri uri,
   required String prompt,
@@ -187,7 +200,9 @@ String buildChatGptWordPrompt({
 발음: $reading
 뜻: $meaning
 
-이 단어를 한자 조합 단위로 쪼개서 각 한자의 역할, 단어 전체 의미가 만들어지는 방식, 비슷한 단어와 헷갈리기 쉬운 점, 기억하기 쉬운 암기법을 알려 줘.''';
+이 단어를 한자 조합 단위로 쪼개서 각 한자의 역할, 단어 전체 의미가 만들어지는 방식, 비슷한 단어와 헷갈리기 쉬운 점, 기억하기 쉬운 암기법을 알려 줘.
+
+또한 이 단어를 자연스럽게 사용한 일본어 예문 1개와 한국어 뜻을 함께 보여 줘. 예문 안에서 학습 단어는 반드시 **$term**처럼 앞뒤에 별표 두 개씩을 붙여 강조해 줘.''';
 
 Map<String, String> _decodeKoreanTable(String source) {
   final decoded = jsonDecode(source) as Map<String, dynamic>;

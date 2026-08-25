@@ -77,7 +77,9 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "openUrl" -> {
                         val uri = Uri.parse(call.argument<String>("url").orEmpty())
-                        if (uri.scheme != "https") {
+                        val isTongHanjaHttp = uri.scheme == "http" &&
+                            (uri.host == "tonghanja.com" || uri.host == "www.tonghanja.com")
+                        if (uri.scheme != "https" && !isTongHanjaHttp) {
                             result.success(false)
                             return@setMethodCallHandler
                         }

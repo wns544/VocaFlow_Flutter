@@ -106,8 +106,7 @@ class ActiveStudy {
         rangeStart: (json['rangeStart'] as num?)?.toInt(),
         rangeEnd: (json['rangeEnd'] as num?)?.toInt(),
         sourceMode: json['sourceMode'] as String?,
-        rangeCourseSchema:
-            (json['rangeCourseSchema'] as num?)?.toInt() ?? 1,
+        rangeCourseSchema: (json['rangeCourseSchema'] as num?)?.toInt() ?? 1,
       );
 }
 
@@ -265,6 +264,7 @@ class VocaStore {
   static const _exampleFontSizeKey = 'exampleFontSize';
   static const _exampleMeaningFontSizeKey = 'exampleMeaningFontSize';
   static const _chatGptConversationUrlKey = 'chatGptConversationUrl';
+  static const _openDictionaryInAppKey = 'openDictionaryInApp';
   static const _readingMeaningMigrationKey = 'readingMeaningMigrationV1';
   static const int rangeCourseSchemaVersion = 2;
   static const _rangeCourseMigrationKey = 'rangeCourseMigrationV4';
@@ -325,6 +325,8 @@ class VocaStore {
       _prefs.getDouble(_exampleMeaningFontSizeKey) ?? 14;
   String get chatGptConversationUrl =>
       _prefs.getString(_chatGptConversationUrlKey) ?? '';
+  bool get openDictionaryInApp =>
+      _prefs.getBool(_openDictionaryInAppKey) ?? false;
   String get targetName => _prefs.getString(_targetNameKey) ?? '';
   DateTime? get targetDate {
     final value = _prefs.getString(_targetDateKey);
@@ -1016,6 +1018,11 @@ class VocaStore {
     return true;
   }
 
+  Future<void> setOpenDictionaryInApp(bool value) async {
+    await _prefs.setBool(_openDictionaryInAppKey, value);
+    await cloudChanges.markProfile();
+  }
+
   Future<void> setTarget(String name, DateTime? date) async {
     await _prefs.setString(_targetNameKey, name.trim());
     if (date == null) {
@@ -1265,6 +1272,7 @@ class VocaStore {
           'opacity': meaningOpacity,
         },
         'chatGptConversationUrl': chatGptConversationUrl,
+        'openDictionaryInApp': openDictionaryInApp,
         'activeStudy': activeStudy?.toJson(),
         'activeStudies': activeStudies.map((k, v) => MapEntry(k, v.toJson())),
         'resetMarkers': resetMarkers.map(
@@ -1359,6 +1367,8 @@ class VocaStore {
     await setChatGptConversationUrl(
       json['chatGptConversationUrl'] as String? ?? '',
     );
+    await _prefs.setBool(
+        _openDictionaryInAppKey, json['openDictionaryInApp'] as bool? ?? false);
     await _saveResetMarkers(
       (json['resetMarkers'] as Map<String, dynamic>? ?? const {}).map(
         (key, value) => MapEntry(
