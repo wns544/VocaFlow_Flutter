@@ -1,4 +1,4 @@
-import 'models.dart';
+﻿import 'models.dart';
 
 Map<String, dynamic> mergeBackupJson({
   required Map<String, dynamic> cloud,
@@ -70,6 +70,15 @@ Map<String, dynamic> mergeBackupJson({
       _mergeDailyStudyStats(cloud['dailyStudyStats'], local['dailyStudyStats']);
   result['studyEventLog'] =
       _mergeStudyEventLogs(cloud['studyEventLog'], local['studyEventLog']);
+  result['rangeCoursePasses'] = _mergeCoursePasses(
+    cloud['rangeCoursePasses'],
+    local['rangeCoursePasses'],
+  );
+  final rangeCourseSchema = _maxInt(
+    cloud['rangeCourseSchema'],
+    local['rangeCourseSchema'],
+  );
+  result['rangeCourseSchema'] = rangeCourseSchema;
 
   final mergedStudies = <String, dynamic>{};
   final cloudStudies =
@@ -83,6 +92,7 @@ Map<String, dynamic> mergeBackupJson({
       cloudStudies[key],
       localStudies[key],
       resetMarkers,
+      rangeCourseSchema,
     );
     if (chosen != null) {
       mergedStudies[key.toString()] = chosen;
@@ -106,9 +116,24 @@ Map<String, dynamic> mergeBackupJson({
       }
     }
   });
-  result['activeStudy'] =
-      fallbackActive ?? cloud['activeStudy'] ?? local['activeStudy'];
+  result['activeStudy'] = fallbackActive;
   return result;
+}
+
+Map<String, int> _mergeCoursePasses(dynamic cloud, dynamic local) {
+  final cloudPasses = cloud as Map<dynamic, dynamic>? ?? const {};
+  final localPasses = local as Map<dynamic, dynamic>? ?? const {};
+  final keys = {...cloudPasses.keys, ...localPasses.keys};
+  return {
+    for (final key in keys)
+      key.toString(): _maxPassCount(cloudPasses[key], localPasses[key]),
+  };
+}
+
+int _maxPassCount(dynamic left, dynamic right) {
+  final leftCount = left is num ? left.toInt() : 0;
+  final rightCount = right is num ? right.toInt() : 0;
+  return leftCount > rightCount ? leftCount : rightCount;
 }
 
 List<WordBook> _books(dynamic value) => (value as List<dynamic>? ?? [])
@@ -260,12 +285,14 @@ Map<String, dynamic>? _chooseActiveStudy(
   dynamic cloud,
   dynamic local,
   Map<String, DateTime> resetMarkers,
+  int rangeCourseSchema,
 ) {
   final cloudMap = cloud is Map ? Map<String, dynamic>.from(cloud) : null;
   final localMap = local is Map ? Map<String, dynamic>.from(local) : null;
   final candidates = [cloudMap, localMap]
       .whereType<Map<String, dynamic>>()
       .where((active) => !_resetAfterActive(active, resetMarkers))
+      .where((active) => _isCompatibleRangeCourse(active, rangeCourseSchema))
       .toList();
   if (candidates.isEmpty) return null;
   candidates.sort((a, b) {
@@ -284,6 +311,16 @@ Map<String, dynamic>? _chooseActiveStudy(
     return bTime.compareTo(aTime);
   });
   return candidates.first;
+}
+
+bool _isCompatibleRangeCourse(
+    Map<String, dynamic> active, int rangeCourseSchema) {
+  final isRangeCourse = active['bookId'] != null &&
+      active['rangeStart'] != null &&
+      active['rangeEnd'] != null;
+  if (!isRangeCourse || rangeCourseSchema < 2) return true;
+  return ((active['rangeCourseSchema'] as num?)?.toInt() ?? 1) >=
+      rangeCourseSchema;
 }
 
 DateTime? _activeUpdatedAt(Map<String, dynamic> active) {

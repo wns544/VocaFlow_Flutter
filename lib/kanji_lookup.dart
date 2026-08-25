@@ -142,18 +142,24 @@ Uri chatGptPromptUri({
 
 String? normalizeChatGptConversationUrl(String value) {
   final uri = Uri.tryParse(value.trim());
-  if (uri == null ||
-      uri.scheme != 'https' ||
-      uri.host != 'chatgpt.com' ||
-      uri.pathSegments.length != 2 ||
-      uri.pathSegments.first != 'c' ||
-      uri.pathSegments.last.isEmpty) {
+  if (uri == null || uri.scheme != 'https' || uri.host != 'chatgpt.com') {
     return null;
   }
+
+  final segments = uri.pathSegments;
+  final isStandardConversation =
+      segments.length == 2 && segments.first == 'c' && segments.last.isNotEmpty;
+  final isGptConversation = segments.length == 4 &&
+      segments[0] == 'g' &&
+      segments[1].isNotEmpty &&
+      segments[2] == 'c' &&
+      segments[3].isNotEmpty;
+  if (!isStandardConversation && !isGptConversation) return null;
+
   return Uri(
     scheme: 'https',
     host: 'chatgpt.com',
-    pathSegments: ['c', uri.pathSegments.last],
+    pathSegments: segments,
   ).toString();
 }
 

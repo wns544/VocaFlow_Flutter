@@ -22,12 +22,13 @@ import 'kanji_lookup.dart';
 import 'local_word_search.dart';
 import 'models.dart';
 import 'store.dart';
+import 'study_course.dart';
 
 const ink = Color(0xFF1C1C1E);
 const sea = Color(0xFF34C759);
 const mist = Color(0xFFF2F2F7);
 const coral = Color(0xFFFF3B30);
-const flutterSplashMinimumDuration = Duration(milliseconds: 320);
+const flutterSplashMinimumDuration = Duration(milliseconds: 900);
 const studySpeechChannel = MethodChannel('com.vocaflow.app/study_speech');
 const resumeSnapshotChannel = MethodChannel('com.vocaflow.app/resume_snapshot');
 final defaultKanjiLookupService = KanjiLookupService();
@@ -692,7 +693,7 @@ class _ReferenceHomePageState extends State<HomePage> {
   final expandedFavoriteIds = <String>{};
   final selectedFavoriteSessions = <String, Set<int>>{};
   var multiSessionSelectionMode = false;
-  var homeHeaderCollapseProgress = 0.0;
+  final homeHeaderCollapseProgress = ValueNotifier<double>(0);
 
   @override
   void initState() {
@@ -705,6 +706,7 @@ class _ReferenceHomePageState extends State<HomePage> {
     favoriteScrollController
       ..removeListener(_handleFavoriteScroll)
       ..dispose();
+    homeHeaderCollapseProgress.dispose();
     super.dispose();
   }
 
@@ -712,8 +714,8 @@ class _ReferenceHomePageState extends State<HomePage> {
     final progress = favoriteScrollController.hasClients
         ? (favoriteScrollController.offset / 72).clamp(0.0, 1.0).toDouble()
         : 0.0;
-    if ((progress - homeHeaderCollapseProgress).abs() < .02) return;
-    setState(() => homeHeaderCollapseProgress = progress);
+    if ((progress - homeHeaderCollapseProgress.value).abs() < .005) return;
+    homeHeaderCollapseProgress.value = progress;
   }
 
   WordBook get book => widget.store.books.firstWhere(
@@ -741,7 +743,6 @@ class _ReferenceHomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
-    final sessions = book.sessions(widget.store.sessionSize);
     final memorized =
         book.words.where((word) => word.state == StudyState.memorized).length;
     final reviewWords =
@@ -757,37 +758,45 @@ class _ReferenceHomePageState extends State<HomePage> {
     final favoriteBooks =
         widget.store.books.where((item) => item.isFavorite).toList();
 
-    final next = sessions.isEmpty
-        ? null
-        : sessions.firstWhere((session) => !session.isCompleted,
-            orElse: () => sessions.first);
-    final nextKey = next == null
-        ? ''
-        : widget.store.activeStudyKeyFor(
-            bookId: book.id,
-            sessionIndexes: [next.index],
-            sessionSelections: const {},
-          );
-    final activeNext =
-        next == null ? null : widget.store.getActiveStudyFor(nextKey);
+    final activeNext = widget.store.activeCourseForBook(book.id);
+    final cumulativeCourses = cumulativeStudyCourses(book.words.length);
+    StudyCourse? suggestedCourse;
+    for (final course in cumulativeCourses) {
+      if (widget.store.coursePassesFor(book.id, course.start, course.end) ==
+          0) {
+        suggestedCourse = course;
+        break;
+      }
+    }
+    suggestedCourse ??=
+        cumulativeCourses.isEmpty ? null : cumulativeCourses.last;
     final progress = book.words.isEmpty ? 0.0 : memorized / book.words.length;
     final progressPercent = book.words.isEmpty ? 0 : (progress * 100).round();
-    final canStudy = sessions.isNotEmpty;
+    final canStudy = book.words.isNotEmpty;
     Future<void> openNextStudy() async {
       if (!canStudy) return;
       if (activeNext != null) {
         await Navigator.of(context).push(MaterialPageRoute(
+          builder: (_) =>
+              CardStudyPage(store: widget.store, resume: activeNext),
+        ));
+      } else if (suggestedCourse != null) {
+        final selectedCourse = suggestedCourse;
+        await Navigator.of(context).push(MaterialPageRoute(
           builder: (_) => CardStudyPage(
             store: widget.store,
-            resume: activeNext,
+            words: selectedCourse.wordsFrom(book),
+            bookId: book.id,
+            rangeStart: selectedCourse.start,
+            rangeEnd: selectedCourse.end,
+            sourceMode: selectedCourse.source.name,
+            useSavedResume: false,
           ),
         ));
-        if (!mounted) return;
-        setState(() {});
-        widget.refresh();
-      } else {
-        await _startNext(context, sessions);
       }
+      if (!mounted) return;
+      setState(() {});
+      widget.refresh();
     }
 
     return Padding(
@@ -814,12 +823,10 @@ class _ReferenceHomePageState extends State<HomePage> {
             ]),
           ),
         ]),
-        AnimatedSize(
+        ValueListenableBuilder<double>(
           key: const ValueKey('home-study-controls'),
-          duration: const Duration(milliseconds: 120),
-          curve: Curves.easeInOutCubic,
-          alignment: Alignment.topCenter,
-          child: multiSessionSelectionMode
+          valueListenable: homeHeaderCollapseProgress,
+          builder: (context, collapseProgress, _) => multiSessionSelectionMode
               ? Card(
                   child: SizedBox(
                     height: 48,
@@ -858,20 +865,18 @@ class _ReferenceHomePageState extends State<HomePage> {
                   ),
                 )
               : Column(children: [
-                  SizedBox(
-                      height: _lerpDouble(12, 8, homeHeaderCollapseProgress)),
+                  SizedBox(height: _lerpDouble(12, 8, collapseProgress)),
                   _MorphingStudySummary(
                     key: const ValueKey('home-study-summary-morph'),
-                    collapseProgress: homeHeaderCollapseProgress,
+                    collapseProgress: collapseProgress,
                     bookName: book.name,
                     progress: progress,
                     progressPercent: progressPercent,
                     progressLabel: '$memorized/${book.words.length} 외움',
                   ),
-                  SizedBox(
-                      height: _lerpDouble(8, 6, homeHeaderCollapseProgress)),
+                  SizedBox(height: _lerpDouble(8, 6, collapseProgress)),
                   _HomeActionSegmentBar(
-                    collapseProgress: homeHeaderCollapseProgress,
+                    collapseProgress: collapseProgress,
                     items: [
                       _HomeActionItem(
                         key: const ValueKey('home-action-review'),
@@ -892,7 +897,7 @@ class _ReferenceHomePageState extends State<HomePage> {
                         label: activeNext != null ? '이어서' : '학습',
                         value: activeNext != null
                             ? '${activeNext.memorized}/${activeNext.total}'
-                            : '시작',
+                            : suggestedCourse?.rangeLabel ?? 'No.-',
                         onTap: canStudy ? openNextStudy : null,
                       ),
                       _HomeActionItem(
@@ -922,10 +927,10 @@ class _ReferenceHomePageState extends State<HomePage> {
                   ),
                 ]),
         ),
-        SizedBox(height: _lerpDouble(8, 6, homeHeaderCollapseProgress)),
+        const SizedBox(height: 6),
         SizedBox(
           width: double.infinity,
-          height: _lerpDouble(42, 36, homeHeaderCollapseProgress),
+          height: 38,
           child: OutlinedButton.icon(
             key: const ValueKey('multi-session-study'),
             onPressed: favoriteBooks.any((item) => item.words.isNotEmpty)
@@ -942,7 +947,7 @@ class _ReferenceHomePageState extends State<HomePage> {
             ),
           ),
         ),
-        SizedBox(height: _lerpDouble(12, 8, homeHeaderCollapseProgress)),
+        const SizedBox(height: 8),
         const Text('즐겨찾기 단어장',
             style: TextStyle(
                 color: Color(0xFF8E8E93),
@@ -975,6 +980,14 @@ class _ReferenceHomePageState extends State<HomePage> {
                     final expanded = expandedFavoriteIds.contains(favorite.id);
                     final favoriteSessions =
                         favorite.sessions(widget.store.sessionSize);
+                    final favoriteCourses =
+                        cumulativeStudyCourses(favorite.words.length);
+                    final completedCourseCount = favoriteCourses
+                        .where((course) =>
+                            widget.store.coursePassesFor(
+                                favorite.id, course.start, course.end) >
+                            0)
+                        .length;
                     return Card(
                       key: ValueKey('favorite-book-card-${favorite.id}'),
                       color: isBookCompleted(widget.store, favorite)
@@ -1002,7 +1015,9 @@ class _ReferenceHomePageState extends State<HomePage> {
                                     fontSize: 14,
                                     fontWeight: FontWeight.w800)),
                             subtitle: Text(
-                                '$completedCount/$sessionCount 세션 완료 · $memorizedWordCount/${favorite.words.length}단어',
+                                multiSessionSelectionMode
+                                    ? '$completedCount/$sessionCount 세션 완료 · $memorizedWordCount/${favorite.words.length}단어'
+                                    : '$completedCourseCount/${favoriteCourses.length} 묶음세션 완료 · $memorizedWordCount/${favorite.words.length}단어',
                                 style: const TextStyle(
                                     color: Color(0xFF8E8E93), fontSize: 12)),
                             trailing: IconButton(
@@ -1028,67 +1043,137 @@ class _ReferenceHomePageState extends State<HomePage> {
                               ? const SizedBox.shrink()
                               : Column(children: [
                                   const Divider(height: 1),
-                                  ...favoriteSessions.map((session) => Material(
-                                        color: widget.store.isSessionCompleted(
-                                                favorite.id, session.index)
-                                            ? const Color(0xFFEDEDED)
-                                            : Colors.transparent,
-                                        child: ListTile(
-                                          key: ValueKey(
-                                              'favorite-${favorite.id}-session-${session.index}'),
-                                          dense: true,
-                                          contentPadding: EdgeInsets.only(
-                                              left: multiSessionSelectionMode
-                                                  ? 10
-                                                  : 58,
-                                              right: 14),
-                                          leading: multiSessionSelectionMode
-                                              ? Checkbox(
+                                  ...(multiSessionSelectionMode
+                                      ? favoriteSessions
+                                          .map((session) => Material(
+                                                color: widget.store
+                                                        .isSessionCompleted(
+                                                            favorite.id,
+                                                            session.index)
+                                                    ? const Color(0xFFEDEDED)
+                                                    : Colors.transparent,
+                                                child: ListTile(
                                                   key: ValueKey(
-                                                      'favorite-session-checkbox-${favorite.id}-${session.index}'),
-                                                  value:
-                                                      selectedFavoriteSessions[
-                                                                  favorite.id]
-                                                              ?.contains(session
-                                                                  .index) ??
-                                                          false,
-                                                  onChanged: (_) =>
+                                                      'favorite-session-row-${favorite.id}-${session.index}'),
+                                                  dense: true,
+                                                  contentPadding:
+                                                      const EdgeInsets.only(
+                                                          left: 10, right: 14),
+                                                  leading: Checkbox(
+                                                    key: ValueKey(
+                                                        'favorite-session-checkbox-${favorite.id}-${session.index}'),
+                                                    value:
+                                                        selectedFavoriteSessions[
+                                                                    favorite.id]
+                                                                ?.contains(session
+                                                                    .index) ??
+                                                            false,
+                                                    onChanged: (_) =>
+                                                        toggleFavoriteSession(
+                                                            favorite, session),
+                                                  ),
+                                                  title: Text(session.label,
+                                                      style: const TextStyle(
+                                                          fontSize: 13,
+                                                          fontWeight:
+                                                              FontWeight.w700)),
+                                                  subtitle:
+                                                      _SessionProgressSubtitle(
+                                                    store: widget.store,
+                                                    book: favorite,
+                                                    session: session,
+                                                  ),
+                                                  onTap: () =>
                                                       toggleFavoriteSession(
                                                           favorite, session),
-                                                )
-                                              : null,
-                                          title: Text(session.label,
-                                              style: const TextStyle(
-                                                  fontSize: 13,
-                                                  fontWeight: FontWeight.w700)),
-                                          subtitle: _SessionProgressSubtitle(
-                                            store: widget.store,
-                                            book: favorite,
-                                            session: session,
-                                          ),
-                                          trailing: multiSessionSelectionMode
-                                              ? null
-                                              : Container(
-                                                  width: 30,
-                                                  height: 30,
-                                                  alignment: Alignment.center,
-                                                  decoration:
-                                                      const BoxDecoration(
-                                                    color: Color(0x1A34C759),
-                                                    shape: BoxShape.circle,
-                                                  ),
-                                                  child: const Icon(
-                                                      Icons.play_arrow_rounded,
-                                                      color: sea,
-                                                      size: 18),
                                                 ),
-                                          onTap: multiSessionSelectionMode
-                                              ? () => toggleFavoriteSession(
-                                                  favorite, session)
-                                              : () => _openFavoriteSession(
-                                                  favorite, session),
-                                        ),
-                                      )),
+                                              ))
+                                          .toList()
+                                      : favoriteCourses.map((course) {
+                                          final words =
+                                              course.wordsFrom(favorite);
+
+                                          final active = widget.store
+                                              .activeCourseForBook(favorite.id);
+                                          final isCurrent = active
+                                                      ?.rangeStart ==
+                                                  course.start &&
+                                              active?.rangeEnd == course.end;
+                                          final recordedPasses = widget.store
+                                              .coursePassesFor(favorite.id,
+                                                  course.start, course.end);
+                                          final passes = recordedPasses;
+                                          final cumulativeMemorized = passes > 0
+                                              ? words.length
+                                              : isCurrent
+                                                  ? active!.memorized
+                                                      .clamp(0, active.total)
+                                                  : 0;
+                                          final currentDone = isCurrent
+                                              ? (active!.memorized +
+                                                      active.reviewed.length)
+                                                  .clamp(0, active.total)
+                                              : 0;
+                                          return Material(
+                                            color: isCurrent
+                                                ? const Color(0xFFF0FDF4)
+                                                : passes > 0
+                                                    ? const Color(0xFFEDEDED)
+                                                    : Colors.transparent,
+                                            child: ListTile(
+                                              key: ValueKey(
+                                                  'favorite-${favorite.id}-course-${course.start}-${course.end}'),
+                                              dense: true,
+                                              contentPadding:
+                                                  const EdgeInsets.only(
+                                                      left: 58, right: 14),
+                                              title: Row(children: [
+                                                Expanded(
+                                                  child: Text(
+                                                    course.rangeLabel,
+                                                    style: const TextStyle(
+                                                        fontSize: 13,
+                                                        fontWeight:
+                                                            FontWeight.w700),
+                                                  ),
+                                                ),
+                                                if (isCurrent)
+                                                  const Text(
+                                                    '진행중',
+                                                    style: TextStyle(
+                                                      color: sea,
+                                                      fontSize: 11,
+                                                      fontWeight:
+                                                          FontWeight.w800,
+                                                    ),
+                                                  ),
+                                              ]),
+                                              subtitle: Text(
+                                                isCurrent
+                                                    ? '이번 학습 $currentDone/${active!.total} · 누적 암기 $cumulativeMemorized/${words.length}'
+                                                    : '총 ${words.length}개 · 누적 암기 $cumulativeMemorized/${words.length}${passes > 0 ? ' · $passes회독 완료' : ''}',
+                                                style: const TextStyle(
+                                                    color: Color(0xFF8E8E93),
+                                                    fontSize: 12),
+                                              ),
+                                              trailing: Container(
+                                                width: 30,
+                                                height: 30,
+                                                alignment: Alignment.center,
+                                                decoration: const BoxDecoration(
+                                                  color: Color(0x1A34C759),
+                                                  shape: BoxShape.circle,
+                                                ),
+                                                child: const Icon(
+                                                    Icons.play_arrow_rounded,
+                                                    color: sea,
+                                                    size: 18),
+                                              ),
+                                              onTap: () => _openFavoriteCourse(
+                                                  favorite, course),
+                                            ),
+                                          );
+                                        }).toList()),
                                 ]),
                         ),
                       ]),
@@ -1147,40 +1232,68 @@ class _ReferenceHomePageState extends State<HomePage> {
     });
   }
 
-  Future<void> _openFavoriteSession(
-      WordBook favorite, StudySession session) async {
+  Future<void> _openFavoriteCourse(
+      WordBook favorite, StudyCourse course) async {
     await widget.store.selectQuickBook(favorite.id);
-    final sessionCompleted =
-        widget.store.isSessionCompleted(favorite.id, session.index);
     if (!mounted) return;
     setState(() => selectedBookId = favorite.id);
+
+    final active = widget.store.activeCourseForBook(favorite.id);
+    final sameRange =
+        active?.rangeStart == course.start && active?.rangeEnd == course.end;
+    if (sameRange) {
+      await Navigator.of(context).push(MaterialPageRoute(
+        builder: (_) => CardStudyPage(store: widget.store, resume: active),
+      ));
+      if (!mounted) return;
+      setState(() {});
+      widget.refresh();
+      return;
+    }
+
+    final hasProgress = active != null &&
+        (active.memorized > 0 ||
+            active.reviewed.isNotEmpty ||
+            active.queueIds.length < active.total);
+    if (hasProgress) {
+      final replace = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('현재 묶음세션을 바꿀까요?'),
+          content: Text(
+            '진행 중인 No.${active.rangeStart}~${active.rangeEnd} 대신 '
+            '${course.rangeLabel} 학습을 시작합니다.\n\n'
+            '이번 학습 진행만 초기화됩니다. 단어별 암기·복습·정답·오답 기록은 유지됩니다.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('취소'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('교체'),
+            ),
+          ],
+        ),
+      );
+      if (replace != true || !mounted) return;
+    }
+
     await Navigator.of(context).push(MaterialPageRoute(
       builder: (_) => CardStudyPage(
         store: widget.store,
-        words: session.words,
+        words: course.wordsFrom(favorite),
         bookId: favorite.id,
-        sessionIndexes: [session.index],
-        useSavedResume: !sessionCompleted,
+        rangeStart: course.start,
+        rangeEnd: course.end,
+        sourceMode: course.source.name,
+        useSavedResume: false,
       ),
     ));
     if (!mounted) return;
     setState(() {});
     widget.refresh();
-  }
-
-  Future<void> _startNext(
-      BuildContext context, List<StudySession> sessions) async {
-    final next = sessions.firstWhere((session) => !session.isCompleted,
-        orElse: () => sessions.first);
-    selectedSessions
-      ..clear()
-      ..add(next.index);
-    await _openSelected(context);
-  }
-
-  Future<void> _openSelected(BuildContext context) async {
-    final indexes = selectedSessions.toList()..sort();
-    await _openSelections(context, {book.id: indexes});
   }
 
   Future<void> _openSelections(
@@ -1492,6 +1605,9 @@ class CardStudyPage extends StatefulWidget {
       this.bookId,
       this.sessionIndexes = const [],
       this.sessionSelections = const {},
+      this.rangeStart,
+      this.rangeEnd,
+      this.sourceMode,
       this.resume,
       this.useSavedResume = true,
       this.kanjiLookupService,
@@ -1501,6 +1617,9 @@ class CardStudyPage extends StatefulWidget {
   final String? bookId;
   final List<int> sessionIndexes;
   final Map<String, List<int>> sessionSelections;
+  final int? rangeStart;
+  final int? rangeEnd;
+  final String? sourceMode;
   final ActiveStudy? resume;
   final bool useSavedResume;
   final KanjiLookupService? kanjiLookupService;
@@ -1522,6 +1641,7 @@ class _CardStudyPageState extends State<CardStudyPage>
   var revealed = false;
   var exiting = false;
   var finishingStudy = false;
+  var completionValidated = false;
   Word? lastWord;
   StudyState? lastState;
   final undoHistory = <StudyDecision>[];
@@ -1529,6 +1649,14 @@ class _CardStudyPageState extends State<CardStudyPage>
 
   bool get horizontalSwipe => widget.store.horizontalSwipe;
   String? get activeBookId => widget.resume?.bookId ?? widget.bookId;
+  int? get activeRangeStart => widget.resume?.rangeStart ?? widget.rangeStart;
+  int? get activeRangeEnd => widget.resume?.rangeEnd ?? widget.rangeEnd;
+  String? get activeSourceMode =>
+      widget.resume?.sourceMode ?? widget.sourceMode;
+  bool get isRangeCourse =>
+      activeBookId != null &&
+      activeRangeStart != null &&
+      activeRangeEnd != null;
   List<int> get activeSessionIndexes =>
       widget.resume?.sessionIndexes ?? widget.sessionIndexes;
   Map<String, List<int>> get activeSessionSelections {
@@ -1557,12 +1685,22 @@ class _CardStudyPageState extends State<CardStudyPage>
     };
     ActiveStudy? resolvedResume = widget.resume;
     if (resolvedResume == null && widget.useSavedResume) {
-      final key = widget.store.activeStudyKeyFor(
-        bookId: widget.bookId,
-        sessionIndexes: widget.sessionIndexes,
-        sessionSelections: widget.sessionSelections,
-      );
-      resolvedResume = widget.store.getActiveStudyFor(key);
+      if (widget.rangeStart != null &&
+          widget.rangeEnd != null &&
+          widget.bookId != null) {
+        final active = widget.store.activeCourseForBook(widget.bookId!);
+        if (active?.rangeStart == widget.rangeStart &&
+            active?.rangeEnd == widget.rangeEnd) {
+          resolvedResume = active;
+        }
+      } else {
+        final key = widget.store.activeStudyKeyFor(
+          bookId: widget.bookId,
+          sessionIndexes: widget.sessionIndexes,
+          sessionSelections: widget.sessionSelections,
+        );
+        resolvedResume = widget.store.getActiveStudyFor(key);
+      }
     }
     final resume = resolvedResume;
     if (resume == null) {
@@ -1573,8 +1711,13 @@ class _CardStudyPageState extends State<CardStudyPage>
       total = queue.length;
     } else {
       queue = widget.store.resolveActiveWords(resume);
-      total = resume.total;
-      memorized = resume.memorized;
+      if (resume.isRangeCourse) {
+        total = resume.total;
+        memorized = resume.memorized.clamp(0, total);
+      } else {
+        total = resume.total;
+        memorized = resume.memorized;
+      }
       reviewed.addAll(resume.reviewed);
       revealed = resume.revealed;
       lastState = resume.lastState;
@@ -1641,11 +1784,13 @@ class _CardStudyPageState extends State<CardStudyPage>
 
   Future<void> persistStudy() async {
     if (queue.isEmpty || exiting) return;
-    final key = widget.store.activeStudyKeyFor(
-      bookId: activeBookId,
-      sessionIndexes: activeSessionIndexes,
-      sessionSelections: activeSessionSelections,
-    );
+    final key = isRangeCourse
+        ? widget.store.currentCourseKey(activeBookId!)
+        : widget.store.activeStudyKeyFor(
+            bookId: activeBookId,
+            sessionIndexes: activeSessionIndexes,
+            sessionSelections: activeSessionSelections,
+          );
     await widget.store.saveActiveStudyFor(
         key,
         ActiveStudy(
@@ -1662,6 +1807,9 @@ class _CardStudyPageState extends State<CardStudyPage>
           undoHistory: undoHistory,
           sessionSelections: activeSessionSelections,
           lastWordBookId: lastWord == null ? null : _bookIdForWord(lastWord!),
+          rangeStart: activeRangeStart,
+          rangeEnd: activeRangeEnd,
+          sourceMode: activeSourceMode,
         ));
   }
 
@@ -1762,7 +1910,10 @@ class _CardStudyPageState extends State<CardStudyPage>
               bookId: _bookIdForWord(word),
               sessionIndexes: _sessionIndexesForWord(word),
             ));
-        if (activeSessionSelections.isNotEmpty) {
+        if (isRangeCourse) {
+          await widget.store.completeRangeCourse(
+              activeBookId!, activeRangeStart!, activeRangeEnd!);
+        } else if (activeSessionSelections.isNotEmpty) {
           for (final selection in activeSessionSelections.entries) {
             await widget.store.completeSessions(selection.key, selection.value);
           }
@@ -1775,6 +1926,8 @@ class _CardStudyPageState extends State<CardStudyPage>
           sessionSelections: activeSessionSelections,
         );
         await widget.store.clearActiveStudyFor(key);
+        completionValidated = true;
+        if (mounted) setState(() {});
         unawaited(deleteResumeSnapshot());
         AutoBackupCoordinator.activeInstance
             ?.requestImmediateBackup(ignoreMinimumInterval: true);
@@ -1997,6 +2150,11 @@ class _CardStudyPageState extends State<CardStudyPage>
 
   @override
   Widget build(BuildContext context) {
+    if (queue.isEmpty && !completionValidated) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
     if (queue.isEmpty) {
       return ResultPage(
           total: total,
@@ -2027,9 +2185,8 @@ class _CardStudyPageState extends State<CardStudyPage>
     }).where((label) => label.isNotEmpty);
     final sessionLabel =
         selectionLabels.isEmpty ? '복습' : selectionLabels.join(' · ');
-    final studyContextLabel = activeSessionSelections.length > 1
-        ? sessionLabel
-        : '${selectedBook?.name ?? '기본 단어장'} · $sessionLabel';
+    final studyContextLabel =
+        activeSessionSelections.length > 1 ? sessionLabel : sessionLabel;
     final negativeColor =
         stateForDirection(false) == StudyState.memorized ? sea : coral;
     final positiveColor =
@@ -3735,6 +3892,254 @@ class _BooksPageState extends State<BooksPage> {
   }
 }
 
+class StudyCoursePage extends StatefulWidget {
+  const StudyCoursePage({
+    super.key,
+    required this.store,
+    required this.bookId,
+  });
+
+  final VocaStore store;
+  final String bookId;
+
+  @override
+  State<StudyCoursePage> createState() => _StudyCoursePageState();
+}
+
+class _StudyCoursePageState extends State<StudyCoursePage> {
+  var source = StudyCourseSource.cumulative;
+
+  WordBook get book =>
+      widget.store.books.firstWhere((item) => item.id == widget.bookId);
+
+  Future<void> startCourse(StudyCourse course) async {
+    final active = widget.store.activeCourseForBook(book.id);
+    final sameRange =
+        active?.rangeStart == course.start && active?.rangeEnd == course.end;
+    if (sameRange) {
+      await Navigator.of(context).push(MaterialPageRoute(
+        builder: (_) => CardStudyPage(store: widget.store, resume: active),
+      ));
+      if (mounted) setState(() {});
+      return;
+    }
+
+    final hasProgress = active != null &&
+        (active.memorized > 0 ||
+            active.reviewed.isNotEmpty ||
+            active.queueIds.length < active.total);
+    if (hasProgress) {
+      final replace = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('현재 묶음세션을 바꿀까요?'),
+          content: Text(
+            '진행 중인 No.${active.rangeStart}~${active.rangeEnd} 대신 '
+            '${course.rangeLabel} 학습을 시작합니다.\n\n'
+            '이번 학습 진행만 초기화됩니다. 단어별 암기·복습·정답·오답 기록은 유지됩니다.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('취소'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('교체'),
+            ),
+          ],
+        ),
+      );
+      if (replace != true) return;
+      if (!mounted) return;
+    }
+
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => CardStudyPage(
+        store: widget.store,
+        words: course.wordsFrom(book),
+        bookId: book.id,
+        rangeStart: course.start,
+        rangeEnd: course.end,
+        sourceMode: course.source.name,
+        useSavedResume: false,
+      ),
+    ));
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final courses = source == StudyCourseSource.cumulative
+        ? cumulativeStudyCourses(book.words.length)
+        : individualStudyCourses(book.words.length);
+    final active = widget.store.activeCourseForBook(book.id);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(book.name,
+            style: const TextStyle(fontWeight: FontWeight.w800)),
+        backgroundColor: mist,
+      ),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 6),
+            child: SizedBox(
+              width: double.infinity,
+              child: SegmentedButton<StudyCourseSource>(
+                segments: const [
+                  ButtonSegment(
+                    value: StudyCourseSource.cumulative,
+                    label: Text('묶음세션'),
+                    icon: Icon(Icons.stacked_bar_chart),
+                  ),
+                  ButtonSegment(
+                    value: StudyCourseSource.individual,
+                    label: Text('50개씩'),
+                    icon: Icon(Icons.view_agenda_outlined),
+                  ),
+                ],
+                selected: {source},
+                onSelectionChanged: (value) =>
+                    setState(() => source = value.first),
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(18, 2, 18, 8),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                source == StudyCourseSource.cumulative
+                    ? '50개씩 범위를 겹쳐 학습하는 묶음세션이며, 각 범위의 진행은 별도로 계산됩니다.'
+                    : '겹치지 않는 50개 구간만 골라 학습합니다.',
+                style: const TextStyle(
+                  color: Colors.black54,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ),
+          Expanded(
+            child: courses.isEmpty
+                ? const Center(child: Text('단어장이 비어 있습니다.'))
+                : ListView.separated(
+                    padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
+                    itemCount: courses.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 10),
+                    itemBuilder: (context, index) {
+                      final course = courses[index];
+
+                      final isCurrent = active?.rangeStart == course.start &&
+                          active?.rangeEnd == course.end;
+                      final recordedPasses = widget.store
+                          .coursePassesFor(book.id, course.start, course.end);
+                      final passes = recordedPasses;
+                      final cumulativeMemorized = passes > 0
+                          ? course.wordCount
+                          : isCurrent
+                              ? active!.memorized.clamp(0, active.total)
+                              : 0;
+                      final currentDone = isCurrent
+                          ? (active!.memorized + active.reviewed.length)
+                              .clamp(0, active.total)
+                          : 0;
+                      return Card(
+                        color:
+                            isCurrent ? const Color(0xFFF0FDF4) : Colors.white,
+                        child: InkWell(
+                          key: ValueKey('study-course-$index'),
+                          borderRadius: BorderRadius.circular(12),
+                          onTap: () => startCourse(course),
+                          child: Padding(
+                            padding: const EdgeInsets.all(16),
+                            child: Row(
+                              children: [
+                                Container(
+                                  width: 58,
+                                  height: 58,
+                                  decoration: BoxDecoration(
+                                    color: isCurrent
+                                        ? const Color(0xFFDCFCE7)
+                                        : const Color(0xFFEFF6FF),
+                                    borderRadius: BorderRadius.circular(16),
+                                  ),
+                                  child: Icon(
+                                    isCurrent
+                                        ? Icons.play_arrow_rounded
+                                        : Icons.menu_book_rounded,
+                                    color: isCurrent
+                                        ? sea
+                                        : const Color(0xFF3B82F6),
+                                    size: 31,
+                                  ),
+                                ),
+                                const SizedBox(width: 14),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Row(children: [
+                                        Expanded(
+                                          child: Text(course.rangeLabel,
+                                              style: const TextStyle(
+                                                  fontSize: 18,
+                                                  fontWeight: FontWeight.w900)),
+                                        ),
+                                        if (isCurrent)
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(
+                                                horizontal: 9, vertical: 5),
+                                            decoration: BoxDecoration(
+                                              color: const Color(0xFFDCFCE7),
+                                              borderRadius:
+                                                  BorderRadius.circular(99),
+                                            ),
+                                            child: const Text('진행중',
+                                                style: TextStyle(
+                                                    color: sea,
+                                                    fontSize: 11,
+                                                    fontWeight:
+                                                        FontWeight.w900)),
+                                          ),
+                                      ]),
+                                      const SizedBox(height: 5),
+                                      Text(
+                                          '총 ${course.wordCount}개 · 누적 암기 $cumulativeMemorized/${course.wordCount}${passes > 0 ? ' · $passes회독 완료' : ''}',
+                                          style: const TextStyle(
+                                              color: Colors.black54,
+                                              fontWeight: FontWeight.w600)),
+                                      if (isCurrent) ...[
+                                        const SizedBox(height: 3),
+                                        Text(
+                                            '이번 학습 $currentDone/${active!.total}',
+                                            style: const TextStyle(
+                                                color: sea,
+                                                fontSize: 12,
+                                                fontWeight: FontWeight.w800)),
+                                      ],
+                                    ],
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                const Icon(Icons.chevron_right),
+                              ],
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class BookDetailPage extends StatefulWidget {
   const BookDetailPage({
     super.key,
@@ -3889,6 +4294,21 @@ class _BookDetailPageState extends State<BookDetailPage> {
             const Icon(Icons.edit_outlined, size: 16, color: Colors.black45),
           ]),
         ),
+        actions: [
+          TextButton.icon(
+            onPressed: () async {
+              await Navigator.of(context).push(MaterialPageRoute(
+                builder: (_) => StudyCoursePage(
+                  store: widget.store,
+                  bookId: book.id,
+                ),
+              ));
+              if (mounted) setState(() {});
+            },
+            icon: const Icon(Icons.route_outlined, size: 18),
+            label: const Text('묶음세션'),
+          ),
+        ],
         backgroundColor: mist,
       ),
       body: Column(children: [
@@ -4218,9 +4638,7 @@ class LegacySettingsPage extends StatelessWidget {
           ListTile(
             leading: const Icon(Icons.flag_outlined),
             title: const Text('학습 목표'),
-            subtitle: Text(store.targetDate == null
-                ? 'D-day를 설정해 보세요'
-                : '${store.targetName.isEmpty ? '목표일' : store.targetName} · ${_dDayText(store.dDay)}'),
+            subtitle: Text(store.targetDate == null ? 'D-day를 설정해 보세요' : ' · '),
             trailing: const Icon(Icons.chevron_right),
             onTap: () => _editTarget(context),
           ),
@@ -4486,7 +4904,7 @@ class _SettingsPageState extends State<SettingsPage> {
     try {
       final path = await FilePicker.platform.saveFile(
         dialogTitle: '단어장 Excel로 내보내기',
-        fileName: '${safeName.isEmpty ? 'VocaFlow_단어장' : safeName}.xlsx',
+        fileName: '.xlsx',
         type: FileType.custom,
         allowedExtensions: const ['xlsx'],
         bytes: createWordBookXlsx(book),
@@ -4577,7 +4995,13 @@ class _SettingsPageState extends State<SettingsPage> {
       await task();
     } catch (error) {
       if (!mounted) return;
-      _showSnack('클라우드 작업에 실패했습니다. ($error)');
+      if (error is CloudQuotaExceededException) {
+        _showSnack('서버 사용량이 초과되어 지금은 동기화할 수 없어요. 나중에 다시 시도해 주세요.');
+      } else if (error is CloudSyncTimeoutException) {
+        _showSnack('서버 응답이 오래 걸려 동기화를 멈췄어요. 잠시 후 다시 시도해 주세요.');
+      } else {
+        _showSnack('클라우드 작업에 실패했습니다. ($error)');
+      }
     } finally {
       if (mounted) setState(() => syncing = false);
     }
@@ -4637,10 +5061,7 @@ class _SettingsPageState extends State<SettingsPage> {
             padding: const EdgeInsets.all(16),
             child:
                 Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(
-                  user == null
-                      ? 'Google 계정으로 Firebase에 연결할 수 있어요.'
-                      : '${user.email ?? user.displayName ?? '로그인된 사용자'} · 연결됨',
+              Text(user == null ? 'Google 계정으로 Firebase에 연결할 수 있어요.' : '연결됨',
                   style:
                       const TextStyle(color: Color(0xFF8E8E93), fontSize: 12)),
               const SizedBox(height: 14),
@@ -4673,7 +5094,7 @@ class _SettingsPageState extends State<SettingsPage> {
                             signingIn
                                 ? '로그인 중...'
                                 : user == null
-                                    ? 'Google로 로그인'
+                                    ? 'Google 로그인'
                                     : '로그아웃',
                             style: const TextStyle(
                                 fontSize: 13, fontWeight: FontWeight.w700)),
@@ -4934,7 +5355,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 Tooltip(
                   message: '컴퓨터 브라우저에서 같은 ChatGPT 계정으로 로그인하세요.\n'
                       '사용할 대화방을 열고 주소창의\n'
-                      'https://chatgpt.com/c/... URL을 복사해 붙여넣어 주세요.',
+                      'https://chatgpt.com/c/... 또는 chatgpt.com/g/... URL을 복사해 붙여넣어 주세요.',
                   triggerMode: TooltipTriggerMode.tap,
                   child: const Padding(
                     padding: EdgeInsets.all(8),
@@ -5007,21 +5428,6 @@ class _SettingsPageState extends State<SettingsPage> {
                 if (mounted) setState(() {});
               },
             ),
-          ),
-        ),
-        const SizedBox(height: 20),
-        const _SectionTitle('기본 세션 크기'),
-        Card(
-          child: ListTile(
-            key: const ValueKey('session-size-setting'),
-            leading: const Icon(Icons.view_carousel_outlined, color: sea),
-            title: const Text('세션당 기본 단어 수',
-                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
-            subtitle: Text('현재 ${widget.store.sessionSize}개'),
-            trailing: const Text('변경',
-                style: TextStyle(
-                    color: sea, fontSize: 12, fontWeight: FontWeight.w700)),
-            onTap: editSessionSize,
           ),
         ),
         const SizedBox(height: 20),
@@ -5111,7 +5517,7 @@ class _SettingsPageState extends State<SettingsPage> {
               const Text(
                 'ChatGPT 앱의 공유 링크가 아니라,\n'
                 '브라우저 주소창에 보이는\n'
-                'chatgpt.com/c/... 대화 URL을 입력해 주세요.',
+                'chatgpt.com/c/... 또는 chatgpt.com/g/... 대화 URL을 입력해 주세요.',
                 style: TextStyle(color: Color(0xFF6E6E73), fontSize: 12),
               ),
               const SizedBox(height: 12),
@@ -5146,7 +5552,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 final normalized = normalizeChatGptConversationUrl(input);
                 if (normalized == null) {
                   setDialogState(() => errorText =
-                      'https://chatgpt.com/c/... 형식의 대화 URL을 입력해 주세요.');
+                      'https://chatgpt.com/c/... 또는 https://chatgpt.com/g/... 형식의 대화 URL을 입력해 주세요.');
                   return;
                 }
                 Navigator.pop(context, normalized);

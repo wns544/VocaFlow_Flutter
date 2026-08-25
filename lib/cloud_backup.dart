@@ -1,9 +1,25 @@
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
 import 'cloud_change_tracker.dart';
 import 'models.dart';
 import 'store.dart';
+
+class CloudQuotaExceededException implements Exception {
+  const CloudQuotaExceededException();
+
+  @override
+  String toString() => 'CloudQuotaExceededException';
+}
+
+class CloudSyncTimeoutException implements Exception {
+  const CloudSyncTimeoutException();
+
+  @override
+  String toString() => 'CloudSyncTimeoutException';
+}
 
 class CloudBookOverview {
   const CloudBookOverview({
@@ -71,6 +87,21 @@ class CloudBackup {
   final FirebaseAuth auth;
   final FirebaseFirestore firestore;
 
+  static const _operationTimeout = Duration(seconds: 90);
+
+  Future<T> _runCloudOperation<T>(Future<T> Function() operation) async {
+    try {
+      return await operation().timeout(_operationTimeout);
+    } on FirebaseException catch (error) {
+      if (error.code == 'resource-exhausted') {
+        throw const CloudQuotaExceededException();
+      }
+      rethrow;
+    } on TimeoutException {
+      throw const CloudSyncTimeoutException();
+    }
+  }
+
   User get _user {
     final current = auth.currentUser;
     if (current == null) {
@@ -88,13 +119,26 @@ class CloudBackup {
   CollectionReference<Map<String, dynamic>> get _booksRef =>
       firestore.collection('users').doc(_user.uid).collection('vocabBooks');
 
-  Future<bool> hasBackup() async => (await _profileRef.get()).exists;
+  Future<bool> hasBackup() =>
+      _runCloudOperation(() async => (await _profileRef.get()).exists);
 
   Future<void> uploadIncremental(
-      VocaStore store, CloudChangeSnapshot changes) async {
-    if (changes.isEmpty) return;
+    VocaStore store,
+    CloudChangeSnapshot changes, {
+    bool forceProfile = false,
+  }) =>
+      _runCloudOperation(
+        () => _uploadIncremental(store, changes, forceProfile: forceProfile),
+      );
+
+  Future<void> _uploadIncremental(
+    VocaStore store,
+    CloudChangeSnapshot changes, {
+    required bool forceProfile,
+  }) async {
+    if (changes.isEmpty && !forceProfile) return;
     final backup = store.toBackupJson();
-    if (changes.profileDirty) {
+    if (changes.profileDirty || forceProfile) {
       await _profileRef.set(_profileData(store, backup));
     }
 
@@ -152,7 +196,10 @@ class CloudBackup {
     await commitIfNeeded(force: true);
   }
 
-  Future<void> upload(VocaStore store) async {
+  Future<void> upload(VocaStore store) =>
+      _runCloudOperation(() => _upload(store));
+
+  Future<void> _upload(VocaStore store) async {
     final backup = store.toBackupJson();
     final remoteBooks = await _booksRef.get();
     await _profileRef.set(_profileData(store, backup));
@@ -219,7 +266,10 @@ class CloudBackup {
     await commitIfNeeded(force: true);
   }
 
-  Future<Map<String, dynamic>> downloadBackupJson() async {
+  Future<Map<String, dynamic>> downloadBackupJson() =>
+      _runCloudOperation(_downloadBackupJson);
+
+  Future<Map<String, dynamic>> _downloadBackupJson() async {
     final profile = await _profileRef.get();
     if (!profile.exists) {
       throw StateError('No cloud backup found.');
@@ -246,6 +296,9 @@ class CloudBackup {
 
     return {
       'version': profileData['version'] as int? ?? 1,
+      'rangeCourseSchema': profileData['rangeCourseSchema'] as int? ?? 1,
+      'rangeCoursePasses':
+          profileData['rangeCoursePasses'] as Map<String, dynamic>? ?? {},
       'books': books,
       'quickBook': profileData['quickBook'] as String? ?? 'default',
       'sessionSize': profileData['sessionSize'] as int? ?? 10,
@@ -406,6 +459,8 @@ class CloudBackup {
           VocaStore store, Map<String, dynamic> backup) =>
       {
         'version': backup['version'],
+        'rangeCourseSchema': backup['rangeCourseSchema'],
+        'rangeCoursePasses': backup['rangeCoursePasses'],
         'quickBook': backup['quickBook'],
         'sessionSize': backup['sessionSize'],
         'completed': backup['completed'],

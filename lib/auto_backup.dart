@@ -20,8 +20,8 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     CloudBackup? cloud,
     Connectivity? connectivity,
     DateTime Function()? now,
-    this.idleDelay = const Duration(seconds: 60),
-    this.minimumInterval = const Duration(minutes: 5),
+    this.idleDelay = const Duration(seconds: 15),
+    this.minimumInterval = const Duration(seconds: 15),
   })  : cloud = cloud ?? CloudBackup(),
         connectivity = connectivity ?? Connectivity(),
         _now = now ?? DateTime.now;
@@ -39,6 +39,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   int? _scheduledGeneration;
   StreamSubscription<User?>? _authSubscription;
   bool _uploading = false;
+  bool _flushingForBackground = false;
   int _failureCount = 0;
 
   bool get isUploading => _uploading;
@@ -129,11 +130,31 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   Future<void> manualFullUpload() async {
     final current = user;
     if (current == null) throw StateError('Google login is required.');
-    await cloud.upload(store);
-    await store.cloudChanges.clearPending();
-    await store.cloudChanges.recordSuccess(current.uid, _now());
-    _failureCount = 0;
-    onChanged?.call();
+    try {
+      // A full snapshot is needed only when this account has no cloud data yet.
+      // Later manual syncs use the same durable change journal as auto-sync.
+      if (!initialized || !await cloud.hasBackup()) {
+        await cloud.upload(store);
+        await store.cloudChanges.clearPending();
+      } else {
+        final changes = store.cloudChanges.snapshot;
+        // A manual upload is the user's explicit "save this device now"
+        // action. Always rewrite the compact profile snapshot so the active
+        // course (queue, progress and range) cannot be skipped merely because
+        // an earlier journal acknowledgement already cleared profileDirty.
+        // Word documents still use the incremental journal below.
+        await cloud.uploadIncremental(store, changes, forceProfile: true);
+        if (!changes.isEmpty) {
+          await store.cloudChanges.acknowledge(changes);
+        }
+      }
+      await store.cloudChanges.recordSuccess(current.uid, _now());
+      _failureCount = 0;
+      onChanged?.call();
+    } catch (error) {
+      await store.cloudChanges.recordError(current.uid, error);
+      rethrow;
+    }
   }
 
   Future<void> manualRestore() async {
@@ -163,6 +184,21 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
 
   void requestImmediateBackup({bool ignoreMinimumInterval = false}) =>
       _schedule(Duration.zero, ignoreMinimumInterval: ignoreMinimumInterval);
+
+  /// Sends the durable local change journal before the app moves to background.
+  /// Android can stop the process afterwards, so this bypasses the idle delay.
+  Future<void> flushPendingBackup() async {
+    if (_flushingForBackground || _uploading || !enabled || pendingCount == 0) {
+      return;
+    }
+    _flushingForBackground = true;
+    _cancelScheduledUpload();
+    try {
+      await _uploadPending();
+    } finally {
+      _flushingForBackground = false;
+    }
+  }
 
   void _handleTrackedChange() {
     onChanged?.call();
@@ -216,16 +252,29 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     }
 
     final changes = store.cloudChanges.snapshot;
+    // The profile contains the active course's exact queue and progress.
+    // Keep that snapshot current on every batched automatic upload while a
+    // course is in progress, even if a previous acknowledgement happened to
+    // clear profileDirty before the latest local study persistence.
+    final hasActiveCourse = store.activeStudies.isNotEmpty;
     _uploading = true;
     onChanged?.call();
     try {
-      await cloud.uploadIncremental(store, changes);
+      await cloud.uploadIncremental(
+        store,
+        changes,
+        forceProfile: hasActiveCourse,
+      );
       await store.cloudChanges.acknowledge(changes);
       await store.cloudChanges.recordSuccess(current.uid, _now());
       _failureCount = 0;
       if (pendingCount > 0) _schedule(idleDelay);
     } catch (error) {
-      await _scheduleRetry(error);
+      if (error is CloudQuotaExceededException) {
+        await store.cloudChanges.recordError(current.uid, error);
+      } else {
+        await _scheduleRetry(error);
+      }
     } finally {
       _uploading = false;
       onChanged?.call();
@@ -242,6 +291,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       Duration(minutes: 5),
       Duration(minutes: 30),
     ];
+    if (_failureCount >= retryDelays.length) return;
     final index = _failureCount.clamp(0, retryDelays.length - 1);
     _failureCount++;
     _cancelScheduledUpload();
@@ -278,14 +328,8 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       return;
     }
     if (state == AppLifecycleState.paused ||
-        state == AppLifecycleState.inactive) {
-      final recent = lastSuccess;
-      if (enabled &&
-          pendingCount > 0 &&
-          !_uploading &&
-          (recent == null || _now().difference(recent) >= idleDelay)) {
-        unawaited(_uploadPending());
-      }
+        state == AppLifecycleState.detached) {
+      unawaited(flushPendingBackup());
     }
   }
 }

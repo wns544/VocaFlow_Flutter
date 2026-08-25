@@ -6,13 +6,6 @@
     <item>
         <bitmap
             android:gravity="center"
-            android:src="@mipmap/splash_translation_cards" />
-    </item>
-
-    <item
-        android:gravity="bottom|center_horizontal"
-        android:bottom="82dp">
-        <bitmap
-            android:src="@drawable/splash_text" />
+            android:src="@mipmap/splash_composition" />
     </item>
 </layer-list>

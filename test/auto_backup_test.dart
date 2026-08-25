@@ -289,6 +289,31 @@ void main() {
     expect((events.last as Map)['timestamp'], '2026-06-28T10:00:00.000');
   });
 
+  test('merge preserves independent bundle session passes', () {
+    final cloud = _backup(
+      [
+        _book('same', 'JLPT', [_word(1, 'cloud')])
+      ],
+      rangeCoursePasses: const {},
+    );
+    final local = _backup(
+      [
+        _book('same', 'JLPT', [_word(1, 'local')])
+      ],
+      rangeCoursePasses: const {
+        'same:0:50': 1,
+        'same:0:100': 2,
+      },
+    );
+
+    final merged = mergeBackupJson(cloud: cloud, local: local);
+
+    expect(merged['rangeCoursePasses'], {
+      'same:0:50': 1,
+      'same:0:100': 2,
+    });
+  });
+
   test('automatic backup configuration is stored per account', () async {
     final tracker = await CloudChangeTracker.load();
     await tracker.setInitialized('a', true);
@@ -311,6 +336,7 @@ Map<String, dynamic> _backup(
   Map<String, String> completedAt = const {},
   Map<String, String> resetMarkers = const {},
   Map<String, dynamic> activeStudies = const {},
+  Map<String, dynamic> rangeCoursePasses = const {},
   Map<String, dynamic> dailyStudyStats = const {},
   List<Map<String, dynamic>> studyEventLog = const [],
   List<String> days = const [],
@@ -324,6 +350,7 @@ Map<String, dynamic> _backup(
       'completedAt': completedAt,
       'resetMarkers': resetMarkers,
       'activeStudies': activeStudies,
+      'rangeCoursePasses': rangeCoursePasses,
       'dailyStudyStats': dailyStudyStats,
       'studyEventLog': studyEventLog,
       'studyDays': days,

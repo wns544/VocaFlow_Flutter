@@ -23,6 +23,10 @@ class ActiveStudy {
     this.sessionSelections = const {},
     this.lastWordBookId,
     this.updatedAt,
+    this.rangeStart,
+    this.rangeEnd,
+    this.sourceMode,
+    this.rangeCourseSchema = VocaStore.rangeCourseSchemaVersion,
   });
 
   final List<int> queueIds;
@@ -39,6 +43,13 @@ class ActiveStudy {
   final Map<String, List<int>> sessionSelections;
   final String? lastWordBookId;
   final DateTime? updatedAt;
+  final int? rangeStart;
+  final int? rangeEnd;
+  final String? sourceMode;
+  final int rangeCourseSchema;
+
+  bool get isRangeCourse =>
+      bookId != null && rangeStart != null && rangeEnd != null;
 
   Map<String, dynamic> toJson() => {
         'queueIds': queueIds,
@@ -55,6 +66,10 @@ class ActiveStudy {
         'sessionSelections': sessionSelections,
         'lastWordBookId': lastWordBookId,
         'updatedAt': (updatedAt ?? DateTime.now()).toIso8601String(),
+        'rangeStart': rangeStart,
+        'rangeEnd': rangeEnd,
+        'sourceMode': sourceMode,
+        'rangeCourseSchema': rangeCourseSchema,
       };
 
   factory ActiveStudy.fromJson(Map<String, dynamic> json) => ActiveStudy(
@@ -88,6 +103,11 @@ class ActiveStudy {
         updatedAt: json['updatedAt'] == null
             ? null
             : DateTime.tryParse(json['updatedAt'] as String),
+        rangeStart: (json['rangeStart'] as num?)?.toInt(),
+        rangeEnd: (json['rangeEnd'] as num?)?.toInt(),
+        sourceMode: json['sourceMode'] as String?,
+        rangeCourseSchema:
+            (json['rangeCourseSchema'] as num?)?.toInt() ?? 1,
       );
 }
 
@@ -223,6 +243,7 @@ class VocaStore {
   static const _sessionSizeKey = 'sessionSize';
   static const _completedKey = 'completed';
   static const _completedAtKey = 'completedAt';
+  static const _coursePassesKey = 'rangeCoursePassesV2';
   static const _studyDaysKey = 'studyDays';
   static const _dailyStudyStatsKey = 'dailyStudyStats';
   static const _studyEventLogKey = 'studyEventLog';
@@ -245,6 +266,8 @@ class VocaStore {
   static const _exampleMeaningFontSizeKey = 'exampleMeaningFontSize';
   static const _chatGptConversationUrlKey = 'chatGptConversationUrl';
   static const _readingMeaningMigrationKey = 'readingMeaningMigrationV1';
+  static const int rangeCourseSchemaVersion = 2;
+  static const _rangeCourseMigrationKey = 'rangeCourseMigrationV4';
   static const studyEventLogMaxItems = 3000;
   static const studyEventLogMaxAge = Duration(days: 90);
 
@@ -264,8 +287,19 @@ class VocaStore {
     store.books = store._loadBooks();
     store.cloudChanges = await CloudChangeTracker.load();
     store.wordSearch = LocalWordSearchIndex(() => store.books);
+    await store._migrateRangeCourses();
     await store._repairSwappedJapaneseFields();
     return store;
+  }
+
+  Future<void> _migrateRangeCourses() async {
+    if (_prefs.getBool(_rangeCourseMigrationKey) ?? false) return;
+    final studies = Map<String, ActiveStudy>.from(activeStudies);
+    studies.removeWhere((_, active) => active.isRangeCourse);
+    await _saveActiveStudies(studies);
+    await _prefs.remove(_activeStudyKey);
+    await _prefs.setBool(_rangeCourseMigrationKey, true);
+    await cloudChanges.markProfile();
   }
 
   WordBook get quickBook {
@@ -543,6 +577,67 @@ class VocaStore {
     return '${bookId ?? "unknown"}:$sortedIdx';
   }
 
+  String currentCourseKey(String bookId) => '$bookId:current';
+
+  ActiveStudy? activeCourseForBook(String bookId) {
+    final active = activeStudies[currentCourseKey(bookId)];
+    if (active == null || !active.isRangeCourse) return null;
+    if (active.rangeCourseSchema < rangeCourseSchemaVersion ||
+        resolveActiveWords(active).isEmpty) return null;
+    return active;
+  }
+
+  List<Word> wordsForRange(String bookId, int rangeStart, int rangeEnd) {
+    final book = books.where((item) => item.id == bookId).firstOrNull;
+    if (book == null) return const [];
+    final start = rangeStart.clamp(0, book.words.length).toInt();
+    final end = rangeEnd.clamp(start, book.words.length).toInt();
+    return book.words.sublist(start, end);
+  }
+
+  List<Word> unmemorizedWordsForRange(
+          String bookId, int rangeStart, int rangeEnd) =>
+      wordsForRange(bookId, rangeStart, rangeEnd)
+          .where((word) => word.state != StudyState.memorized)
+          .toList();
+
+  bool isRangeFullyMemorized(String bookId, int rangeStart, int rangeEnd) {
+    final words = wordsForRange(bookId, rangeStart, rangeEnd);
+    return words.isNotEmpty &&
+        words.every((word) => word.state == StudyState.memorized);
+  }
+
+  Future<ActiveStudy?> reopenIncompleteRangeCourse(
+      String bookId, int rangeStart, int rangeEnd) async {
+    final key = '$bookId:$rangeStart:$rangeEnd';
+    final passes = Map<String, int>.from(coursePasses);
+    if ((passes[key] ?? 0) <= 0) return null;
+    final words = wordsForRange(bookId, rangeStart, rangeEnd);
+    if (words.isEmpty) return null;
+
+    passes.remove(key);
+    await _prefs.setString(_coursePassesKey, jsonEncode(passes));
+    final active = ActiveStudy(
+      queueIds: words.map((word) => word.id).toList(),
+      queueBookIds: List.filled(words.length, bookId),
+      total: words.length,
+      memorized: 0,
+      sessionIndexes: const [],
+      reviewed: const [],
+      revealed: false,
+      bookId: bookId,
+      rangeStart: rangeStart,
+      rangeEnd: rangeEnd,
+      sourceMode: 'cumulative',
+      rangeCourseSchema: rangeCourseSchemaVersion,
+      updatedAt: DateTime.now(),
+    );
+    await saveActiveStudyFor(currentCourseKey(bookId), active,
+        markCloudChange: false);
+    await cloudChanges.markProfile();
+    return activeCourseForBook(bookId);
+  }
+
   ActiveStudy? getActiveStudyFor(String key) {
     final active = activeStudies[key];
     if (active == null || isActiveStudyCompleted(active)) return null;
@@ -580,6 +675,13 @@ class VocaStore {
   Future<void> saveActiveStudyFor(String key, ActiveStudy active,
       {bool markCloudChange = true}) async {
     final studies = Map<String, ActiveStudy>.from(activeStudies);
+    final resolvedKey = active.isRangeCourse && active.bookId != null
+        ? currentCourseKey(active.bookId!)
+        : key;
+    if (active.isRangeCourse && active.bookId != null) {
+      studies.removeWhere((studyKey, study) =>
+          study.bookId == active.bookId && study.isRangeCourse);
+    }
     final updatedActive = ActiveStudy(
       queueIds: active.queueIds,
       queueBookIds: active.queueBookIds,
@@ -594,9 +696,13 @@ class VocaStore {
       undoHistory: active.undoHistory,
       sessionSelections: active.sessionSelections,
       lastWordBookId: active.lastWordBookId,
+      rangeStart: active.rangeStart,
+      rangeEnd: active.rangeEnd,
+      sourceMode: active.sourceMode,
+      rangeCourseSchema: active.rangeCourseSchema,
       updatedAt: DateTime.now(),
     );
-    studies[key] = updatedActive;
+    studies[resolvedKey] = updatedActive;
     if (studies.length > 20) {
       final sortedKeys = studies.keys.toList()
         ..sort((a, b) {
@@ -631,6 +737,11 @@ class VocaStore {
       if (markCloudChange) await cloudChanges.markProfile();
     }
   }
+
+  Future<void> clearActiveCourseForBook(String bookId,
+          {bool markCloudChange = true}) =>
+      clearActiveStudyFor(currentCourseKey(bookId),
+          markCloudChange: markCloudChange);
 
   Future<void> clearAllActiveStudies({bool markCloudChange = true}) async {
     _activeStudiesCache = const {};
@@ -786,6 +897,21 @@ class VocaStore {
     return completed.contains('$bookId:$sessionIndex');
   }
 
+  Map<String, int> get coursePasses {
+    final raw = _prefs.getString(_coursePassesKey);
+    if (raw == null) return const {};
+    try {
+      return (jsonDecode(raw) as Map<String, dynamic>).map(
+        (key, value) => MapEntry(key, (value as num).toInt()),
+      );
+    } catch (_) {
+      return const {};
+    }
+  }
+
+  int coursePassesFor(String bookId, int start, int end) =>
+      coursePasses['$bookId:$start:$end'] ?? 0;
+
   int nextSessionIndex(WordBook book) {
     final completed = (_prefs.getStringList(_completedKey) ?? []).toSet();
     for (var index = 0; index < sessionCount(book); index++) {
@@ -880,11 +1006,13 @@ class VocaStore {
   Future<bool> setChatGptConversationUrl(String value) async {
     if (value.trim().isEmpty) {
       await _prefs.remove(_chatGptConversationUrlKey);
+      await cloudChanges.markProfile();
       return true;
     }
     final normalized = normalizeChatGptConversationUrl(value);
     if (normalized == null) return false;
     await _prefs.setString(_chatGptConversationUrlKey, normalized);
+    await cloudChanges.markProfile();
     return true;
   }
 
@@ -978,6 +1106,23 @@ class VocaStore {
     await _clearActiveStudiesForSessions(bookId, completedIndexes);
     await cloudChanges.markProfile();
     onSessionCompleted?.call();
+  }
+
+  Future<bool> completeRangeCourse(
+      String bookId, int rangeStart, int rangeEnd) async {
+    final passes = Map<String, int>.from(coursePasses);
+    final key = '$bookId:$rangeStart:$rangeEnd';
+    passes[key] = (passes[key] ?? 0) + 1;
+    await _prefs.setString(_coursePassesKey, jsonEncode(passes));
+    final now = DateTime.now();
+    await _recordCompletedSessions(now, 1);
+    final days = (_prefs.getStringList(_studyDaysKey) ?? []).toSet()
+      ..add(_dayKey(now));
+    await _prefs.setStringList(_studyDaysKey, days.toList());
+    await clearActiveCourseForBook(bookId, markCloudChange: false);
+    await cloudChanges.markProfile();
+    onSessionCompleted?.call();
+    return true;
   }
 
   Future<void> deleteBook(String id) async {
@@ -1083,7 +1228,9 @@ class VocaStore {
   }
 
   Map<String, dynamic> toBackupJson() => {
-        'version': 1,
+        'version': 3,
+        'rangeCourseSchema': rangeCourseSchemaVersion,
+        'rangeCoursePasses': coursePasses,
         'books': books.map((book) => book.toJson()).toList(),
         'quickBook': _prefs.getString(_quickBookKey) ?? 'default',
         'sessionSize': sessionSize,
@@ -1149,6 +1296,11 @@ class VocaStore {
     await _prefs.setStringList(
       _completedKey,
       (json['completed'] as List<dynamic>? ?? []).cast<String>(),
+    );
+    await _prefs.setString(
+      _coursePassesKey,
+      jsonEncode(
+          json['rangeCoursePasses'] as Map<String, dynamic>? ?? const {}),
     );
     await _saveCompletedAt(
       (json['completedAt'] as Map<String, dynamic>? ?? const {}).map(
@@ -1229,6 +1381,8 @@ class VocaStore {
     if (value is! Map) return null;
     try {
       final active = ActiveStudy.fromJson(Map<String, dynamic>.from(value));
+      if (active.isRangeCourse &&
+          active.rangeCourseSchema < rangeCourseSchemaVersion) return null;
       return active.queueIds.isEmpty ? null : active;
     } catch (_) {
       return null;

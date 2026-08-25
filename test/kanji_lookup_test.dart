@@ -69,6 +69,16 @@ void main() {
       ),
       'https://chatgpt.com/c/conversation-id',
     );
+    expect(
+      normalizeChatGptConversationUrl(
+        'https://chatgpt.com/g/g-p-6a845008a9488191b115ae328a2792d3-ilboneogongbu/c/6a84500e-0cd4-83e8-b51d-ba27086dc1ae?temporary=true#bottom',
+      ),
+      'https://chatgpt.com/g/g-p-6a845008a9488191b115ae328a2792d3-ilboneogongbu/c/6a84500e-0cd4-83e8-b51d-ba27086dc1ae',
+    );
+    expect(
+      normalizeChatGptConversationUrl('https://chatgpt.com/g/custom-gpt/c/'),
+      isNull,
+    );
     expect(normalizeChatGptConversationUrl('https://example.com/c/id'), isNull);
     expect(normalizeChatGptConversationUrl('https://chatgpt.com/'), isNull);
     final chatGptUri = chatGptPromptUri(

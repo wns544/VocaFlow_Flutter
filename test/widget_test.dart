@@ -384,6 +384,8 @@ void main() {
     expect(find.byKey(const ValueKey('study-card')), findsNothing);
     expect((await VocaStore.load()).activeStudy, isNotNull);
 
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
     await tester.tap(find.byKey(const ValueKey('home-action-study')));
     await tester.pumpAndSettle();
     await tester.tap(find.byIcon(Icons.arrow_back));
@@ -391,6 +393,51 @@ void main() {
     expect(find.text('학습을 나갈까요?'), findsNothing);
     expect(find.byKey(const ValueKey('study-card')), findsNothing);
     expect((await VocaStore.load()).activeStudy, isNotNull);
+  });
+
+  testWidgets('active home study can choose another No. course from favorites',
+      (WidgetTester tester) async {
+    final book = WordBook(
+      id: 'course-picker-book',
+      name: 'Course picker',
+      isFavorite: true,
+      words: List.generate(
+        100,
+        (index) => Word(
+          id: 50000 + index,
+          term: 'word-$index',
+          reading: '',
+          meaning: 'meaning-$index',
+        ),
+      ),
+    );
+    SharedPreferences.setMockInitialValues({
+      'books': jsonEncode([book.toJson()]),
+      'quickBook': book.id,
+      'rangeCourseMigrationV3': true,
+    });
+    await tester.pumpWidget(const VocaFlowApp());
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('home-action-study')));
+    await tester.pumpAndSettle();
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+
+    expect(
+        find.byKey(const ValueKey('home-change-study-course')), findsNothing);
+    await tester.tap(find.byKey(ValueKey('favorite-sessions-${book.id}')));
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byKey(ValueKey('favorite-${book.id}-course-0-100')),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(
+        (await VocaStore.load()).activeCourseForBook(book.id)?.rangeEnd, 100);
   });
 
   testWidgets('selects sessions across multiple favorite word books',
@@ -491,6 +538,8 @@ void main() {
   testWidgets('favorite book appears on the study tab',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({});
+    final firstCourseEnd =
+        min(50, (await VocaStore.load()).books.first.words.length);
     await tester.pumpWidget(const VocaFlowApp());
     await tester.pumpAndSettle();
 
@@ -513,8 +562,14 @@ void main() {
     );
     await tester.tap(favoriteHeader);
     await tester.pumpAndSettle();
-    expect(find.byKey(const ValueKey('favorite-default-session-0')),
-        findsOneWidget);
+    expect(
+      find.byKey(ValueKey('favorite-default-course-0-$firstCourseEnd')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('favorite-default-session-0')),
+      findsNothing,
+    );
   });
 
   testWidgets('favorite list scroll collapses and restores the home header',
@@ -595,38 +650,6 @@ void main() {
 
     expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
     expect(find.text('mistake'), findsOneWidget);
-  });
-
-  testWidgets('completed favorite session ignores stale saved resume',
-      (WidgetTester tester) async {
-    SharedPreferences.setMockInitialValues({
-      'completed': ['default:0'],
-    });
-    final store = await VocaStore.load();
-    final book = store.books.first..isFavorite = true;
-    await store.updateBook(book);
-    final firstSession = book.sessions(store.sessionSize).first;
-    await store.saveActiveStudy(ActiveStudy(
-      queueIds: firstSession.words.skip(6).map((word) => word.id).toList(),
-      queueBookIds: firstSession.words.skip(6).map((_) => book.id).toList(),
-      total: firstSession.words.length,
-      memorized: 6,
-      reviewed: const [],
-      revealed: false,
-      bookId: book.id,
-      sessionIndexes: const [0],
-    ));
-
-    await tester.pumpWidget(const VocaFlowApp());
-    await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const ValueKey('favorite-sessions-default')));
-    await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const ValueKey('favorite-default-session-0')));
-    await tester.pumpAndSettle();
-
-    expect(find.textContaining('4개 남음'), findsNothing);
-    expect(find.textContaining('${firstSession.words.length}개 남음'),
-        findsOneWidget);
   });
 
   testWidgets('horizontal reversed swipe uses the opposite decision color',
@@ -796,7 +819,7 @@ void main() {
 
     final firstKanji = find.byKey(const ValueKey('copy-han-0'));
     await tester.tap(firstKanji);
-    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pumpAndSettle();
     expect(
         find.byKey(const ValueKey('kanji-detail-character')), findsOneWidget);
     expect(find.text('남길 유'), findsOneWidget);
@@ -825,15 +848,20 @@ void main() {
     expect(wordChatGptUrl.path, '/c/study-kanji');
     expect(wordChatGptUrl.queryParameters['q'], contains('한자 조합'));
 
-    Navigator.of(tester.element(
-            find.byKey(const ValueKey('kanji-detail-character'))))
+    Navigator.of(tester
+            .element(find.byKey(const ValueKey('kanji-detail-character'))))
         .pop();
+    await tester.pumpAndSettle();
+    ScaffoldMessenger.of(tester.element(firstKanji)).clearSnackBars();
     await tester.pumpAndSettle();
 
     await tester.tap(firstKanji);
     await tester.pump(const Duration(milliseconds: 50));
     await tester.tap(firstKanji);
     await tester.pump(const Duration(milliseconds: 400));
+    await tester.idle();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
     expect(copiedTexts, ['遺']);
     expect(find.text('“遺” 복사 완료'), findsOneWidget);
 
@@ -1288,15 +1316,15 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.textContaining('chatgpt.com/c/'), findsWidgets);
 
-    await tester.enterText(
-        input, 'https://chatgpt.com/c/hanja-study?temporary=true');
+    await tester.enterText(input,
+        'https://chatgpt.com/g/g-p-japanese-study/c/hanja-study?temporary=true#bottom');
     await tester
         .tap(find.byKey(const ValueKey('save-chatgpt-conversation-url')));
     await tester.pumpAndSettle();
 
     final reloaded = await VocaStore.load();
-    expect(
-        reloaded.chatGptConversationUrl, 'https://chatgpt.com/c/hanja-study');
+    expect(reloaded.chatGptConversationUrl,
+        'https://chatgpt.com/g/g-p-japanese-study/c/hanja-study');
   });
 
   testWidgets('Japanese font dropdown fits a narrow settings screen',
@@ -1338,5 +1366,183 @@ void main() {
       find.byType(ReorderableListView),
     );
     expect(reorderable.proxyDecorator, isNotNull);
+  });
+
+  test('range completion is independent of global word history', () async {
+    final book = WordBook(
+      id: 'range-completion-book',
+      name: 'Range completion',
+      words: List.generate(
+        100,
+        (index) => Word(
+          id: 20000 + index,
+          term: 'word-$index',
+          reading: '',
+          meaning: 'meaning-$index',
+          state: index < 68 ? StudyState.memorized : StudyState.review,
+        ),
+      ),
+    );
+    SharedPreferences.setMockInitialValues({
+      'books': jsonEncode([book.toJson()]),
+      'quickBook': book.id,
+      'rangeCourseMigrationV4': true,
+    });
+    final store = await VocaStore.load();
+
+    expect(await store.completeRangeCourse(book.id, 0, 100), isTrue);
+    expect(store.coursePassesFor(book.id, 0, 100), 1);
+
+    // Global word states do not determine any overlapping range course.
+    expect(await store.completeRangeCourse(book.id, 0, 50), isTrue);
+    expect(store.coursePassesFor(book.id, 0, 50), 1);
+    expect(store.coursePassesFor(book.id, 0, 100), 1);
+
+    for (final word in store.books.single.words) {
+      word.state = StudyState.memorized;
+    }
+    await store.updateBook(store.books.single);
+
+    expect(await store.completeRangeCourse(book.id, 0, 100), isTrue);
+    expect(store.coursePassesFor(book.id, 0, 100), 2);
+  });
+
+  test('reopening a range resets only that range progress', () async {
+    final book = WordBook(
+      id: 'range-repair-book',
+      name: 'Range repair',
+      words: List.generate(
+        100,
+        (index) => Word(
+          id: 21000 + index,
+          term: 'word-$index',
+          reading: '',
+          meaning: 'meaning-$index',
+          state: index < 68 ? StudyState.memorized : StudyState.review,
+          wrongCount: index == 99 ? 7 : 0,
+        ),
+      ),
+    );
+    SharedPreferences.setMockInitialValues({
+      'books': jsonEncode([book.toJson()]),
+      'quickBook': book.id,
+      'rangeCourseMigrationV3': true,
+      'rangeCoursePassesV2': jsonEncode({'${book.id}:0:100': 1}),
+    });
+    final store = await VocaStore.load();
+
+    final repaired = await store.reopenIncompleteRangeCourse(book.id, 0, 100);
+
+    expect(repaired, isNotNull);
+    expect(repaired!.total, 100);
+    expect(repaired.memorized, 0);
+    expect(repaired.queueIds, hasLength(100));
+    expect(store.coursePassesFor(book.id, 0, 100), 0);
+    expect(store.activeCourseForBook(book.id)?.rangeEnd, 100);
+    expect(store.books.single.words.last.wrongCount, 7);
+  });
+
+  testWidgets('completed range shows historical 100/100 even if states change',
+      (WidgetTester tester) async {
+    final book = WordBook(
+      id: 'completed-range-display',
+      name: 'Completed range',
+      isFavorite: true,
+      words: List.generate(
+        100,
+        (index) => Word(
+          id: 51000 + index,
+          term: 'word-$index',
+          reading: '',
+          meaning: 'meaning-$index',
+          state: index < 68 ? StudyState.memorized : StudyState.review,
+        ),
+      ),
+    );
+    SharedPreferences.setMockInitialValues({
+      'books': jsonEncode([book.toJson()]),
+      'quickBook': book.id,
+      'rangeCourseMigrationV3': true,
+      'rangeCoursePassesV2': jsonEncode({'${book.id}:0:100': 1}),
+    });
+
+    await tester.pumpWidget(const VocaFlowApp());
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(ValueKey('favorite-sessions-${book.id}')));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('누적 암기 100/100 · 1회독 완료'), findsOneWidget);
+    expect(find.textContaining('남은 32개 이어서'), findsNothing);
+  });
+
+  testWidgets('overlapping bundle sessions keep independent progress',
+      (WidgetTester tester) async {
+    final book = WordBook(
+      id: 'independent-bundle-progress',
+      name: 'Independent bundles',
+      isFavorite: true,
+      words: List.generate(
+        100,
+        (index) => Word(
+          id: 52000 + index,
+          term: 'word-$index',
+          reading: '',
+          meaning: 'meaning-$index',
+          state: index < 50 ? StudyState.memorized : StudyState.fresh,
+        ),
+      ),
+    );
+    SharedPreferences.setMockInitialValues({
+      'books': jsonEncode([book.toJson()]),
+      'quickBook': book.id,
+      'rangeCourseMigrationV3': true,
+      'rangeCoursePassesV2': jsonEncode({'${book.id}:0:50': 1}),
+    });
+
+    await tester.pumpWidget(const VocaFlowApp());
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(ValueKey('favorite-sessions-${book.id}')));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.textContaining('누적 암기 50/50 · 1회독 완료'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('누적 암기 0/100'), findsOneWidget);
+    expect(find.textContaining('누적 암기 50/100'), findsNothing);
+  });
+
+  testWidgets('home starts the suggested cumulative range directly',
+      (WidgetTester tester) async {
+    final book = WordBook(
+      id: 'home-range-book',
+      name: 'Home range',
+      words: List.generate(
+        103,
+        (index) => Word(
+          id: 22000 + index,
+          term: 'word-$index',
+          reading: '',
+          meaning: 'meaning-$index',
+        ),
+      ),
+    );
+    SharedPreferences.setMockInitialValues({
+      'books': jsonEncode([book.toJson()]),
+      'quickBook': book.id,
+      'rangeCourseMigrationV3': true,
+    });
+
+    await tester.pumpWidget(const VocaFlowApp());
+    await tester.pumpAndSettle();
+
+    expect(find.text('No.0~50'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('home-action-study')));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
+    final store = await VocaStore.load();
+    expect(store.activeCourseForBook(book.id)?.rangeStart, 0);
+    expect(store.activeCourseForBook(book.id)?.rangeEnd, 50);
   });
 }
