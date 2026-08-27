@@ -117,7 +117,40 @@ Map<String, dynamic> mergeBackupJson({
     }
   });
   result['activeStudy'] = fallbackActive;
+  final dictionarySetting = _newestDictionaryOpenSetting(
+    cloud['openDictionaryInAppSetting'],
+    local['openDictionaryInAppSetting'],
+  );
+  if (dictionarySetting == null) {
+    result.remove('openDictionaryInAppSetting');
+  } else {
+    result['openDictionaryInAppSetting'] = dictionarySetting;
+  }
   return result;
+}
+
+Map<String, dynamic>? _newestDictionaryOpenSetting(
+  dynamic cloud,
+  dynamic local,
+) {
+  final cloudSetting = _dictionaryOpenSetting(cloud);
+  final localSetting = _dictionaryOpenSetting(local);
+  if (cloudSetting == null) return localSetting;
+  if (localSetting == null) return cloudSetting;
+  final cloudUpdatedAt = DateTime.parse(cloudSetting['updatedAt'] as String);
+  final localUpdatedAt = DateTime.parse(localSetting['updatedAt'] as String);
+  return localUpdatedAt.isAfter(cloudUpdatedAt) ? localSetting : cloudSetting;
+}
+
+Map<String, dynamic>? _dictionaryOpenSetting(dynamic value) {
+  if (value is! Map) return null;
+  final setting = Map<String, dynamic>.from(value);
+  final enabled = setting['value'];
+  final updatedAt = setting['updatedAt'];
+  if (enabled is! bool || updatedAt is! String) return null;
+  final parsed = DateTime.tryParse(updatedAt)?.toUtc();
+  if (parsed == null) return null;
+  return {'value': enabled, 'updatedAt': parsed.toIso8601String()};
 }
 
 Map<String, int> _mergeCoursePasses(dynamic cloud, dynamic local) {

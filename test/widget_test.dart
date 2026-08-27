@@ -28,16 +28,23 @@ void main() {
     expect(studySpeechLanguage('resilience'), 'en-US');
   });
 
-  test('review cards return within the next six to ten cards', () {
+  test('review cards return after a spacious run of new cards', () {
     final indexes = List.generate(
       100,
-      (seed) => reviewReinsertIndex(49, random: Random(seed)),
+      (seed) => reviewReinsertIndex(49, freshCards: 49, random: Random(seed)),
     );
-    expect(indexes.every((index) => index >= 6 && index <= 10), isTrue);
+    expect(indexes.every((index) => index >= 12 && index <= 18), isTrue);
     expect(indexes, isNot(contains(49)));
-    expect(reviewReinsertIndex(5, random: Random(1)), inInclusiveRange(2, 5));
-    expect(reviewReinsertIndex(2, random: Random(1)), 2);
-    expect(reviewReinsertIndex(1, random: Random(1)), 1);
+    expect(
+      reviewReinsertIndex(49, freshCards: 8, random: Random(1)),
+      inInclusiveRange(8, 13),
+    );
+    expect(
+      reviewReinsertIndex(5, freshCards: 5, random: Random(1)),
+      inInclusiveRange(4, 5),
+    );
+    expect(reviewReinsertIndex(2, freshCards: 2, random: Random(1)), 2);
+    expect(reviewReinsertIndex(1, freshCards: 1, random: Random(1)), 1);
     expect(reviewReinsertIndex(0, random: Random(1)), 0);
   });
   tearDown(() => shuffleNewStudyQueues = true);

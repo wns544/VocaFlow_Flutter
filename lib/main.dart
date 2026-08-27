@@ -55,10 +55,21 @@ List<T> shuffledStudyQueue<T>(Iterable<T> items, {Random? random}) =>
 double _lerpDouble(num start, num end, double progress) =>
     start + (end - start) * progress.clamp(0.0, 1.0);
 
-int reviewReinsertIndex(int remainingCards, {Random? random}) {
+int reviewReinsertIndex(int remainingCards, {int? freshCards, Random? random}) {
   if (remainingCards <= 0) return 0;
-  final minimumGap = remainingCards < 6 ? min(2, remainingCards) : 6;
-  final maximumGap = min(10, remainingCards);
+  // Wrong cards return after a useful run of new cards. The fresh-card count
+  // keeps a JLPT round spacious early on and naturally shortens it near the end.
+  final fresh = (freshCards ?? remainingCards).clamp(0, remainingCards);
+  final minimumGap = fresh >= 18
+      ? min(12, remainingCards)
+      : fresh >= 8
+          ? min(8, remainingCards)
+          : min(4, remainingCards);
+  final maximumGap = fresh >= 18
+      ? min(18, remainingCards)
+      : fresh >= 8
+          ? min(13, remainingCards)
+          : min(7, remainingCards);
   return minimumGap + (random ?? Random()).nextInt(maximumGap - minimumGap + 1);
 }
 
@@ -352,11 +363,11 @@ class _FlutterSplashScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return const ColoredBox(
-      color: Colors.white,
-      child: Center(
+      color: Color(0xFFF1F2F5),
+      child: SizedBox.expand(
         child: Image(
           image: AssetImage('assets/splash_design.png'),
-          width: 240,
+          fit: BoxFit.contain,
           filterQuality: FilterQuality.high,
         ),
       ),
@@ -1636,13 +1647,16 @@ class _CardStudyPageState extends State<CardStudyPage>
   late final int total;
   late final Map<Word, String> _bookIdsByWord;
   final reviewed = <String>{};
+  final seenWordIds = <int>{};
   final _primaryDrag = ValueNotifier<double>(0);
   Future<void> _persistenceChain = Future<void>.value();
   var memorized = 0;
   var revealed = false;
+  var showingExplanation = false;
   var exiting = false;
   var finishingStudy = false;
   var completionValidated = false;
+  var _undoTransitionRevision = 0;
   Word? lastWord;
   StudyState? lastState;
   final undoHistory = <StudyDecision>[];
@@ -1720,6 +1734,7 @@ class _CardStudyPageState extends State<CardStudyPage>
         memorized = resume.memorized;
       }
       reviewed.addAll(resume.reviewed);
+      seenWordIds.addAll(resume.seenWordIds);
       revealed = resume.revealed;
       lastState = resume.lastState;
       undoHistory.addAll(resume.undoHistory);
@@ -1806,6 +1821,7 @@ class _CardStudyPageState extends State<CardStudyPage>
           lastWordId: lastWord?.id,
           lastState: lastState,
           undoHistory: undoHistory,
+          seenWordIds: seenWordIds.toList(),
           sessionSelections: activeSessionSelections,
           lastWordBookId: lastWord == null ? null : _bookIdForWord(lastWord!),
           rangeStart: activeRangeStart,
@@ -1883,6 +1899,7 @@ class _CardStudyPageState extends State<CardStudyPage>
   void decide(StudyState state) {
     if (queue.isEmpty) return;
     final word = queue.removeAt(0);
+    seenWordIds.add(word.id);
     final previousState = word.state;
     lastWord = word;
     lastState = state;
@@ -1896,11 +1913,16 @@ class _CardStudyPageState extends State<CardStudyPage>
       memorized++;
     } else {
       reviewed.add(word.term);
-      final insertAt = reviewReinsertIndex(queue.length);
+      final freshCards = queue
+          .where((candidate) => !seenWordIds.contains(candidate.id))
+          .length;
+      final insertAt =
+          reviewReinsertIndex(queue.length, freshCards: freshCards);
       queue.insert(insertAt, word);
     }
     word.state = state;
     revealed = false;
+    showingExplanation = false;
     if (queue.isEmpty && !finishingStudy) {
       finishingStudy = true;
       _persistenceChain = _persistenceChain.then((_) async {
@@ -1994,6 +2016,10 @@ class _CardStudyPageState extends State<CardStudyPage>
   }
 
   void toggleReveal(Word word) {
+    if (showingExplanation) {
+      setState(() => showingExplanation = false);
+      return;
+    }
     final shouldReveal = !revealed;
     setState(() => revealed = shouldReveal);
     persistStudy();
@@ -2001,6 +2027,14 @@ class _CardStudyPageState extends State<CardStudyPage>
     if (shouldReveal) {
       speakStudyWord(word.reading.trim().isEmpty ? word.term : word.reading);
     }
+  }
+
+  void showExplanation(Word word) {
+    if (word.explanation.trim().isEmpty) return;
+    setState(() {
+      showingExplanation = true;
+      revealed = false;
+    });
   }
 
   Widget revealSlot({required bool visible, required Widget child}) =>
@@ -2020,100 +2054,159 @@ class _CardStudyPageState extends State<CardStudyPage>
           fontSize: widget.store.readingFontSize,
           fontFamily: japaneseFontFamily(widget.store) ?? 'monospace'));
 
-  Widget cardFace(Word word, bool back) => Padding(
-        padding: const EdgeInsets.all(26),
-        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-          const SizedBox(height: 20),
-          if (widget.store.readingAboveTerm)
-            SizedBox(
-              height: widget.store.readingFontSize * 1.45 + 12,
-              child: AnimatedOpacity(
-                opacity: back ? 1 : 0,
-                duration: const Duration(milliseconds: 240),
-                curve: Curves.easeOut,
-                child: Align(
-                  alignment: Alignment.bottomCenter,
-                  child: Padding(
-                    padding: const EdgeInsets.only(bottom: 12),
-                    child: readingText(word),
-                  ),
-                ),
+  Widget cardFace(Word word, bool back) => Stack(
+        children: [
+          if (!back && word.explanation.trim().isNotEmpty)
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onLongPress: () => showExplanation(word),
               ),
             ),
-          Center(
-            child: Row(mainAxisSize: MainAxisSize.min, children: [
-              const SizedBox(width: 40),
-              Flexible(
-                child: FittedBox(
-                  fit: BoxFit.scaleDown,
-                  child: _TappableHanTerm(
-                    term: word.term,
-                    style: TextStyle(
-                        color: ink,
-                        fontSize: widget.store.termFontSize,
-                        fontFamily: japaneseFontFamily(widget.store),
-                        fontWeight: FontWeight.w800),
-                    onCharacterTap: (character) =>
-                        showKanjiDetails(character, word),
-                    onCharacterDoubleTap: copyText,
-                    onCharacterLongPress: copyText,
+          if (!back && word.explanation.trim().isNotEmpty) ...[
+            const Positioned(
+              top: 17,
+              left: 17,
+              child: IgnorePointer(
+                child: Icon(Icons.lightbulb_outline,
+                    size: 20, color: Color(0xFF34A853)),
+              ),
+            ),
+            const Positioned(
+              top: 17,
+              right: 17,
+              child: IgnorePointer(
+                child: Icon(Icons.lightbulb_outline,
+                    size: 20, color: Color(0xFF34A853)),
+              ),
+            ),
+          ],
+          Padding(
+            padding: const EdgeInsets.all(26),
+            child:
+                Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+              const SizedBox(height: 20),
+              if (widget.store.readingAboveTerm)
+                SizedBox(
+                  height: widget.store.readingFontSize * 1.45 + 12,
+                  child: AnimatedOpacity(
+                    opacity: back ? 1 : 0,
+                    duration: const Duration(milliseconds: 240),
+                    curve: Curves.easeOut,
+                    child: Align(
+                      alignment: Alignment.bottomCenter,
+                      child: Padding(
+                        padding: const EdgeInsets.only(bottom: 12),
+                        child: readingText(word),
+                      ),
+                    ),
                   ),
                 ),
+              Center(
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  const SizedBox(width: 40),
+                  Flexible(
+                    child: FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: _TappableHanTerm(
+                        term: word.term,
+                        style: TextStyle(
+                            color: ink,
+                            fontSize: widget.store.termFontSize,
+                            fontFamily: japaneseFontFamily(widget.store),
+                            fontWeight: FontWeight.w800),
+                        onCharacterTap: (character) =>
+                            showKanjiDetails(character, word),
+                        onCharacterDoubleTap: copyText,
+                        onCharacterLongPress: copyText,
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 40,
+                    child: IconButton(
+                      key: const ValueKey('copy-word'),
+                      tooltip: '단어 복사',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: () => copyText(word.term),
+                      icon: const Icon(Icons.copy_outlined,
+                          size: 18, color: Color(0xFF8E8E93)),
+                    ),
+                  ),
+                ]),
               ),
-              SizedBox(
-                width: 40,
-                child: IconButton(
-                  key: const ValueKey('copy-word'),
-                  tooltip: '단어 복사',
-                  visualDensity: VisualDensity.compact,
-                  onPressed: () => copyText(word.term),
-                  icon: const Icon(Icons.copy_outlined,
-                      size: 18, color: Color(0xFF8E8E93)),
-                ),
-              ),
-            ]),
-          ),
-          revealSlot(
-            visible: back,
-            child: Column(children: [
-              if (!widget.store.readingAboveTerm) ...[
-                const SizedBox(height: 12),
-                readingText(word),
-              ],
-              const SizedBox(height: 8),
-              Text(word.meaning,
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                      color: ink.withValues(alpha: widget.store.meaningOpacity),
-                      fontSize: widget.store.meaningFontSize,
-                      fontFamily: japaneseFontFamily(widget.store),
-                      fontWeight:
-                          fontWeightFromValue(widget.store.meaningFontWeight))),
-              if (widget.store.showExamples && word.example.isNotEmpty) ...[
-                const SizedBox(height: 28),
-                Text(word.example,
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                        fontSize: widget.store.exampleFontSize,
-                        fontFamily: japaneseFontFamily(widget.store))),
-                if (word.exampleMeaning.isNotEmpty) ...[
-                  const SizedBox(height: 6),
-                  Text(word.exampleMeaning,
+              revealSlot(
+                visible: back,
+                child: Column(children: [
+                  if (!widget.store.readingAboveTerm) ...[
+                    const SizedBox(height: 12),
+                    readingText(word),
+                  ],
+                  const SizedBox(height: 8),
+                  Text(word.meaning,
                       textAlign: TextAlign.center,
                       style: TextStyle(
-                          color: Colors.black54,
-                          fontSize: widget.store.exampleMeaningFontSize,
-                          fontFamily: japaneseFontFamily(widget.store))),
-                ],
-              ],
+                          color: ink.withValues(
+                              alpha: widget.store.meaningOpacity),
+                          fontSize: widget.store.meaningFontSize,
+                          fontFamily: japaneseFontFamily(widget.store),
+                          fontWeight: fontWeightFromValue(
+                              widget.store.meaningFontWeight))),
+                  if (widget.store.showExamples && word.example.isNotEmpty) ...[
+                    const SizedBox(height: 28),
+                    Text(word.example,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                            fontSize: widget.store.exampleFontSize,
+                            fontFamily: japaneseFontFamily(widget.store))),
+                    if (word.exampleMeaning.isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      Text(word.exampleMeaning,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                              color: Colors.black54,
+                              fontSize: widget.store.exampleMeaningFontSize,
+                              fontFamily: japaneseFontFamily(widget.store))),
+                    ],
+                  ],
+                ]),
+              ),
+              const Spacer(),
+              Text(back ? '탭하여 숨기기' : '탭하여 정답 보기',
+                  style:
+                      const TextStyle(color: Color(0x338E8E93), fontSize: 11)),
             ]),
           ),
-          const Spacer(),
-          Text(back ? '탭하여 숨기기' : '탭하여 정답 보기',
-              style: const TextStyle(color: Color(0x338E8E93), fontSize: 11)),
+        ],
+      );
+  Widget explanationFace(Word word) => Padding(
+        padding: const EdgeInsets.all(30),
+        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+          const Icon(Icons.lightbulb_rounded,
+              color: Color(0xFF34A853), size: 34),
+          const SizedBox(height: 16),
+          const Text('설명',
+              style: TextStyle(
+                  color: ink, fontSize: 18, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 16),
+          Flexible(
+            child: SingleChildScrollView(
+              child: Text(
+                word.explanation.trim(),
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                    color: ink.withValues(alpha: .82),
+                    fontSize: widget.store.meaningFontSize,
+                    height: 1.55,
+                    fontFamily: japaneseFontFamily(widget.store)),
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          const Text('탭하여 카드로 돌아가기',
+              style: TextStyle(color: Color(0x338E8E93), fontSize: 11)),
         ]),
       );
-
   Future<void> undo() async {
     if (undoHistory.isEmpty) return;
     final undone = undoHistory.removeLast();
@@ -2127,6 +2220,9 @@ class _CardStudyPageState extends State<CardStudyPage>
     if (word == null) return;
     queue.removeWhere((item) => item.id == word.id);
     queue.insert(0, word);
+    if (!undoHistory.any((item) => item.wordId == word.id)) {
+      seenWordIds.remove(word.id);
+    }
     if (undone.decision == StudyState.memorized) memorized--;
     if (undone.decision == StudyState.review &&
         !undoHistory.any((item) =>
@@ -2145,7 +2241,9 @@ class _CardStudyPageState extends State<CardStudyPage>
             .firstOrNull;
     lastState = previous?.decision;
     await persistStudy();
-    if (mounted) setState(() {});
+    if (mounted) {
+      setState(() => _undoTransitionRevision++);
+    }
     scheduleResumeSnapshotCapture('study');
   }
 
@@ -2266,37 +2364,81 @@ class _CardStudyPageState extends State<CardStudyPage>
                       icon: Icons.keyboard_arrow_up, color: negativeColor),
                 const SizedBox(height: 12),
                 Expanded(
-                  child: _StudyCardDeck(
-                    frontId: _cardIdentity(word),
-                    backId: nextWord == null ? null : _cardIdentity(nextWord),
-                    horizontalSwipe: horizontalSwipe,
-                    onTap: () => toggleReveal(word),
-                    onPrimaryDragChanged: (value) => _primaryDrag.value = value,
-                    onDismissed: (positive) =>
-                        decide(stateForDirection(positive)),
-                    front: widget.store.flipCard
-                        ? TweenAnimationBuilder<double>(
-                            key: ValueKey('active-card-${_cardIdentity(word)}'),
-                            tween: Tween(begin: 0, end: revealed ? pi : 0),
-                            duration: const Duration(milliseconds: 420),
-                            curve: Curves.easeInOutCubic,
-                            builder: (context, angle, _) {
-                              final back = angle > pi / 2;
-                              return Transform(
-                                alignment: Alignment.center,
-                                transform: Matrix4.identity()
-                                  ..setEntry(3, 2, 0.0012)
-                                  ..rotateY(angle),
-                                child: Transform(
-                                  alignment: Alignment.center,
-                                  transform: Matrix4.rotationY(back ? pi : 0),
-                                  child: cardFace(word, back),
-                                ),
-                              );
-                            },
-                          )
-                        : cardFace(word, revealed),
-                    back: nextWord == null ? null : cardFace(nextWord, false),
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 280),
+                    switchInCurve: Curves.easeOutCubic,
+                    switchOutCurve: Curves.easeInCubic,
+                    layoutBuilder: (currentChild, previousChildren) => Stack(
+                      clipBehavior: Clip.none,
+                      fit: StackFit.expand,
+                      children: [
+                        ...previousChildren,
+                        if (currentChild != null) currentChild,
+                      ],
+                    ),
+                    transitionBuilder: (child, animation) => AnimatedBuilder(
+                      animation: animation,
+                      child: child,
+                      builder: (context, child) {
+                        final leaving =
+                            animation.status == AnimationStatus.reverse;
+                        final distance = (1 - animation.value) * .16;
+                        return Opacity(
+                          opacity: animation.value,
+                          child: Transform.translate(
+                            offset: Offset(leaving ? distance : -distance, 0),
+                            child: Transform.scale(
+                              scale: 1 - (1 - animation.value) * .035,
+                              child: child,
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                    child: KeyedSubtree(
+                      key: ValueKey('undo-card-$_undoTransitionRevision'),
+                      child: _StudyCardDeck(
+                        frontId:
+                            '${_cardIdentity(word)}:${showingExplanation ? 'explanation' : 'card'}',
+                        backId:
+                            nextWord == null ? null : _cardIdentity(nextWord),
+                        horizontalSwipe: horizontalSwipe,
+                        onTap: () => toggleReveal(word),
+                        onPrimaryDragChanged: (value) =>
+                            _primaryDrag.value = value,
+                        onDismissed: (positive) =>
+                            decide(stateForDirection(positive)),
+                        front: showingExplanation
+                            ? explanationFace(word)
+                            : widget.store.flipCard
+                                ? TweenAnimationBuilder<double>(
+                                    key: ValueKey(
+                                        'active-card-${_cardIdentity(word)}'),
+                                    tween:
+                                        Tween(begin: 0, end: revealed ? pi : 0),
+                                    duration: const Duration(milliseconds: 420),
+                                    curve: Curves.easeInOutCubic,
+                                    builder: (context, angle, _) {
+                                      final back = angle > pi / 2;
+                                      return Transform(
+                                        alignment: Alignment.center,
+                                        transform: Matrix4.identity()
+                                          ..setEntry(3, 2, 0.0012)
+                                          ..rotateY(angle),
+                                        child: Transform(
+                                          alignment: Alignment.center,
+                                          transform:
+                                              Matrix4.rotationY(back ? pi : 0),
+                                          child: cardFace(word, back),
+                                        ),
+                                      );
+                                    },
+                                  )
+                                : cardFace(word, revealed),
+                        back:
+                            nextWord == null ? null : cardFace(nextWord, false),
+                      ),
+                    ),
                   ),
                 ),
                 const SizedBox(height: 8),
@@ -2876,13 +3018,6 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
               ),
               const SizedBox(height: 8),
               OutlinedButton.icon(
-                key: const ValueKey('open-naver-hanja'),
-                onPressed: openNaver,
-                icon: const Icon(Icons.search, size: 19),
-                label: const Text('네이버 한자사전에서 보기'),
-              ),
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
                 key: const ValueKey('open-tonghanja'),
                 onPressed: openTongHanja,
                 icon: const Icon(Icons.travel_explore_outlined, size: 19),
@@ -2894,6 +3029,13 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
                 onPressed: openNihongoKanji,
                 icon: const Icon(Icons.menu_book_outlined, size: 19),
                 label: const Text('일본어 한자 공부방에서 검색'),
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                key: const ValueKey('open-naver-hanja'),
+                onPressed: openNaver,
+                icon: const Icon(Icons.search, size: 19),
+                label: const Text('네이버 한자사전에서 보기'),
               ),
               const SizedBox(height: 8),
               FilledButton.icon(
@@ -6413,6 +6555,7 @@ class _WordEditorSheetState extends State<_WordEditorSheet> {
   late final TextEditingController meaning;
   late final TextEditingController example;
   late final TextEditingController exampleMeaning;
+  late final TextEditingController explanation;
 
   @override
   void initState() {
@@ -6422,6 +6565,7 @@ class _WordEditorSheetState extends State<_WordEditorSheet> {
     meaning = TextEditingController(text: widget.word.meaning);
     example = TextEditingController(text: widget.word.example);
     exampleMeaning = TextEditingController(text: widget.word.exampleMeaning);
+    explanation = TextEditingController(text: widget.word.explanation);
   }
 
   @override
@@ -6431,6 +6575,7 @@ class _WordEditorSheetState extends State<_WordEditorSheet> {
     meaning.dispose();
     example.dispose();
     exampleMeaning.dispose();
+    explanation.dispose();
     super.dispose();
   }
 
@@ -6444,6 +6589,7 @@ class _WordEditorSheetState extends State<_WordEditorSheet> {
         meaning: meaning.text.trim(),
         example: example.text.trim(),
         exampleMeaning: exampleMeaning.text.trim(),
+        explanation: explanation.text.trim(),
       ),
     );
   }
@@ -6499,6 +6645,17 @@ class _WordEditorSheetState extends State<_WordEditorSheet> {
                 controller: exampleMeaning,
                 maxLines: 2,
                 decoration: const InputDecoration(labelText: '예문 뜻')),
+            const SizedBox(height: 10),
+            TextField(
+                key: const ValueKey('word-explanation'),
+                controller: explanation,
+                keyboardType: TextInputType.multiline,
+                textInputAction: TextInputAction.newline,
+                minLines: 3,
+                maxLines: null,
+                decoration: const InputDecoration(
+                    labelText: '설명문 (카드 빈 공간을 길게 눌러 보기)',
+                    alignLabelWithHint: true)),
           ]),
         ),
       );

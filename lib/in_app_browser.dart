@@ -33,6 +33,7 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
             }
           },
           onPageFinished: (_) async {
+            await _applyAdFilter();
             final canGoBack = await _controller.canGoBack();
             if (mounted) {
               setState(() {
@@ -44,6 +45,63 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
         ),
       )
       ..loadRequest(widget.uri);
+  }
+
+  Future<void> _applyAdFilter() async {
+    const selectors = [
+      'ins.adsbygoogle',
+      '.adsbygoogle',
+      '[data-ad-client]',
+      '[data-ad-slot]',
+      '[id^="google_ads"]',
+      '[id*="google_ads_"]',
+      'iframe[src*="doubleclick.net"]',
+      'iframe[src*="googlesyndication.com"]',
+      'iframe[src*="googleadservices.com"]',
+      '.google-auto-placed',
+      '.ad-banner',
+      '.ad-container',
+      '.ad-wrapper',
+      '.advertisement',
+      '.advertising',
+    ];
+    final selectorList = selectors.map((selector) => "'$selector'").join(',');
+    final script = '''
+(() => {
+  const selectors = [$selectorList];
+  const hideAds = () => {
+    let hidden = 0;
+    for (const selector of selectors) {
+      document.querySelectorAll(selector).forEach((element) => {
+        if (element.dataset.vocaflowAdHidden === 'true') return;
+        element.dataset.vocaflowAdHidden = 'true';
+        element.style.setProperty('display', 'none', 'important');
+        element.style.setProperty('visibility', 'hidden', 'important');
+        element.style.setProperty('height', '0', 'important');
+        element.style.setProperty('min-height', '0', 'important');
+        element.style.setProperty('margin', '0', 'important');
+        element.style.setProperty('padding', '0', 'important');
+        hidden += 1;
+      });
+    }
+    return hidden;
+  };
+  const hidden = hideAds();
+  if (!window.__vocaflowAdFilterInstalled) {
+    window.__vocaflowAdFilterInstalled = true;
+    new MutationObserver(hideAds).observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+    });
+  }
+  return String(hidden);
+})()
+''';
+    try {
+      await _controller.runJavaScriptReturningResult(script);
+    } catch (_) {
+      // A page may block script injection; the browser itself must still work.
+    }
   }
 
   Future<void> _goBack() async {

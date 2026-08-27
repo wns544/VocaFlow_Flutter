@@ -14,6 +14,7 @@ Uint8List createWordBookXlsx(WordBook book) {
     TextCellValue('reading'),
     TextCellValue('example'),
     TextCellValue('exampleMeaning'),
+    TextCellValue('explanation'),
   ]);
 
   for (final word in book.words) {
@@ -23,6 +24,7 @@ Uint8List createWordBookXlsx(WordBook book) {
       TextCellValue(word.reading),
       TextCellValue(word.example),
       TextCellValue(word.exampleMeaning),
+      TextCellValue(word.explanation),
     ]);
   }
 

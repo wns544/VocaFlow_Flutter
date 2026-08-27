@@ -8,6 +8,7 @@ class Word {
     required this.reading,
     this.example = '',
     this.exampleMeaning = '',
+    this.explanation = '',
     this.state = StudyState.fresh,
     this.correctCount = 0,
     this.wrongCount = 0,
@@ -21,6 +22,7 @@ class Word {
   final String reading;
   final String example;
   final String exampleMeaning;
+  final String explanation;
   StudyState state;
   int correctCount;
   int wrongCount;
@@ -34,6 +36,7 @@ class Word {
         'reading': reading,
         'example': example,
         'exampleMeaning': exampleMeaning,
+        'explanation': explanation,
         'state': state.name,
         'correctCount': correctCount,
         'wrongCount': wrongCount,
@@ -48,6 +51,7 @@ class Word {
         reading: json['reading'] as String? ?? '',
         example: json['example'] as String? ?? '',
         exampleMeaning: json['exampleMeaning'] as String? ?? '',
+        explanation: json['explanation'] as String? ?? '',
         correctCount: (json['correctCount'] as num?)?.toInt() ?? 0,
         wrongCount: (json['wrongCount'] as num?)?.toInt() ?? 0,
         lastStudiedAt: _dateTimeFromJson(json['lastStudiedAt']),
@@ -64,6 +68,7 @@ class Word {
     String? reading,
     String? example,
     String? exampleMeaning,
+    String? explanation,
     StudyState? state,
     int? correctCount,
     int? wrongCount,
@@ -78,6 +83,7 @@ class Word {
         reading: reading ?? this.reading,
         example: example ?? this.example,
         exampleMeaning: exampleMeaning ?? this.exampleMeaning,
+        explanation: explanation ?? this.explanation,
         state: state ?? this.state,
         correctCount: correctCount ?? this.correctCount,
         wrongCount: wrongCount ?? this.wrongCount,

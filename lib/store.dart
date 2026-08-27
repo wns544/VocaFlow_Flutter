@@ -20,6 +20,7 @@ class ActiveStudy {
     this.lastWordId,
     this.lastState,
     this.undoHistory = const [],
+    this.seenWordIds = const [],
     this.sessionSelections = const {},
     this.lastWordBookId,
     this.updatedAt,
@@ -40,6 +41,7 @@ class ActiveStudy {
   final int? lastWordId;
   final StudyState? lastState;
   final List<StudyDecision> undoHistory;
+  final List<int> seenWordIds;
   final Map<String, List<int>> sessionSelections;
   final String? lastWordBookId;
   final DateTime? updatedAt;
@@ -63,6 +65,7 @@ class ActiveStudy {
         'lastWordId': lastWordId,
         'lastState': lastState?.name,
         'undoHistory': undoHistory.map((item) => item.toJson()).toList(),
+        'seenWordIds': seenWordIds,
         'sessionSelections': sessionSelections,
         'lastWordBookId': lastWordBookId,
         'updatedAt': (updatedAt ?? DateTime.now()).toIso8601String(),
@@ -89,6 +92,9 @@ class ActiveStudy {
             .firstOrNull,
         undoHistory: (json['undoHistory'] as List<dynamic>? ?? [])
             .map((item) => StudyDecision.fromJson(item as Map<String, dynamic>))
+            .toList(),
+        seenWordIds: (json['seenWordIds'] as List<dynamic>? ?? [])
+            .map((item) => (item as num).toInt())
             .toList(),
         sessionSelections:
             (json['sessionSelections'] as Map<String, dynamic>? ?? {}).map(
@@ -265,6 +271,8 @@ class VocaStore {
   static const _exampleMeaningFontSizeKey = 'exampleMeaningFontSize';
   static const _chatGptConversationUrlKey = 'chatGptConversationUrl';
   static const _openDictionaryInAppKey = 'openDictionaryInApp';
+  static const _openDictionaryInAppUpdatedAtKey =
+      'openDictionaryInAppUpdatedAt';
   static const _readingMeaningMigrationKey = 'readingMeaningMigrationV1';
   static const int rangeCourseSchemaVersion = 2;
   static const _rangeCourseMigrationKey = 'rangeCourseMigrationV4';
@@ -286,6 +294,7 @@ class VocaStore {
     final store = VocaStore._(await SharedPreferences.getInstance());
     store.books = store._loadBooks();
     store.cloudChanges = await CloudChangeTracker.load();
+    await store._migrateOpenDictionaryInAppSetting();
     store.wordSearch = LocalWordSearchIndex(() => store.books);
     await store._migrateRangeCourses();
     await store._repairSwappedJapaneseFields();
@@ -327,6 +336,21 @@ class VocaStore {
       _prefs.getString(_chatGptConversationUrlKey) ?? '';
   bool get openDictionaryInApp =>
       _prefs.getBool(_openDictionaryInAppKey) ?? false;
+
+  DateTime? get openDictionaryInAppUpdatedAt {
+    final raw = _prefs.getString(_openDictionaryInAppUpdatedAtKey);
+    return raw == null ? null : DateTime.tryParse(raw)?.toUtc();
+  }
+
+  Map<String, dynamic>? get openDictionaryInAppSettingJson {
+    final updatedAt = openDictionaryInAppUpdatedAt;
+    if (updatedAt == null) return null;
+    return {
+      'value': openDictionaryInApp,
+      'updatedAt': updatedAt.toIso8601String(),
+    };
+  }
+
   String get targetName => _prefs.getString(_targetNameKey) ?? '';
   DateTime? get targetDate {
     final value = _prefs.getString(_targetDateKey);
@@ -585,7 +609,9 @@ class VocaStore {
     final active = activeStudies[currentCourseKey(bookId)];
     if (active == null || !active.isRangeCourse) return null;
     if (active.rangeCourseSchema < rangeCourseSchemaVersion ||
-        resolveActiveWords(active).isEmpty) return null;
+        resolveActiveWords(active).isEmpty) {
+      return null;
+    }
     return active;
   }
 
@@ -1019,8 +1045,45 @@ class VocaStore {
   }
 
   Future<void> setOpenDictionaryInApp(bool value) async {
-    await _prefs.setBool(_openDictionaryInAppKey, value);
-    await cloudChanges.markProfile();
+    final updatedAt = DateTime.now().toUtc();
+    await Future.wait([
+      _prefs.setBool(_openDictionaryInAppKey, value),
+      _prefs.setString(
+        _openDictionaryInAppUpdatedAtKey,
+        updatedAt.toIso8601String(),
+      ),
+    ]);
+    await cloudChanges.markDictionaryOpenSetting();
+  }
+
+  Future<void> applyOpenDictionaryInAppSettingFromCloud(
+    Map<String, dynamic> setting,
+  ) async {
+    final value = setting['value'];
+    final updatedAtRaw = setting['updatedAt'];
+    if (value is! bool || updatedAtRaw is! String) return;
+    final remoteUpdatedAt = DateTime.tryParse(updatedAtRaw)?.toUtc();
+    if (remoteUpdatedAt == null) return;
+    final localUpdatedAt = openDictionaryInAppUpdatedAt;
+    if (localUpdatedAt != null && !remoteUpdatedAt.isAfter(localUpdatedAt)) {
+      return;
+    }
+    await Future.wait([
+      _prefs.setBool(_openDictionaryInAppKey, value),
+      _prefs.setString(
+        _openDictionaryInAppUpdatedAtKey,
+        remoteUpdatedAt.toIso8601String(),
+      ),
+    ]);
+  }
+
+  Future<void> _migrateOpenDictionaryInAppSetting() async {
+    if (!openDictionaryInApp || openDictionaryInAppUpdatedAt != null) return;
+    await _prefs.setString(
+      _openDictionaryInAppUpdatedAtKey,
+      DateTime.now().toUtc().toIso8601String(),
+    );
+    await cloudChanges.markDictionaryOpenSetting();
   }
 
   Future<void> setTarget(String name, DateTime? date) async {
@@ -1235,7 +1298,7 @@ class VocaStore {
   }
 
   Map<String, dynamic> toBackupJson() => {
-        'version': 3,
+        'version': 4,
         'rangeCourseSchema': rangeCourseSchemaVersion,
         'rangeCoursePasses': coursePasses,
         'books': books.map((book) => book.toJson()).toList(),
@@ -1272,7 +1335,7 @@ class VocaStore {
           'opacity': meaningOpacity,
         },
         'chatGptConversationUrl': chatGptConversationUrl,
-        'openDictionaryInApp': openDictionaryInApp,
+        'openDictionaryInAppSetting': openDictionaryInAppSettingJson,
         'activeStudy': activeStudy?.toJson(),
         'activeStudies': activeStudies.map((k, v) => MapEntry(k, v.toJson())),
         'resetMarkers': resetMarkers.map(
@@ -1367,8 +1430,7 @@ class VocaStore {
     await setChatGptConversationUrl(
       json['chatGptConversationUrl'] as String? ?? '',
     );
-    await _prefs.setBool(
-        _openDictionaryInAppKey, json['openDictionaryInApp'] as bool? ?? false);
+
     await _saveResetMarkers(
       (json['resetMarkers'] as Map<String, dynamic>? ?? const {}).map(
         (key, value) => MapEntry(
@@ -1384,6 +1446,12 @@ class VocaStore {
     } else {
       await _prefs.setString(_targetDateKey, targetDate);
     }
+    final dictionarySetting = json['openDictionaryInAppSetting'];
+    if (dictionarySetting is Map) {
+      await applyOpenDictionaryInAppSettingFromCloud(
+        Map<String, dynamic>.from(dictionarySetting),
+      );
+    }
     await restoreActiveStudyFromBackupJson(json);
   }
 
@@ -1392,7 +1460,9 @@ class VocaStore {
     try {
       final active = ActiveStudy.fromJson(Map<String, dynamic>.from(value));
       if (active.isRangeCourse &&
-          active.rangeCourseSchema < rangeCourseSchemaVersion) return null;
+          active.rangeCourseSchema < rangeCourseSchemaVersion) {
+        return null;
+      }
       return active.queueIds.isEmpty ? null : active;
     } catch (_) {
       return null;

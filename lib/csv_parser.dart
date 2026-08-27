@@ -33,6 +33,7 @@ List<Word> parseWordRows(List<List<String>> rows) {
       reading: reading,
       example: _valueAt(columns, mapping?.example ?? 3),
       exampleMeaning: _valueAt(columns, mapping?.exampleMeaning ?? 4),
+      explanation: _valueAt(columns, mapping?.explanation ?? 5),
     ));
   }
   return words;
@@ -54,6 +55,7 @@ class _ColumnMapping {
     required this.reading,
     required this.example,
     required this.exampleMeaning,
+    required this.explanation,
   });
 
   final int term;
@@ -61,6 +63,7 @@ class _ColumnMapping {
   final int reading;
   final int example;
   final int exampleMeaning;
+  final int explanation;
 
   static _ColumnMapping? fromHeader(List<String> columns) {
     final normalized = columns.map(_normalizeHeader).toList();
@@ -83,6 +86,8 @@ class _ColumnMapping {
       example: _find(normalized, const {'example', '예문'}),
       exampleMeaning: _find(normalized,
           const {'examplemeaning', 'exampletranslation', '예문뜻', '예문해석'}),
+      explanation: _find(normalized,
+          const {'explanation', 'description', 'note', '설명', '설명문', '메모'}),
     );
   }
 

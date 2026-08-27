@@ -8,6 +8,7 @@ class CloudChangeSnapshot {
   const CloudChangeSnapshot({
     required this.generation,
     required this.profileDirty,
+    required this.dictionaryOpenSettingDirty,
     required this.bookIds,
     required this.wordIdsByBook,
     required this.deletedWordIdsByBook,
@@ -16,6 +17,7 @@ class CloudChangeSnapshot {
 
   final int generation;
   final bool profileDirty;
+  final bool dictionaryOpenSettingDirty;
   final Set<String> bookIds;
   final Map<String, Set<int>> wordIdsByBook;
   final Map<String, Set<int>> deletedWordIdsByBook;
@@ -24,6 +26,7 @@ class CloudChangeSnapshot {
   bool get isEmpty => pendingCount == 0;
   int get pendingCount =>
       (profileDirty ? 1 : 0) +
+      (dictionaryOpenSettingDirty ? 1 : 0) +
       bookIds.length +
       wordIdsByBook.values.fold<int>(0, (sum, ids) => sum + ids.length) +
       deletedWordIdsByBook.values.fold<int>(0, (sum, ids) => sum + ids.length) +
@@ -47,6 +50,7 @@ class CloudChangeTracker {
 
   int _generation = 0;
   bool _profileDirty = false;
+  bool _dictionaryOpenSettingDirty = false;
   final Set<String> _bookIds = {};
   final Map<String, Set<int>> _wordIdsByBook = {};
   final Map<String, Set<int>> _deletedWordIdsByBook = {};
@@ -58,6 +62,7 @@ class CloudChangeTracker {
   CloudChangeSnapshot get snapshot => CloudChangeSnapshot(
         generation: _generation,
         profileDirty: _profileDirty,
+        dictionaryOpenSettingDirty: _dictionaryOpenSettingDirty,
         bookIds: Set.of(_bookIds),
         wordIdsByBook: _copyMap(_wordIdsByBook),
         deletedWordIdsByBook: _copyMap(_deletedWordIdsByBook),
@@ -69,6 +74,12 @@ class CloudChangeTracker {
   Future<void> markProfile() => _mutate(() {
         if (_profileDirty) return false;
         _profileDirty = true;
+        return true;
+      });
+
+  Future<void> markDictionaryOpenSetting() => _mutate(() {
+        if (_dictionaryOpenSettingDirty) return false;
+        _dictionaryOpenSettingDirty = true;
         return true;
       });
 
@@ -157,6 +168,7 @@ class CloudChangeTracker {
   Future<void> clearPending() async {
     _generation++;
     _profileDirty = false;
+    _dictionaryOpenSettingDirty = false;
     _bookIds.clear();
     _wordIdsByBook.clear();
     _deletedWordIdsByBook.clear();
@@ -218,6 +230,8 @@ class CloudChangeTracker {
       final json = jsonDecode(encoded) as Map<String, dynamic>;
       _generation = json['generation'] as int? ?? 0;
       _profileDirty = json['profileDirty'] as bool? ?? false;
+      _dictionaryOpenSettingDirty =
+          json['dictionaryOpenSettingDirty'] as bool? ?? false;
       _bookIds.addAll((json['bookIds'] as List<dynamic>? ?? []).cast<String>());
       _restoreMap(json['wordIdsByBook'], _wordIdsByBook);
       _restoreMap(json['deletedWordIdsByBook'], _deletedWordIdsByBook);
@@ -233,6 +247,7 @@ class CloudChangeTracker {
         jsonEncode({
           'generation': _generation,
           'profileDirty': _profileDirty,
+          'dictionaryOpenSettingDirty': _dictionaryOpenSettingDirty,
           'bookIds': _bookIds.toList(),
           'wordIdsByBook': _encodeMap(_wordIdsByBook),
           'deletedWordIdsByBook': _encodeMap(_deletedWordIdsByBook),

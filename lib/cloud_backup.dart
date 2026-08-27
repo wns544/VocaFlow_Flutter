@@ -139,7 +139,13 @@ class CloudBackup {
     if (changes.isEmpty && !forceProfile) return;
     final backup = store.toBackupJson();
     if (changes.profileDirty || forceProfile) {
-      await _profileRef.set(_profileData(store, backup));
+      await _profileRef.set(
+        _profileData(store, backup),
+        SetOptions(merge: true),
+      );
+    }
+    if (changes.dictionaryOpenSettingDirty) {
+      await _syncDictionaryOpenSetting(store);
     }
 
     var operationCount = 0;
@@ -202,7 +208,11 @@ class CloudBackup {
   Future<void> _upload(VocaStore store) async {
     final backup = store.toBackupJson();
     final remoteBooks = await _booksRef.get();
-    await _profileRef.set(_profileData(store, backup));
+    await _profileRef.set(
+      _profileData(store, backup),
+      SetOptions(merge: true),
+    );
+    await _syncDictionaryOpenSetting(store);
 
     var operationCount = 0;
     var batch = firestore.batch();
@@ -324,6 +334,8 @@ class CloudBackup {
               <String, dynamic>{},
       'chatGptConversationUrl':
           profileData['chatGptConversationUrl'] as String? ?? '',
+      'openDictionaryInAppSetting': _validDictionaryOpenSetting(
+          profileData['openDictionaryInAppSetting']),
       'activeStudy': profileData['activeStudy'] as Map<String, dynamic>?,
       'activeStudies':
           profileData['activeStudies'] as Map<String, dynamic>? ?? {},
@@ -448,12 +460,61 @@ class CloudBackup {
         'reading': data['reading'] as String? ?? '',
         'example': data['example'] as String? ?? '',
         'exampleMeaning': data['exampleMeaning'] as String? ?? '',
+        'explanation': data['explanation'] as String? ?? '',
         'state': data['state'] as String? ?? StudyState.fresh.name,
         'correctCount': (data['correctCount'] as num?)?.toInt() ?? 0,
         'wrongCount': (data['wrongCount'] as num?)?.toInt() ?? 0,
         'lastStudiedAt': data['lastStudiedAt'] as String?,
         'lastWrongAt': data['lastWrongAt'] as String?,
       };
+
+  Future<void> _syncDictionaryOpenSetting(VocaStore store) async {
+    final local = store.openDictionaryInAppSettingJson;
+    if (local == null) return;
+    final localUpdatedAt = _dictionaryOpenSettingUpdatedAt(local);
+    if (localUpdatedAt == null) return;
+
+    Map<String, dynamic>? newerRemote;
+    await firestore.runTransaction<void>((transaction) async {
+      final snapshot = await transaction.get(_profileRef);
+      final remote = _validDictionaryOpenSetting(
+        snapshot.data()?['openDictionaryInAppSetting'],
+      );
+      final remoteUpdatedAt =
+          remote == null ? null : _dictionaryOpenSettingUpdatedAt(remote);
+      if (remote != null &&
+          remoteUpdatedAt != null &&
+          remoteUpdatedAt.isAfter(localUpdatedAt)) {
+        newerRemote = remote;
+        return;
+      }
+      if (remoteUpdatedAt != null && remoteUpdatedAt == localUpdatedAt) return;
+      transaction.set(
+        _profileRef,
+        {'openDictionaryInAppSetting': local},
+        SetOptions(merge: true),
+      );
+    });
+    if (newerRemote != null) {
+      await store.applyOpenDictionaryInAppSettingFromCloud(newerRemote!);
+    }
+  }
+
+  Map<String, dynamic>? _validDictionaryOpenSetting(dynamic raw) {
+    if (raw is! Map) return null;
+    final setting = Map<String, dynamic>.from(raw);
+    final value = setting['value'];
+    final updatedAt = setting['updatedAt'];
+    if (value is! bool || updatedAt is! String) return null;
+    final parsed = DateTime.tryParse(updatedAt)?.toUtc();
+    if (parsed == null) return null;
+    return {'value': value, 'updatedAt': parsed.toIso8601String()};
+  }
+
+  DateTime? _dictionaryOpenSettingUpdatedAt(Map<String, dynamic> setting) {
+    final raw = setting['updatedAt'];
+    return raw is String ? DateTime.tryParse(raw)?.toUtc() : null;
+  }
 
   Map<String, dynamic> _profileData(
           VocaStore store, Map<String, dynamic> backup) =>

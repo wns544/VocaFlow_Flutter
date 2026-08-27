@@ -1,11 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Modify this file to customize your launch splash screen -->
+<!-- Keep the native launch surface visually seamless. Flutter immediately draws the full splash artwork. -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:drawable="@color/app_start_background" />
-
-    <item>
-        <bitmap
-            android:gravity="center"
-            android:src="@mipmap/splash_composition" />
-    </item>
 </layer-list>
