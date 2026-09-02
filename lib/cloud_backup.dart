@@ -339,6 +339,8 @@ class CloudBackup {
       'activeStudy': profileData['activeStudy'] as Map<String, dynamic>?,
       'activeStudies':
           profileData['activeStudies'] as Map<String, dynamic>? ?? {},
+      'activeStudyTombstones':
+          profileData['activeStudyTombstones'] as Map<String, dynamic>? ?? {},
       'resetMarkers':
           profileData['resetMarkers'] as Map<String, dynamic>? ?? {},
     };
@@ -542,6 +544,7 @@ class CloudBackup {
         'chatGptConversationUrl': backup['chatGptConversationUrl'],
         'activeStudy': backup['activeStudy'],
         'activeStudies': backup['activeStudies'],
+        'activeStudyTombstones': backup['activeStudyTombstones'],
         'resetMarkers': backup['resetMarkers'],
         'bookOrder': store.books.map((book) => book.id).toList(),
         'updatedAt': FieldValue.serverTimestamp(),

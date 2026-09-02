@@ -23,6 +23,7 @@ class ActiveStudy {
     this.seenWordIds = const [],
     this.sessionSelections = const {},
     this.lastWordBookId,
+    this.startedAt,
     this.updatedAt,
     this.rangeStart,
     this.rangeEnd,
@@ -44,6 +45,7 @@ class ActiveStudy {
   final List<int> seenWordIds;
   final Map<String, List<int>> sessionSelections;
   final String? lastWordBookId;
+  final DateTime? startedAt;
   final DateTime? updatedAt;
   final int? rangeStart;
   final int? rangeEnd;
@@ -68,6 +70,8 @@ class ActiveStudy {
         'seenWordIds': seenWordIds,
         'sessionSelections': sessionSelections,
         'lastWordBookId': lastWordBookId,
+        'startedAt':
+            (startedAt ?? updatedAt ?? DateTime.now()).toIso8601String(),
         'updatedAt': (updatedAt ?? DateTime.now()).toIso8601String(),
         'rangeStart': rangeStart,
         'rangeEnd': rangeEnd,
@@ -106,6 +110,9 @@ class ActiveStudy {
           ),
         ),
         lastWordBookId: json['lastWordBookId'] as String?,
+        startedAt: json['startedAt'] == null
+            ? null
+            : DateTime.tryParse(json['startedAt'] as String),
         updatedAt: json['updatedAt'] == null
             ? null
             : DateTime.tryParse(json['updatedAt'] as String),
@@ -287,6 +294,7 @@ class VocaStore {
   Map<String, DailyStudyStats>? _dailyStudyStatsCache;
   List<StudyEventLog>? _studyEventLogCache;
   Map<String, ActiveStudy>? _activeStudiesCache;
+  Map<String, DateTime>? _activeStudyTombstonesCache;
   Map<String, DateTime>? _completedAtCache;
   Map<String, DateTime>? _resetMarkersCache;
 
@@ -411,6 +419,7 @@ class VocaStore {
   }
 
   static const _activeStudiesKey = 'activeStudies';
+  static const _activeStudyTombstonesKey = 'activeStudyTombstones';
   static const _resetMarkersKey = 'resetMarkers';
 
   Map<String, ActiveStudy> get activeStudies {
@@ -456,6 +465,23 @@ class VocaStore {
           ));
     } catch (_) {
       return _resetMarkersCache = const {};
+    }
+  }
+
+  Map<String, DateTime> get activeStudyTombstones {
+    final cached = _activeStudyTombstonesCache;
+    if (cached != null) return cached;
+    final saved = _prefs.getString(_activeStudyTombstonesKey);
+    if (saved == null) return _activeStudyTombstonesCache = const {};
+    try {
+      final decoded = jsonDecode(saved) as Map<String, dynamic>;
+      return _activeStudyTombstonesCache = decoded.map((key, value) => MapEntry(
+            key,
+            DateTime.tryParse(value as String? ?? '') ??
+                DateTime.fromMillisecondsSinceEpoch(0),
+          ));
+    } catch (_) {
+      return _activeStudyTombstonesCache = const {};
     }
   }
 
@@ -568,6 +594,25 @@ class VocaStore {
     );
   }
 
+  Future<void> _saveActiveStudyTombstones(Map<String, DateTime> tombstones) {
+    final sortedEntries = tombstones.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    final pruned = Map<String, DateTime>.fromEntries(sortedEntries.take(100));
+    _activeStudyTombstonesCache = pruned;
+    return _prefs.setString(
+      _activeStudyTombstonesKey,
+      jsonEncode(pruned.map(
+        (key, value) => MapEntry(key, value.toIso8601String()),
+      )),
+    );
+  }
+
+  Future<void> _markActiveStudyTombstone(String key) async {
+    final tombstones = Map<String, DateTime>.from(activeStudyTombstones);
+    tombstones[key] = DateTime.now();
+    await _saveActiveStudyTombstones(tombstones);
+  }
+
   Future<void> _markReset(String key) async {
     final markers = Map<String, DateTime>.from(resetMarkers);
     markers[key] = DateTime.now();
@@ -604,6 +649,24 @@ class VocaStore {
   }
 
   String currentCourseKey(String bookId) => '$bookId:current';
+
+  String activeStudyKey(ActiveStudy active) {
+    if (active.isRangeCourse && active.bookId != null) {
+      return currentCourseKey(active.bookId!);
+    }
+    return activeStudyKeyFor(
+      bookId: active.bookId,
+      sessionIndexes: active.sessionIndexes,
+      sessionSelections: active.sessionSelections,
+    );
+  }
+
+  bool _activeStudyDeletedAfter(String key, ActiveStudy active) {
+    final deletedAt = activeStudyTombstones[key];
+    final startedAt = active.startedAt ?? active.updatedAt;
+    return deletedAt != null &&
+        (startedAt == null || deletedAt.isAfter(startedAt));
+  }
 
   ActiveStudy? activeCourseForBook(String bookId) {
     final active = activeStudies[currentCourseKey(bookId)];
@@ -710,6 +773,11 @@ class VocaStore {
       studies.removeWhere((studyKey, study) =>
           study.bookId == active.bookId && study.isRangeCourse);
     }
+    final previousActive = activeStudies[resolvedKey];
+    final startedAt = active.startedAt ??
+        previousActive?.startedAt ??
+        previousActive?.updatedAt ??
+        DateTime.now();
     final updatedActive = ActiveStudy(
       queueIds: active.queueIds,
       queueBookIds: active.queueBookIds,
@@ -724,6 +792,7 @@ class VocaStore {
       undoHistory: active.undoHistory,
       sessionSelections: active.sessionSelections,
       lastWordBookId: active.lastWordBookId,
+      startedAt: startedAt,
       rangeStart: active.rangeStart,
       rangeEnd: active.rangeEnd,
       sourceMode: active.sourceMode,
@@ -745,6 +814,10 @@ class VocaStore {
       }
     }
     await _saveActiveStudies(studies);
+    final tombstones = Map<String, DateTime>.from(activeStudyTombstones);
+    if (tombstones.remove(resolvedKey) != null) {
+      await _saveActiveStudyTombstones(tombstones);
+    }
     if (markCloudChange) await cloudChanges.markProfile();
   }
 
@@ -762,6 +835,7 @@ class VocaStore {
     if (studies.containsKey(key)) {
       studies.remove(key);
       await _saveActiveStudies(studies);
+      await _markActiveStudyTombstone(key);
       if (markCloudChange) await cloudChanges.markProfile();
     }
   }
@@ -772,9 +846,15 @@ class VocaStore {
           markCloudChange: markCloudChange);
 
   Future<void> clearAllActiveStudies({bool markCloudChange = true}) async {
+    final tombstones = Map<String, DateTime>.from(activeStudyTombstones);
+    final now = DateTime.now();
+    for (final key in activeStudies.keys) {
+      tombstones[key] = now;
+    }
     _activeStudiesCache = const {};
     await _prefs.remove(_activeStudiesKey);
     await _prefs.remove(_activeStudyKey);
+    await _saveActiveStudyTombstones(tombstones);
     if (markCloudChange) await cloudChanges.markProfile();
   }
 
@@ -847,11 +927,7 @@ class VocaStore {
   Future<void> clearActiveStudy({bool markCloudChange = true}) async {
     final current = activeStudy;
     if (current != null) {
-      final key = activeStudyKeyFor(
-        bookId: current.bookId,
-        sessionIndexes: current.sessionIndexes,
-        sessionSelections: current.sessionSelections,
-      );
+      final key = activeStudyKey(current);
       await clearActiveStudyFor(key, markCloudChange: markCloudChange);
     }
   }
@@ -868,6 +944,7 @@ class VocaStore {
       studiesData.forEach((k, v) {
         final active = _activeStudyFromBackupJson(v);
         if (active != null &&
+            !_activeStudyDeletedAfter(k, active) &&
             !isActiveStudyCompleted(active,
                 completedOverride: backupCompleted) &&
             resolveActiveWords(active).length == active.queueIds.length) {
@@ -879,6 +956,7 @@ class VocaStore {
     }
     final active = _activeStudyFromBackupJson(json['activeStudy']);
     if (active == null ||
+        _activeStudyDeletedAfter(activeStudyKey(active), active) ||
         isActiveStudyCompleted(active, completedOverride: backupCompleted) ||
         resolveActiveWords(active).length != active.queueIds.length) {
       return null;
@@ -1338,6 +1416,9 @@ class VocaStore {
         'openDictionaryInAppSetting': openDictionaryInAppSettingJson,
         'activeStudy': activeStudy?.toJson(),
         'activeStudies': activeStudies.map((k, v) => MapEntry(k, v.toJson())),
+        'activeStudyTombstones': activeStudyTombstones.map(
+          (key, value) => MapEntry(key, value.toIso8601String()),
+        ),
         'resetMarkers': resetMarkers.map(
           (key, value) => MapEntry(key, value.toIso8601String()),
         ),
@@ -1345,8 +1426,10 @@ class VocaStore {
 
   Future<void> replaceWithBackupJson(Map<String, dynamic> json) async {
     _activeStudiesCache = const {};
+    _activeStudyTombstonesCache = const {};
     await _prefs.remove(_activeStudyKey);
     await _prefs.remove(_activeStudiesKey);
+    await _prefs.remove(_activeStudyTombstonesKey);
     final decodedBooks = (json['books'] as List<dynamic>? ?? [])
         .map((item) => WordBook.fromJson(item as Map<String, dynamic>))
         .toList();
@@ -1433,6 +1516,15 @@ class VocaStore {
 
     await _saveResetMarkers(
       (json['resetMarkers'] as Map<String, dynamic>? ?? const {}).map(
+        (key, value) => MapEntry(
+          key,
+          DateTime.tryParse(value as String? ?? '') ??
+              DateTime.fromMillisecondsSinceEpoch(0),
+        ),
+      ),
+    );
+    await _saveActiveStudyTombstones(
+      (json['activeStudyTombstones'] as Map<String, dynamic>? ?? const {}).map(
         (key, value) => MapEntry(
           key,
           DateTime.tryParse(value as String? ?? '') ??

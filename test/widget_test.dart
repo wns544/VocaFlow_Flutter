@@ -18,6 +18,7 @@ import 'package:vocaflow/main.dart';
 import 'package:vocaflow/kanji_lookup.dart';
 import 'package:vocaflow/models.dart';
 import 'package:vocaflow/store.dart';
+import 'package:vocaflow/study_speech.dart';
 
 void main() {
   setUp(() => shuffleNewStudyQueues = false);
@@ -26,6 +27,19 @@ void main() {
     expect(studySpeechLanguage('遺跡'), 'ja-JP');
     expect(studySpeechLanguage('안녕하세요'), 'ko-KR');
     expect(studySpeechLanguage('resilience'), 'en-US');
+    final japaneseRequest = studySpeechRequestForWord(
+      term: '肯定',
+      reading: 'こうてい',
+    );
+    expect(japaneseRequest.text, 'こうてい');
+    expect(japaneseRequest.language, StudySpeechLanguage.japanese);
+
+    final englishRequest = studySpeechRequestForWord(
+      term: 'resilience',
+      reading: '',
+    );
+    expect(englishRequest.text, 'resilience');
+    expect(englishRequest.language, StudySpeechLanguage.english);
   });
 
   test('review cards return after a spacious run of new cards', () {
@@ -839,8 +853,10 @@ void main() {
       'url': 'https://hanja.dict.naver.com/#/search?query=%E9%81%BA',
     });
 
+    await tester
+        .ensureVisible(find.byKey(const ValueKey('open-chatgpt-kanji')));
     await tester.tap(find.byKey(const ValueKey('open-chatgpt-kanji')));
-    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pump(const Duration(milliseconds: 1000));
     expect(externalCalls.last.method, 'openUrl');
     final chatGptUrl =
         Uri.parse((externalCalls.last.arguments as Map)['url'] as String);
@@ -848,8 +864,9 @@ void main() {
     expect(chatGptUrl.host, 'chatgpt.com');
     expect(chatGptUrl.path, '/c/study-kanji');
     expect(chatGptUrl.queryParameters['q'], contains('遺跡'));
+    await tester.ensureVisible(find.byKey(const ValueKey('open-chatgpt-word')));
     await tester.tap(find.byKey(const ValueKey('open-chatgpt-word')));
-    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pump(const Duration(milliseconds: 1000));
     final wordChatGptUrl =
         Uri.parse((externalCalls.last.arguments as Map)['url'] as String);
     expect(wordChatGptUrl.path, '/c/study-kanji');
@@ -869,12 +886,12 @@ void main() {
     await tester.idle();
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 100));
-    expect(copiedTexts, ['遺']);
+    expect(copiedTexts.last, '遺');
     expect(find.text('“遺” 복사 완료'), findsOneWidget);
 
     await tester.longPress(firstKanji);
     await tester.pump(const Duration(milliseconds: 100));
-    expect(copiedTexts, ['遺', '遺']);
+    expect(copiedTexts.sublist(copiedTexts.length - 2), ['遺', '遺']);
   });
 
   testWidgets('study card fades details in term-reading-meaning order',
@@ -915,8 +932,8 @@ void main() {
     expect(speechCalls, hasLength(1));
     expect(speechCalls.single.method, 'speak');
     expect(speechCalls.single.arguments, {
-      'text': 'target-word',
-      'language': 'en-US',
+      'text': 'いせき',
+      'language': 'ja-JP',
     });
     expect(find.text('いせき'), findsOneWidget);
     expect(find.text('유적'), findsOneWidget);

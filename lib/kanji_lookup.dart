@@ -124,9 +124,17 @@ Future<bool> openExternalUrl(Uri uri) async {
 Future<bool> openChatGptWithPrompt({
   required Uri uri,
   required String prompt,
+  Duration warmupDelay = const Duration(milliseconds: 900),
+  Future<bool> Function(Uri uri)? openUrl,
 }) async {
   if (uri.scheme != 'https' || prompt.trim().isEmpty) return false;
-  return openExternalUrl(chatGptPromptUri(uri: uri, prompt: prompt));
+  final launcher = openUrl ?? openExternalUrl;
+  final openedConversation = await launcher(uri);
+  if (!openedConversation) return false;
+  if (!warmupDelay.isNegative && warmupDelay > Duration.zero) {
+    await Future<void>.delayed(warmupDelay);
+  }
+  return launcher(chatGptPromptUri(uri: uri, prompt: prompt));
 }
 
 Uri naverHanjaSearchUri(String character) => Uri.parse(

@@ -87,6 +87,14 @@ void main() {
     );
     expect(chatGptUri.toString(),
         'https://chatgpt.com/c/conversation-id?q=%EC%A7%88%EB%AC%B8+%ED%85%8C%EC%8A%A4%ED%8A%B8');
+    expect(
+      chatGptPromptUri(
+        uri: Uri.parse(
+            'https://chatgpt.com/g/g-p-custom/c/conversation-id?model=gpt-5'),
+        prompt: '正',
+      ).toString(),
+      'https://chatgpt.com/g/g-p-custom/c/conversation-id?model=gpt-5&q=%E6%AD%A3',
+    );
 
     final prompt = buildChatGptKanjiPrompt(
       character: '新',
@@ -98,5 +106,47 @@ void main() {
     expect(prompt, contains('현재 학습 단어: 新聞'));
     expect(prompt, contains('발음: しんぶん'));
     expect(prompt, contains('뜻: 신문'));
+  });
+
+  test('ChatGPT prompt opens conversation before prompt URL', () async {
+    final opened = <Uri>[];
+
+    final ok = await openChatGptWithPrompt(
+      uri: Uri.parse('https://chatgpt.com/g/g-p-custom/c/conversation-id'),
+      prompt: '질문 테스트',
+      warmupDelay: Duration.zero,
+      openUrl: (uri) async {
+        opened.add(uri);
+        return true;
+      },
+    );
+
+    expect(ok, isTrue);
+    expect(opened, hasLength(2));
+    expect(opened.first.toString(),
+        'https://chatgpt.com/g/g-p-custom/c/conversation-id');
+    expect(opened.last.toString(),
+        'https://chatgpt.com/g/g-p-custom/c/conversation-id?q=%EC%A7%88%EB%AC%B8+%ED%85%8C%EC%8A%A4%ED%8A%B8');
+  });
+
+  test('ChatGPT prompt reports failure when either deep link fails', () async {
+    final firstFail = await openChatGptWithPrompt(
+      uri: Uri.parse('https://chatgpt.com/c/conversation-id'),
+      prompt: '질문',
+      warmupDelay: Duration.zero,
+      openUrl: (_) async => false,
+    );
+
+    var calls = 0;
+    final secondFail = await openChatGptWithPrompt(
+      uri: Uri.parse('https://chatgpt.com/c/conversation-id'),
+      prompt: '질문',
+      warmupDelay: Duration.zero,
+      openUrl: (_) async => calls++ == 0,
+    );
+
+    expect(firstFail, isFalse);
+    expect(secondFail, isFalse);
+    expect(calls, 2);
   });
 }

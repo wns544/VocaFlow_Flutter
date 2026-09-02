@@ -1,4 +1,4 @@
-﻿import 'models.dart';
+import 'models.dart';
 
 Map<String, dynamic> mergeBackupJson({
   required Map<String, dynamic> cloud,
@@ -12,6 +12,10 @@ Map<String, dynamic> mergeBackupJson({
   final resetMarkers = _mergeDateMap(
     _dateMap(cloud['resetMarkers']),
     _dateMap(local['resetMarkers']),
+  );
+  final activeStudyTombstones = _mergeDateMap(
+    _dateMap(cloud['activeStudyTombstones']),
+    _dateMap(local['activeStudyTombstones']),
   );
   final byId = {for (final book in cloudBooks) book.id: book};
   final usedNames = cloudBooks.map((book) => book.name).toSet();
@@ -89,8 +93,10 @@ Map<String, dynamic> mergeBackupJson({
 
   for (final key in allKeys) {
     final chosen = _chooseActiveStudy(
+      key.toString(),
       cloudStudies[key],
       localStudies[key],
+      activeStudyTombstones,
       resetMarkers,
       rangeCourseSchema,
     );
@@ -99,6 +105,9 @@ Map<String, dynamic> mergeBackupJson({
     }
   }
   result['activeStudies'] = mergedStudies;
+  result['activeStudyTombstones'] = activeStudyTombstones.map(
+    (key, value) => MapEntry(key, value.toIso8601String()),
+  );
   result['resetMarkers'] = resetMarkers.map(
     (key, value) => MapEntry(key, value.toIso8601String()),
   );
@@ -315,8 +324,10 @@ DateTime? _latestDate(DateTime? left, DateTime? right) {
 }
 
 Map<String, dynamic>? _chooseActiveStudy(
+  String key,
   dynamic cloud,
   dynamic local,
+  Map<String, DateTime> activeStudyTombstones,
   Map<String, DateTime> resetMarkers,
   int rangeCourseSchema,
 ) {
@@ -324,6 +335,11 @@ Map<String, dynamic>? _chooseActiveStudy(
   final localMap = local is Map ? Map<String, dynamic>.from(local) : null;
   final candidates = [cloudMap, localMap]
       .whereType<Map<String, dynamic>>()
+      .where((active) => !_activeStudyDeletedAfter(
+            key,
+            active,
+            activeStudyTombstones,
+          ))
       .where((active) => !_resetAfterActive(active, resetMarkers))
       .where((active) => _isCompatibleRangeCourse(active, rangeCourseSchema))
       .toList();
@@ -359,6 +375,22 @@ bool _isCompatibleRangeCourse(
 DateTime? _activeUpdatedAt(Map<String, dynamic> active) {
   final value = active['updatedAt'];
   return value is String ? DateTime.tryParse(value) : null;
+}
+
+DateTime? _activeStartedAt(Map<String, dynamic> active) {
+  final value = active['startedAt'];
+  return value is String ? DateTime.tryParse(value) : _activeUpdatedAt(active);
+}
+
+bool _activeStudyDeletedAfter(
+  String key,
+  Map<String, dynamic> active,
+  Map<String, DateTime> activeStudyTombstones,
+) {
+  final deletedAt = activeStudyTombstones[key];
+  final startedAt = _activeStartedAt(active);
+  return deletedAt != null &&
+      (startedAt == null || deletedAt.isAfter(startedAt));
 }
 
 bool _resetAfterActive(

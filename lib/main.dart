@@ -24,13 +24,13 @@ import 'local_word_search.dart';
 import 'models.dart';
 import 'store.dart';
 import 'study_course.dart';
+import 'study_speech.dart';
 
 const ink = Color(0xFF1C1C1E);
 const sea = Color(0xFF34C759);
 const mist = Color(0xFFF2F2F7);
 const coral = Color(0xFFFF3B30);
 const flutterSplashMinimumDuration = Duration(milliseconds: 900);
-const studySpeechChannel = MethodChannel('com.vocaflow.app/study_speech');
 const resumeSnapshotChannel = MethodChannel('com.vocaflow.app/resume_snapshot');
 final defaultKanjiLookupService = KanjiLookupService();
 final resumeSnapshotNavigatorObserver = _ResumeSnapshotNavigatorObserver();
@@ -88,30 +88,6 @@ FontWeight fontWeightFromValue(int value) => switch (value) {
 
 bool isHanCharacter(String text) =>
     RegExp(r'^[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]$').hasMatch(text);
-
-String studySpeechLanguage(String text) {
-  if (RegExp(r'[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]')
-      .hasMatch(text)) {
-    return 'ja-JP';
-  }
-  if (RegExp(r'[\uAC00-\uD7A3]').hasMatch(text)) return 'ko-KR';
-  return 'en-US';
-}
-
-Future<void> speakStudyWord(String text) async {
-  final trimmed = text.trim();
-  if (trimmed.isEmpty) return;
-  try {
-    await studySpeechChannel.invokeMethod<void>('speak', {
-      'text': trimmed,
-      'language': studySpeechLanguage(trimmed),
-    });
-  } on MissingPluginException {
-    // Voice playback is only available on supported device builds.
-  } on Exception {
-    // Studying should continue even when a device has no matching TTS voice.
-  }
-}
 
 bool isBookCompleted(VocaStore store, WordBook book) {
   final count = store.sessionCount(book);
@@ -2025,7 +2001,10 @@ class _CardStudyPageState extends State<CardStudyPage>
     persistStudy();
     scheduleResumeSnapshotCapture('study');
     if (shouldReveal) {
-      speakStudyWord(word.reading.trim().isEmpty ? word.term : word.reading);
+      speakStudySpeechRequest(studySpeechRequestForWord(
+        term: word.term,
+        reading: word.reading,
+      ));
     }
   }
 
@@ -2942,12 +2921,12 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
       showMessage('설정 탭에서 ChatGPT 전용 대화 URL을 먼저 등록해 주세요.');
       return;
     }
+    await Clipboard.setData(ClipboardData(text: prompt));
     final inserted = await openChatGptWithPrompt(uri: uri, prompt: prompt);
     if (inserted) {
       showMessage('ChatGPT 입력창에 질문을 넣었습니다.');
       return;
     }
-    await Clipboard.setData(ClipboardData(text: prompt));
     final opened = await openExternalUrl(uri);
     showMessage(opened
         ? '질문을 복사했습니다. ChatGPT에 붙여넣어 주세요.'
@@ -5030,8 +5009,8 @@ class _SettingsPageState extends State<SettingsPage> {
                     Navigator.pop(context, InitialSyncChoice.merge),
                 icon: const Icon(CupertinoIcons.arrow_2_squarepath, size: 18),
                 label: const _InitialSyncActionLabel(
-                  title: '클라우드 데이터와 병합',
-                  description: '이 기기 데이터와 클라우드 백업을 합쳐 저장합니다.',
+                  title: '이 기기의 데이터 내보내기',
+                  description: '이 기기 데이터를 클라우드 백업에 합쳐 저장합니다.',
                 ),
               ),
               FilledButton.icon(
@@ -5039,7 +5018,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     Navigator.pop(context, InitialSyncChoice.cloudReplace),
                 icon: const Icon(CupertinoIcons.cloud_download, size: 18),
                 label: const _InitialSyncActionLabel(
-                  title: '클라우드 데이터로 복원',
+                  title: '클라우드 데이터 가져오기',
                   description: '현재 기기 데이터를 지우고 클라우드 백업을 가져옵니다.',
                 ),
               ),
@@ -5731,30 +5710,38 @@ class _SettingsPageState extends State<SettingsPage> {
       builder: (context) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
           title: const Text('ChatGPT 전용 대화 URL'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'ChatGPT 앱의 공유 링크가 아니라,\n'
-                '브라우저 주소창에 보이는\n'
-                'chatgpt.com/c/... 또는 chatgpt.com/g/... 대화 URL을 입력해 주세요.',
-                style: TextStyle(color: Color(0xFF6E6E73), fontSize: 12),
-              ),
-              const SizedBox(height: 12),
-              TextFormField(
-                key: const ValueKey('chatgpt-conversation-url-input'),
-                initialValue: input,
-                onChanged: (value) => input = value,
-                autofocus: true,
-                keyboardType: TextInputType.url,
-                autocorrect: false,
-                decoration: InputDecoration(
-                  hintText: 'https://chatgpt.com/c/...',
-                  errorText: errorText,
+          content: SizedBox(
+            width: 520,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'ChatGPT 앱의 공유 링크가 아니라,\n'
+                  '브라우저 주소창에 보이는\n'
+                  'chatgpt.com/c/... 또는 chatgpt.com/g/... 대화 URL을 입력해 주세요.',
+                  style: TextStyle(color: Color(0xFF6E6E73), fontSize: 12),
                 ),
-              ),
-            ],
+                const SizedBox(height: 12),
+                TextFormField(
+                  key: const ValueKey('chatgpt-conversation-url-input'),
+                  initialValue: input,
+                  onChanged: (value) => input = value,
+                  autofocus: true,
+                  keyboardType: TextInputType.url,
+                  autocorrect: false,
+                  minLines: 3,
+                  maxLines: 5,
+                  decoration: InputDecoration(
+                    alignLabelWithHint: true,
+                    hintText:
+                        'https://chatgpt.com/g/g-p-.../c/...\n또는\nhttps://chatgpt.com/c/...',
+                    errorText: errorText,
+                    border: const OutlineInputBorder(),
+                  ),
+                ),
+              ],
+            ),
           ),
           actions: [
             TextButton(

@@ -211,6 +211,86 @@ void main() {
     expect(active['queueIds'], [5]);
   });
 
+  test('merge drops an active study deleted after it started', () {
+    final cloud = _backup(
+      [
+        _book('same', 'JLPT', [_word(1, 'cloud')])
+      ],
+      activeStudyTombstones: {
+        'same:current': '2026-06-28T10:00:00.000',
+      },
+      rangeCoursePasses: const {
+        'same:0:200': 1,
+      },
+    );
+    final local = _backup(
+      [
+        _book('same', 'JLPT', [_word(1, 'local')])
+      ],
+      activeStudies: {
+        'same:current': {
+          'queueIds': [1],
+          'total': 150,
+          'memorized': 80,
+          'reviewed': [],
+          'revealed': false,
+          'bookId': 'same',
+          'sessionIndexes': [],
+          'rangeStart': 0,
+          'rangeEnd': 150,
+          'rangeCourseSchema': 2,
+          'startedAt': '2026-06-28T09:00:00.000',
+          'updatedAt': '2026-06-28T11:00:00.000',
+        }
+      },
+    );
+
+    final merged = mergeBackupJson(cloud: cloud, local: local);
+
+    expect((merged['activeStudies'] as Map), isNot(contains('same:current')));
+    expect(merged['activeStudyTombstones'],
+        containsPair('same:current', '2026-06-28T10:00:00.000'));
+    expect(merged['rangeCoursePasses'], containsPair('same:0:200', 1));
+  });
+
+  test('merge keeps an active study started after an older deletion marker',
+      () {
+    final cloud = _backup(
+      [
+        _book('same', 'JLPT', [_word(1, 'cloud')])
+      ],
+      activeStudyTombstones: {
+        'same:current': '2026-06-28T10:00:00.000',
+      },
+    );
+    final local = _backup(
+      [
+        _book('same', 'JLPT', [_word(1, 'local')])
+      ],
+      activeStudies: {
+        'same:current': {
+          'queueIds': [1],
+          'total': 150,
+          'memorized': 1,
+          'reviewed': [],
+          'revealed': false,
+          'bookId': 'same',
+          'sessionIndexes': [],
+          'rangeStart': 0,
+          'rangeEnd': 150,
+          'rangeCourseSchema': 2,
+          'startedAt': '2026-06-28T10:05:00.000',
+          'updatedAt': '2026-06-28T10:06:00.000',
+        }
+      },
+    );
+
+    final merged = mergeBackupJson(cloud: cloud, local: local);
+    final active = (merged['activeStudies'] as Map)['same:current'] as Map;
+
+    expect(active['memorized'], 1);
+  });
+
   test('merge preserves higher wrong stats without double counting', () {
     final cloudWord = _word(1, 'cloud')
       ..['wrongCount'] = 2
@@ -335,6 +415,7 @@ Map<String, dynamic> _backup(
   List<String> completed = const [],
   Map<String, String> completedAt = const {},
   Map<String, String> resetMarkers = const {},
+  Map<String, String> activeStudyTombstones = const {},
   Map<String, dynamic> activeStudies = const {},
   Map<String, dynamic> rangeCoursePasses = const {},
   Map<String, dynamic> dailyStudyStats = const {},
@@ -349,6 +430,7 @@ Map<String, dynamic> _backup(
       'completed': completed,
       'completedAt': completedAt,
       'resetMarkers': resetMarkers,
+      'activeStudyTombstones': activeStudyTombstones,
       'activeStudies': activeStudies,
       'rangeCoursePasses': rangeCoursePasses,
       'dailyStudyStats': dailyStudyStats,
