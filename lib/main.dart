@@ -1932,9 +1932,32 @@ class _CardStudyPageState extends State<CardStudyPage>
     });
   }
 
-  Future<void> requestExitStudy() async {
+  Future<void> requestExitStudy({bool confirm = false}) async {
     if (exiting) return;
+    if (confirm && !await _confirmExitStudy()) return;
     await exitStudy();
+  }
+
+  Future<bool> _confirmExitStudy() async {
+    if (!mounted) return false;
+    return await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('학습을 그만할까요?'),
+            content: const Text('현재 진행도는 저장하고 홈 화면으로 돌아갑니다.'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('계속 학습'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('홈으로'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
   }
 
   Future<void> exitStudy() async {
@@ -1947,7 +1970,13 @@ class _CardStudyPageState extends State<CardStudyPage>
     if (!mounted) return;
     setState(() => exiting = true);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) Navigator.of(context).pop();
+      if (!mounted) return;
+      final navigator = Navigator.of(context);
+      if (navigator.canPop()) {
+        navigator.pop();
+      } else {
+        navigator.pushNamedAndRemoveUntil('/', (route) => false);
+      }
     });
   }
 
@@ -1968,12 +1997,14 @@ class _CardStudyPageState extends State<CardStudyPage>
       memorized++;
     } else {
       reviewed.add(word.term);
-      final freshCards = queue
-          .where((candidate) => !seenWordIds.contains(candidate.id))
-          .length;
-      final insertAt =
-          reviewReinsertIndex(queue.length, freshCards: freshCards);
-      queue.insert(insertAt, word);
+      if (queue.isNotEmpty) {
+        final freshCards = queue
+            .where((candidate) => !seenWordIds.contains(candidate.id))
+            .length;
+        final insertAt =
+            reviewReinsertIndex(queue.length, freshCards: freshCards);
+        queue.insert(insertAt, word);
+      }
     }
     word.state = state;
     revealed = false;
@@ -2351,7 +2382,7 @@ class _CardStudyPageState extends State<CardStudyPage>
     return PopScope(
       canPop: exiting,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) requestExitStudy();
+        if (!didPop) requestExitStudy(confirm: true);
       },
       child: Scaffold(
         body: _StudyBackground(

@@ -306,6 +306,34 @@ void main() {
     await tester.pump();
     expect(decisions, [StudyState.memorized]);
   });
+
+  testWidgets('the final review card finishes instead of reinserting forever',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final decisions = <StudyState>[];
+    final word = Word(id: 9261, term: 'final', reading: '', meaning: 'one');
+    await tester.pumpWidget(MaterialApp(
+      home: CardStudyPage(
+        store: store,
+        words: [word],
+        decisionWriter: (_, state) async => decisions.add(state),
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    final card = find.byKey(const ValueKey('study-card'));
+    final gesture = await tester.startGesture(tester.getCenter(card));
+    await gesture.moveBy(const Offset(0, 120));
+    await gesture.moveBy(const Offset(0, 120));
+    await gesture.up();
+    await tester.pumpAndSettle();
+
+    expect(find.text('카드 학습 완료'), findsOneWidget);
+    expect(find.text('final'), findsNothing);
+    expect(decisions, [StudyState.review]);
+  });
+
   testWidgets('the waiting card stays fixed while it becomes the front card',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({});
@@ -437,17 +465,18 @@ void main() {
 
     await tester.binding.handlePopRoute();
     await tester.pumpAndSettle();
-    expect(find.text('학습을 나갈까요?'), findsNothing);
+    expect(find.text('학습을 그만할까요?'), findsOneWidget);
+    expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
+    await tester.tap(find.text('홈으로'));
+    await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey('study-card')), findsNothing);
     expect((await VocaStore.load()).activeStudy, isNotNull);
 
-    await tester.binding.handlePopRoute();
-    await tester.pumpAndSettle();
     await tester.tap(find.byKey(const ValueKey('home-action-study')));
     await tester.pumpAndSettle();
     await tester.tap(find.byIcon(Icons.arrow_back));
     await tester.pumpAndSettle();
-    expect(find.text('학습을 나갈까요?'), findsNothing);
+    expect(find.text('학습을 그만할까요?'), findsNothing);
     expect(find.byKey(const ValueKey('study-card')), findsNothing);
     expect((await VocaStore.load()).activeStudy, isNotNull);
   });
@@ -480,6 +509,9 @@ void main() {
     await tester.pumpAndSettle();
     await tester.binding.handlePopRoute();
     await tester.pumpAndSettle();
+    expect(find.text('학습을 그만할까요?'), findsOneWidget);
+    await tester.tap(find.text('홈으로'));
+    await tester.pumpAndSettle();
 
     expect(
         find.byKey(const ValueKey('home-change-study-course')), findsNothing);
@@ -492,6 +524,9 @@ void main() {
 
     expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
     await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(find.text('학습을 그만할까요?'), findsOneWidget);
+    await tester.tap(find.text('홈으로'));
     await tester.pumpAndSettle();
     expect(
         (await VocaStore.load()).activeCourseForBook(book.id)?.rangeEnd, 100);
