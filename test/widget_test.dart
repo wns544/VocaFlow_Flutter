@@ -270,6 +270,42 @@ void main() {
     expect(reset.transform.storage[13], closeTo(0, .01));
   });
 
+  testWidgets('locked horizontal swipe keeps its first committed direction',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    await store.setHorizontalSwipe(true);
+    final decisions = <StudyState>[];
+    final words = [
+      Word(id: 9251, term: 'locked', reading: '', meaning: 'one'),
+      Word(id: 9252, term: 'next', reading: '', meaning: 'two'),
+    ];
+    await tester.pumpWidget(MaterialApp(
+      home: CardStudyPage(
+        store: store,
+        words: words,
+        decisionWriter: (_, state) async => decisions.add(state),
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    final card = find.byKey(const ValueKey('study-card'));
+    final gesture = await tester.startGesture(tester.getCenter(card));
+    await gesture.moveBy(const Offset(60, 0));
+    await gesture.moveBy(const Offset(60, 0));
+    await gesture.moveBy(const Offset(60, 0));
+    await gesture.moveBy(const Offset(60, 0));
+    await tester.pump();
+    await gesture.moveBy(const Offset(-30, 0));
+    await gesture.moveBy(const Offset(-30, 0));
+    await gesture.up();
+    await tester.pumpAndSettle();
+
+    expect(words.first.state, StudyState.memorized);
+    expect(find.text('next'), findsOneWidget);
+    await tester.pump();
+    expect(decisions, [StudyState.memorized]);
+  });
   testWidgets('the waiting card stays fixed while it becomes the front card',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({});

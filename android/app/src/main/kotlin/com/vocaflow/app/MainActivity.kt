@@ -11,6 +11,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.speech.tts.TextToSpeech
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.PixelCopy
 import android.view.SurfaceView
 import android.view.View
@@ -27,6 +29,7 @@ class MainActivity : FlutterActivity() {
     private val channelName = "com.vocaflow.app/study_speech"
     private val externalChannelName = "com.vocaflow.app/external_links"
     private val snapshotChannelName = "com.vocaflow.app/resume_snapshot"
+    private val navigationButtonChannelName = "com.vocaflow.app/navigation_buttons"
     private val snapshotFile by lazy { File(cacheDir, "resume_snapshot.jpg") }
     private val snapshotTempFile by lazy { File(cacheDir, "resume_snapshot.tmp") }
     private val snapshotPreferences by lazy {
@@ -37,6 +40,7 @@ class MainActivity : FlutterActivity() {
     private var pendingSpeech: Pair<String, String>? = null
     private var snapshotOverlay: ImageView? = null
     private var snapshotCaptureInProgress = false
+    private var navigationButtonChannel: MethodChannel? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val snapshotTimeout = Runnable {
         removeSnapshotOverlay(deleteFile = true)
@@ -88,6 +92,7 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+        navigationButtonChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, navigationButtonChannelName)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, snapshotChannelName)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
@@ -108,6 +113,55 @@ class MainActivity : FlutterActivity() {
             }
     }
 
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_UP) {
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_BACK,
+                KeyEvent.KEYCODE_NAVIGATE_PREVIOUS,
+                KeyEvent.KEYCODE_BUTTON_4 -> {
+                    sendNavigationButton("back")
+                    return true
+                }
+                KeyEvent.KEYCODE_FORWARD,
+                KeyEvent.KEYCODE_NAVIGATE_NEXT,
+                KeyEvent.KEYCODE_BUTTON_5 -> {
+                    sendNavigationButton("forward")
+                    return true
+                }
+                KeyEvent.KEYCODE_DPAD_LEFT -> {
+                    if (event.isAltPressed) {
+                        sendNavigationButton("back")
+                        return true
+                    }
+                }
+                KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                    if (event.isAltPressed) {
+                        sendNavigationButton("forward")
+                        return true
+                    }
+                }
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        if (event.action == MotionEvent.ACTION_BUTTON_PRESS) {
+            if ((event.buttonState and MotionEvent.BUTTON_BACK) != 0) {
+                sendNavigationButton("back")
+                return true
+            }
+            if ((event.buttonState and MotionEvent.BUTTON_FORWARD) != 0) {
+                sendNavigationButton("forward")
+                return true
+            }
+        }
+        return super.dispatchGenericMotionEvent(event)
+    }
+
+    private fun sendNavigationButton(direction: String) {
+        navigationButtonChannel?.invokeMethod(direction, null)
+    }
     private fun showResumeSnapshot() {
         val savedAt = snapshotPreferences.getLong("savedAt", 0L)
         val orientation = snapshotPreferences.getInt("orientation", -1)
@@ -281,3 +335,5 @@ class MainActivity : FlutterActivity() {
         private const val SNAPSHOT_TIMEOUT_MS = 3000L
     }
 }
+
+

@@ -1,5 +1,11 @@
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+
+typedef BrowserNavigationButtonHandler = Future<bool> Function(
+    String direction);
+BrowserNavigationButtonHandler? activeBrowserNavigationButtonHandler;
 
 class InAppBrowserPage extends StatefulWidget {
   const InAppBrowserPage({super.key, required this.uri, required this.title});
@@ -13,8 +19,10 @@ class InAppBrowserPage extends StatefulWidget {
 
 class _InAppBrowserPageState extends State<InAppBrowserPage> {
   late final WebViewController _controller;
+  final FocusNode _focusNode = FocusNode(debugLabel: 'in-app-browser');
   var _loading = true;
   var _canGoBack = false;
+  var _canGoForward = false;
   String? _errorMessage;
 
   @override
@@ -34,17 +42,22 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
           },
           onPageFinished: (_) async {
             await _applyAdFilter();
-            final canGoBack = await _controller.canGoBack();
+            await _refreshHistoryState();
             if (mounted) {
               setState(() {
                 _loading = false;
-                _canGoBack = canGoBack;
               });
             }
           },
         ),
       )
       ..loadRequest(widget.uri);
+  }
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    super.dispose();
   }
 
   Future<void> _applyAdFilter() async {
@@ -104,12 +117,56 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
     }
   }
 
+  Future<void> _refreshHistoryState() async {
+    final canGoBack = await _controller.canGoBack();
+    final canGoForward = await _controller.canGoForward();
+    if (!mounted) return;
+    setState(() {
+      _canGoBack = canGoBack;
+      _canGoForward = canGoForward;
+    });
+  }
+
   Future<void> _goBack() async {
     if (await _controller.canGoBack()) {
       await _controller.goBack();
+      await _refreshHistoryState();
       return;
     }
     if (mounted) Navigator.of(context).pop();
+  }
+
+  Future<void> _goForward() async {
+    if (await _controller.canGoForward()) {
+      await _controller.goForward();
+      await _refreshHistoryState();
+    }
+  }
+
+  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.browserBack ||
+        event.logicalKey == LogicalKeyboardKey.goBack) {
+      _goBack();
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.browserForward ||
+        (event.logicalKey == LogicalKeyboardKey.arrowRight &&
+            HardwareKeyboard.instance.isAltPressed)) {
+      _goForward();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  void _handlePointerDown(PointerDownEvent event) {
+    if (event.buttons == kBackMouseButton) {
+      _goBack();
+    } else if (event.buttons == kForwardMouseButton) {
+      _goForward();
+    }
   }
 
   @override
@@ -117,6 +174,17 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
         appBar: AppBar(
           title: Text(widget.title),
           actions: [
+            IconButton(
+              tooltip: '뒤로',
+              onPressed:
+                  _canGoBack ? _goBack : () => Navigator.of(context).pop(),
+              icon: const Icon(Icons.arrow_back),
+            ),
+            IconButton(
+              tooltip: '앞으로',
+              onPressed: _canGoForward ? _goForward : null,
+              icon: const Icon(Icons.arrow_forward),
+            ),
             IconButton(
               tooltip: '새로고침',
               onPressed: _controller.reload,
@@ -135,33 +203,41 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
           onPopInvokedWithResult: (didPop, _) async {
             if (!didPop) await _goBack();
           },
-          child: Stack(
-            children: [
-              WebViewWidget(controller: _controller),
-              if (_errorMessage != null)
-                Center(
-                  child: Padding(
-                    padding: const EdgeInsets.all(24),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(Icons.public_off_outlined, size: 40),
-                        const SizedBox(height: 12),
-                        Text(
-                          _errorMessage!,
-                          textAlign: TextAlign.center,
+          child: Focus(
+            focusNode: _focusNode,
+            autofocus: true,
+            onKeyEvent: _handleKeyEvent,
+            child: Listener(
+              onPointerDown: _handlePointerDown,
+              child: Stack(
+                children: [
+                  WebViewWidget(controller: _controller),
+                  if (_errorMessage != null)
+                    Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.public_off_outlined, size: 40),
+                            const SizedBox(height: 12),
+                            Text(
+                              _errorMessage!,
+                              textAlign: TextAlign.center,
+                            ),
+                            const SizedBox(height: 12),
+                            FilledButton.icon(
+                              onPressed: _controller.reload,
+                              icon: const Icon(Icons.refresh),
+                              label: const Text('다시 시도'),
+                            ),
+                          ],
                         ),
-                        const SizedBox(height: 12),
-                        FilledButton.icon(
-                          onPressed: _controller.reload,
-                          icon: const Icon(Icons.refresh),
-                          label: const Text('다시 시도'),
-                        ),
-                      ],
+                      ),
                     ),
-                  ),
-                ),
-            ],
+                ],
+              ),
+            ),
           ),
         ),
       );

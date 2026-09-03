@@ -6,6 +6,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -32,6 +33,8 @@ const mist = Color(0xFFF2F2F7);
 const coral = Color(0xFFFF3B30);
 const flutterSplashMinimumDuration = Duration(milliseconds: 900);
 const resumeSnapshotChannel = MethodChannel('com.vocaflow.app/resume_snapshot');
+const navigationButtonChannel =
+    MethodChannel('com.vocaflow.app/navigation_buttons');
 final defaultKanjiLookupService = KanjiLookupService();
 final resumeSnapshotNavigatorObserver = _ResumeSnapshotNavigatorObserver();
 final resumeRouteObserver = RouteObserver<ModalRoute<dynamic>>();
@@ -174,7 +177,19 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
   @override
   void initState() {
     super.initState();
+    navigationButtonChannel.setMethodCallHandler(_handleNavigationButton);
     _loadLocalState();
+  }
+
+  Future<bool> _handleNavigationButton(MethodCall call) async {
+    final method = call.method;
+    if (method != 'back' && method != 'forward') return false;
+    final browserHandler = activeBrowserNavigationButtonHandler;
+    if (browserHandler != null && await browserHandler(method)) return true;
+    if (method == 'back') {
+      return navigatorKey.currentState?.maybePop() ?? false;
+    }
+    return false;
   }
 
   Future<void> _loadLocalState() async {
@@ -245,6 +260,7 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
 
   @override
   void dispose() {
+    navigationButtonChannel.setMethodCallHandler(null);
     autoBackup?.dispose();
     autoBackupNotifier.dispose();
     super.dispose();
@@ -306,6 +322,10 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
       debugShowCheckedModeBanner: false,
       title: 'VocaFlow',
       theme: theme,
+      builder: (context, child) => _MouseBackForwardScope(
+        navigatorKey: navigatorKey,
+        child: child ?? const SizedBox.shrink(),
+      ),
       navigatorObservers: [
         resumeSnapshotNavigatorObserver,
         resumeRouteObserver
@@ -331,6 +351,65 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
       },
     );
   }
+}
+
+class _MouseBackForwardScope extends StatefulWidget {
+  const _MouseBackForwardScope({
+    required this.navigatorKey,
+    required this.child,
+  });
+
+  final GlobalKey<NavigatorState> navigatorKey;
+  final Widget child;
+
+  @override
+  State<_MouseBackForwardScope> createState() => _MouseBackForwardScopeState();
+}
+
+class _MouseBackForwardScopeState extends State<_MouseBackForwardScope> {
+  final FocusNode _focusNode = FocusNode(debugLabel: 'app-mouse-navigation');
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  Future<void> _goBack() async {
+    await widget.navigatorKey.currentState?.maybePop();
+  }
+
+  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.browserBack ||
+        event.logicalKey == LogicalKeyboardKey.goBack ||
+        event.logicalKey == LogicalKeyboardKey.backspace ||
+        (event.logicalKey == LogicalKeyboardKey.arrowLeft &&
+            HardwareKeyboard.instance.isAltPressed)) {
+      _goBack();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  void _handlePointerDown(PointerDownEvent event) {
+    if ((event.buttons & kBackMouseButton) != 0) {
+      _goBack();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Focus(
+        focusNode: _focusNode,
+        autofocus: true,
+        onKeyEvent: _handleKeyEvent,
+        child: Listener(
+          onPointerDown: _handlePointerDown,
+          child: widget.child,
+        ),
+      );
 }
 
 class _FlutterSplashScreen extends StatelessWidget {
@@ -2469,13 +2548,56 @@ class _StudyBackground extends StatelessWidget {
               : dragState == StudyState.review
                   ? Color.lerp(Colors.white, const Color(0xFFFFE8E6), progress)!
                   : Colors.white;
+          final label = dragState == StudyState.memorized
+              ? '외움'
+              : dragState == StudyState.review
+                  ? '다시'
+                  : '';
+          final labelColor = dragState == StudyState.memorized ? sea : coral;
           return AnimatedContainer(
             key: const ValueKey('study-card-background'),
             duration:
                 drag == 0 ? const Duration(milliseconds: 180) : Duration.zero,
             curve: Curves.easeOut,
             color: color,
-            child: child,
+            child: Stack(
+              children: [
+                if (child != null) child,
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: SafeArea(
+                      child: Align(
+                        alignment: Alignment.topCenter,
+                        child: AnimatedOpacity(
+                          key: const ValueKey('study-drag-decision-label'),
+                          opacity: label.isEmpty ? 0 : progress,
+                          duration: const Duration(milliseconds: 90),
+                          child: Container(
+                            margin: const EdgeInsets.only(top: 72),
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 18, vertical: 8),
+                            decoration: BoxDecoration(
+                              color: labelColor.withValues(alpha: .14),
+                              borderRadius: BorderRadius.circular(999),
+                              border: Border.all(
+                                  color: labelColor.withValues(alpha: .42)),
+                            ),
+                            child: Text(
+                              label,
+                              style: TextStyle(
+                                color: labelColor,
+                                fontSize: 18,
+                                fontWeight: FontWeight.w900,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
           );
         },
       );
@@ -2515,6 +2637,8 @@ class _StudyCardDeckState extends State<_StudyCardDeck>
   Offset _touchBias = Offset.zero;
   double _rotation = 0;
   bool _dismissing = false;
+  bool? _lockedPositive;
+  double _dominantPrimary = 0;
 
   double _primaryFor(Offset offset) {
     if (widget.horizontalSwipe) return offset.dx;
@@ -2553,6 +2677,8 @@ class _StudyCardDeckState extends State<_StudyCardDeck>
     _rotation = 0;
     _touchBias = Offset.zero;
     _dismissing = false;
+    _lockedPositive = null;
+    _dominantPrimary = 0;
   }
 
   @override
@@ -2564,6 +2690,8 @@ class _StudyCardDeckState extends State<_StudyCardDeck>
   void _beginDrag(DragStartDetails details) {
     if (_dismissing) return;
     _controller.stop();
+    _lockedPositive = null;
+    _dominantPrimary = 0;
     final size = context.size ?? Size.zero;
     setState(() {
       _touchBias = Offset(
@@ -2579,13 +2707,30 @@ class _StudyCardDeckState extends State<_StudyCardDeck>
     });
   }
 
+  double _cuePrimary(double primary) {
+    final locked = _lockedPositive;
+    if (locked == null) return primary;
+    return primary.abs().clamp(90.0, double.infinity) * (locked ? 1 : -1);
+  }
+
   void _updateDrag(DragUpdateDetails details) {
     if (_dismissing) return;
+    final nextOffset = _offset + details.delta;
+    final primary = _primaryFor(nextOffset);
     setState(() {
-      _offset += details.delta;
+      _offset = nextOffset;
       _rotation = _rotationFor(_offset);
+      if (primary.abs() > _dominantPrimary.abs()) {
+        _dominantPrimary = primary;
+      }
+      if (_lockedPositive == null && primary.abs() >= 70) {
+        _lockedPositive = primary > 0;
+      }
+      if (_lockedPositive != null && primary.abs() < 24) {
+        _lockedPositive = null;
+      }
     });
-    widget.onPrimaryDragChanged(_primaryFor(_offset));
+    widget.onPrimaryDragChanged(_cuePrimary(primary));
   }
 
   Future<void> _animateTo({
@@ -2614,6 +2759,8 @@ class _StudyCardDeckState extends State<_StudyCardDeck>
       curve: Curves.easeOutCubic,
     );
     _touchBias = Offset.zero;
+    _lockedPositive = null;
+    _dominantPrimary = 0;
     widget.onPrimaryDragChanged(0);
   }
 
@@ -2622,26 +2769,25 @@ class _StudyCardDeckState extends State<_StudyCardDeck>
     final velocityVector = details.velocity.pixelsPerSecond;
     final primaryVelocity = _primaryFor(velocityVector);
     final primaryDrag = _primaryFor(_offset);
-    final towardNegative = primaryDrag < -90 || primaryVelocity < -650;
-    final towardPositive = primaryDrag > 90 || primaryVelocity > 650;
-    if (!towardNegative && !towardPositive) {
+    final lockedPositive = _lockedPositive;
+    final hasDismissIntent = primaryDrag.abs() > 90 ||
+        primaryVelocity.abs() > 650 ||
+        (lockedPositive != null && _dominantPrimary.abs() > 110);
+    if (!hasDismissIntent) {
       await _cancelDrag();
       return;
     }
 
-    final positive = towardPositive;
+    final positive = lockedPositive ??
+        (primaryDrag.abs() >= 90 ? primaryDrag > 0 : primaryVelocity > 0);
     final availableSize = context.size ?? MediaQuery.sizeOf(context);
     final dismissDistance =
         max(availableSize.width, availableSize.height) * 1.25;
-    final fallbackDirection = widget.horizontalSwipe
+    final direction = widget.horizontalSwipe
         ? Offset(positive ? 1 : -1, 0)
         : Offset(0, positive ? 1 : -1);
-    final directionSource = velocityVector.distance > 80
-        ? velocityVector
-        : (_offset.distance == 0 ? fallbackDirection : _offset);
-    final direction = directionSource / directionSource.distance;
     final target = direction * dismissDistance;
-    final speed = velocityVector.distance;
+    final speed = max(velocityVector.distance, primaryVelocity.abs());
     final remaining = (target - _offset).distance;
     final durationMs =
         speed > 650 ? (remaining / speed * 1000).round().clamp(160, 280) : 280;
@@ -2653,6 +2799,8 @@ class _StudyCardDeckState extends State<_StudyCardDeck>
       curve: Curves.easeInCubic,
     );
     if (!mounted) return;
+    _lockedPositive = null;
+    _dominantPrimary = 0;
     widget.onPrimaryDragChanged(0);
     widget.onDismissed(positive);
   }
