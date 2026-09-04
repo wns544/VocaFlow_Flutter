@@ -6,7 +6,6 @@ import 'package:file_picker/file_picker.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/cupertino.dart';
-import 'package:flutter/gestures.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -394,21 +393,12 @@ class _MouseBackForwardScopeState extends State<_MouseBackForwardScope> {
     return KeyEventResult.ignored;
   }
 
-  void _handlePointerDown(PointerDownEvent event) {
-    if ((event.buttons & kBackMouseButton) != 0) {
-      _goBack();
-    }
-  }
-
   @override
   Widget build(BuildContext context) => Focus(
         focusNode: _focusNode,
         autofocus: true,
         onKeyEvent: _handleKeyEvent,
-        child: Listener(
-          onPointerDown: _handlePointerDown,
-          child: widget.child,
-        ),
+        child: widget.child,
       );
 }
 
@@ -1944,16 +1934,16 @@ class _CardStudyPageState extends State<CardStudyPage>
     return await showDialog<bool>(
           context: context,
           builder: (context) => AlertDialog(
-            title: const Text('학습을 그만할까요?'),
+            title: const Text('학습을 잠시 중지할까요?'),
             content: const Text('현재 진행도는 저장하고 메인 화면으로 돌아갑니다.'),
             actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('취소'),
-              ),
               FilledButton(
                 onPressed: () => Navigator.pop(context, true),
                 child: const Text('메인으로'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('취소'),
               ),
             ],
           ),
@@ -2455,21 +2445,13 @@ class _CardStudyPageState extends State<CardStudyPage>
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
                           _SwipeHint(
-                            icon: Icons.keyboard_arrow_left,
-                            label:
-                                stateForDirection(false) == StudyState.memorized
-                                    ? '외움'
-                                    : '다시',
+                            label: '<',
                             color: negativeColor,
                             progress: negativeActive ? progress : 0,
                             leadingIcon: true,
                           ),
                           _SwipeHint(
-                            icon: Icons.keyboard_arrow_right,
-                            label:
-                                stateForDirection(true) == StudyState.memorized
-                                    ? '외움'
-                                    : '다시',
+                            label: '>',
                             color: positiveColor,
                             progress: positiveActive ? progress : 0,
                             leadingIcon: false,
@@ -3317,14 +3299,14 @@ class _JapaneseKanjiDetails extends StatelessWidget {
 
 class _SwipeHint extends StatelessWidget {
   const _SwipeHint({
-    required this.icon,
     required this.label,
     required this.color,
+    this.icon,
     this.progress = 0,
     this.leadingIcon = true,
   });
 
-  final IconData icon;
+  final IconData? icon;
   final String label;
   final Color color;
   final double progress;
@@ -3336,11 +3318,13 @@ class _SwipeHint extends StatelessWidget {
     final foregroundAlpha = _lerpDouble(.50, .94, clamped);
     final backgroundAlpha = _lerpDouble(.07, .18, clamped);
     final scale = _lerpDouble(1.0, 1.08, clamped);
-    final iconWidget = Icon(
-      icon,
-      size: _lerpDouble(20, 24, clamped),
-      color: color.withValues(alpha: foregroundAlpha),
-    );
+    final iconWidget = icon == null
+        ? null
+        : Icon(
+            icon,
+            size: _lerpDouble(20, 24, clamped),
+            color: color.withValues(alpha: foregroundAlpha),
+          );
     final labelWidget = AnimatedDefaultTextStyle(
       duration: const Duration(milliseconds: 90),
       style: TextStyle(
@@ -3351,9 +3335,11 @@ class _SwipeHint extends StatelessWidget {
       ),
       child: Text(label),
     );
-    final children = leadingIcon
-        ? [iconWidget, const SizedBox(width: 3), labelWidget]
-        : [labelWidget, const SizedBox(width: 3), iconWidget];
+    final children = iconWidget == null
+        ? <Widget>[labelWidget]
+        : leadingIcon
+            ? <Widget>[iconWidget, const SizedBox(width: 3), labelWidget]
+            : <Widget>[labelWidget, const SizedBox(width: 3), iconWidget];
     return AnimatedScale(
       scale: scale,
       duration: const Duration(milliseconds: 90),

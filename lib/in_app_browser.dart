@@ -1,4 +1,3 @@
-import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
@@ -178,14 +177,6 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
     return KeyEventResult.ignored;
   }
 
-  void _handlePointerDown(PointerDownEvent event) {
-    if (event.buttons == kBackMouseButton) {
-      _goBack();
-    } else if (event.buttons == kForwardMouseButton) {
-      _goForward();
-    }
-  }
-
   @override
   Widget build(BuildContext context) => Scaffold(
         appBar: AppBar(
@@ -224,36 +215,33 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
             focusNode: _focusNode,
             autofocus: true,
             onKeyEvent: _handleKeyEvent,
-            child: Listener(
-              onPointerDown: _handlePointerDown,
-              child: Stack(
-                children: [
-                  WebViewWidget(controller: _controller),
-                  if (_errorMessage != null)
-                    Center(
-                      child: Padding(
-                        padding: const EdgeInsets.all(24),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(Icons.public_off_outlined, size: 40),
-                            const SizedBox(height: 12),
-                            Text(
-                              _errorMessage!,
-                              textAlign: TextAlign.center,
-                            ),
-                            const SizedBox(height: 12),
-                            FilledButton.icon(
-                              onPressed: _controller.reload,
-                              icon: const Icon(Icons.refresh),
-                              label: const Text('다시 시도'),
-                            ),
-                          ],
-                        ),
+            child: Stack(
+              children: [
+                WebViewWidget(controller: _controller),
+                if (_errorMessage != null)
+                  Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.public_off_outlined, size: 40),
+                          const SizedBox(height: 12),
+                          Text(
+                            _errorMessage!,
+                            textAlign: TextAlign.center,
+                          ),
+                          const SizedBox(height: 12),
+                          FilledButton.icon(
+                            onPressed: _controller.reload,
+                            icon: const Icon(Icons.refresh),
+                            label: const Text('다시 시도'),
+                          ),
+                        ],
                       ),
                     ),
-                ],
-              ),
+                  ),
+              ],
             ),
           ),
         ),

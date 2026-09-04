@@ -465,11 +465,11 @@ void main() {
 
     await tester.binding.handlePopRoute();
     await tester.pumpAndSettle();
-    expect(find.text('학습을 그만할까요?'), findsOneWidget);
+    expect(find.text('학습을 잠시 중지할까요?'), findsOneWidget);
     expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
     await tester.binding.handlePopRoute();
     await tester.pumpAndSettle();
-    expect(find.text('학습을 그만할까요?'), findsNothing);
+    expect(find.text('학습을 잠시 중지할까요?'), findsNothing);
     expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
 
     await tester.binding.handlePopRoute();
@@ -483,7 +483,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.byIcon(Icons.arrow_back));
     await tester.pumpAndSettle();
-    expect(find.text('학습을 그만할까요?'), findsNothing);
+    expect(find.text('학습을 잠시 중지할까요?'), findsNothing);
     expect(find.byKey(const ValueKey('study-card')), findsNothing);
     expect((await VocaStore.load()).activeStudy, isNotNull);
   });
@@ -516,7 +516,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.binding.handlePopRoute();
     await tester.pumpAndSettle();
-    expect(find.text('학습을 그만할까요?'), findsOneWidget);
+    expect(find.text('학습을 잠시 중지할까요?'), findsOneWidget);
     await tester.tap(find.text('메인으로'));
     await tester.pumpAndSettle();
 
@@ -532,7 +532,7 @@ void main() {
     expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
     await tester.binding.handlePopRoute();
     await tester.pumpAndSettle();
-    expect(find.text('학습을 그만할까요?'), findsOneWidget);
+    expect(find.text('학습을 잠시 중지할까요?'), findsOneWidget);
     await tester.tap(find.text('메인으로'));
     await tester.pumpAndSettle();
     expect(
@@ -763,8 +763,8 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('home-action-study')));
     await tester.pumpAndSettle();
 
-    expect(find.byIcon(Icons.keyboard_arrow_left), findsOneWidget);
-    expect(find.byIcon(Icons.keyboard_arrow_right), findsOneWidget);
+    expect(find.text('<'), findsOneWidget);
+    expect(find.text('>'), findsOneWidget);
     expect(find.text('알아요'), findsNothing);
     expect(find.text('모르겠어요'), findsNothing);
 
@@ -927,7 +927,7 @@ void main() {
     await tester.binding.handlePopRoute();
     await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey('kanji-detail-character')), findsNothing);
-    expect(find.text('학습을 그만할까요?'), findsNothing);
+    expect(find.text('학습을 잠시 중지할까요?'), findsNothing);
     expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
 
     await tester.tap(firstKanji);
