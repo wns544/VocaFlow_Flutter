@@ -467,7 +467,14 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('학습을 그만할까요?'), findsOneWidget);
     expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
-    await tester.tap(find.text('홈으로'));
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(find.text('학습을 그만할까요?'), findsNothing);
+    expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
+
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('메인으로'));
     await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey('study-card')), findsNothing);
     expect((await VocaStore.load()).activeStudy, isNotNull);
@@ -510,7 +517,7 @@ void main() {
     await tester.binding.handlePopRoute();
     await tester.pumpAndSettle();
     expect(find.text('학습을 그만할까요?'), findsOneWidget);
-    await tester.tap(find.text('홈으로'));
+    await tester.tap(find.text('메인으로'));
     await tester.pumpAndSettle();
 
     expect(
@@ -526,7 +533,7 @@ void main() {
     await tester.binding.handlePopRoute();
     await tester.pumpAndSettle();
     expect(find.text('학습을 그만할까요?'), findsOneWidget);
-    await tester.tap(find.text('홈으로'));
+    await tester.tap(find.text('메인으로'));
     await tester.pumpAndSettle();
     expect(
         (await VocaStore.load()).activeCourseForBook(book.id)?.rangeEnd, 100);
@@ -917,6 +924,14 @@ void main() {
     expect(find.text('남길 유'), findsOneWidget);
     expect(find.textContaining('음독: イ'), findsOneWidget);
     expect(find.textContaining('영문 뜻: leave behind'), findsOneWidget);
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('kanji-detail-character')), findsNothing);
+    expect(find.text('학습을 그만할까요?'), findsNothing);
+    expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
+
+    await tester.tap(firstKanji);
+    await tester.pumpAndSettle();
 
     await tester.tap(find.byKey(const ValueKey('open-naver-hanja')));
     await tester.pump(const Duration(milliseconds: 100));

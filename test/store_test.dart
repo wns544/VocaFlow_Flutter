@@ -236,6 +236,39 @@ void main() {
     );
   });
 
+  test('in-app dictionary setting persists and ignores older cloud values',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+
+    await store.setOpenDictionaryInApp(true);
+    final localUpdatedAt = store.openDictionaryInAppUpdatedAt!;
+    final backup = store.toBackupJson();
+
+    expect(store.openDictionaryInApp, isTrue);
+    expect(backup['openDictionaryInAppSetting'], {
+      'value': true,
+      'updatedAt': localUpdatedAt.toIso8601String(),
+    });
+
+    final reloaded = await VocaStore.load();
+    expect(reloaded.openDictionaryInApp, isTrue);
+
+    await reloaded.applyOpenDictionaryInAppSettingFromCloud({
+      'value': false,
+      'updatedAt':
+          localUpdatedAt.subtract(const Duration(minutes: 1)).toIso8601String(),
+    });
+    expect(reloaded.openDictionaryInApp, isTrue);
+
+    await reloaded.applyOpenDictionaryInAppSettingFromCloud({
+      'value': false,
+      'updatedAt':
+          localUpdatedAt.add(const Duration(minutes: 1)).toIso8601String(),
+    });
+    expect(reloaded.openDictionaryInApp, isFalse);
+  });
+
   test('mixed-book active study preserves word ownership and selections',
       () async {
     SharedPreferences.setMockInitialValues({});

@@ -28,6 +28,7 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
   @override
   void initState() {
     super.initState();
+    activeBrowserNavigationButtonHandler = _handleNavigationButton;
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setNavigationDelegate(
@@ -56,6 +57,10 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
 
   @override
   void dispose() {
+    if (identical(
+        activeBrowserNavigationButtonHandler, _handleNavigationButton)) {
+      activeBrowserNavigationButtonHandler = null;
+    }
     _focusNode.dispose();
     super.dispose();
   }
@@ -143,6 +148,18 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
     }
   }
 
+  Future<bool> _handleNavigationButton(String direction) async {
+    if (direction == 'back') {
+      await _goBack();
+      return true;
+    }
+    if (direction == 'forward') {
+      await _goForward();
+      return true;
+    }
+    return false;
+  }
+
   KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
       return KeyEventResult.ignored;
@@ -199,7 +216,7 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
               : null,
         ),
         body: PopScope(
-          canPop: !_canGoBack,
+          canPop: false,
           onPopInvokedWithResult: (didPop, _) async {
             if (!didPop) await _goBack();
           },

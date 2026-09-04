@@ -394,6 +394,34 @@ void main() {
     });
   });
 
+  test('merge keeps the newest in-app dictionary setting', () {
+    final cloud = _backup(
+      [
+        _book('same', 'JLPT', [_word(1, 'cloud')])
+      ],
+      openDictionaryInAppSetting: const {
+        'value': false,
+        'updatedAt': '2026-08-24T01:00:00.000Z',
+      },
+    );
+    final local = _backup(
+      [
+        _book('same', 'JLPT', [_word(1, 'local')])
+      ],
+      openDictionaryInAppSetting: const {
+        'value': true,
+        'updatedAt': '2026-08-24T02:00:00.000Z',
+      },
+    );
+
+    final merged = mergeBackupJson(cloud: cloud, local: local);
+
+    expect(merged['openDictionaryInAppSetting'], {
+      'value': true,
+      'updatedAt': '2026-08-24T02:00:00.000Z',
+    });
+  });
+
   test('automatic backup configuration is stored per account', () async {
     final tracker = await CloudChangeTracker.load();
     await tracker.setInitialized('a', true);
@@ -421,6 +449,7 @@ Map<String, dynamic> _backup(
   Map<String, dynamic> dailyStudyStats = const {},
   List<Map<String, dynamic>> studyEventLog = const [],
   List<String> days = const [],
+  Map<String, dynamic>? openDictionaryInAppSetting,
 }) =>
     {
       'version': 1,
@@ -442,6 +471,8 @@ Map<String, dynamic> _backup(
       'reverseSwipe': false,
       'japaneseFont': 'system',
       'cardFontSizes': <String, dynamic>{},
+      if (openDictionaryInAppSetting != null)
+        'openDictionaryInAppSetting': openDictionaryInAppSetting,
     };
 
 Map<String, dynamic> _event(String id, String timestamp) => {

@@ -1934,6 +1934,7 @@ class _CardStudyPageState extends State<CardStudyPage>
 
   Future<void> requestExitStudy({bool confirm = false}) async {
     if (exiting) return;
+    if (confirm && !(_route?.isCurrent ?? true)) return;
     if (confirm && !await _confirmExitStudy()) return;
     await exitStudy();
   }
@@ -1944,15 +1945,15 @@ class _CardStudyPageState extends State<CardStudyPage>
           context: context,
           builder: (context) => AlertDialog(
             title: const Text('학습을 그만할까요?'),
-            content: const Text('현재 진행도는 저장하고 홈 화면으로 돌아갑니다.'),
+            content: const Text('현재 진행도는 저장하고 메인 화면으로 돌아갑니다.'),
             actions: [
               TextButton(
                 onPressed: () => Navigator.pop(context, false),
-                child: const Text('계속 학습'),
+                child: const Text('취소'),
               ),
               FilledButton(
                 onPressed: () => Navigator.pop(context, true),
-                child: const Text('홈으로'),
+                child: const Text('메인으로'),
               ),
             ],
           ),
@@ -2382,7 +2383,9 @@ class _CardStudyPageState extends State<CardStudyPage>
     return PopScope(
       canPop: exiting,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) requestExitStudy(confirm: true);
+        if (!didPop && (_route?.isCurrent ?? true)) {
+          requestExitStudy(confirm: true);
+        }
       },
       child: Scaffold(
         body: _StudyBackground(
@@ -2437,20 +2440,54 @@ class _CardStudyPageState extends State<CardStudyPage>
                               color: Color(0xFF8E8E93), fontSize: 11)),
                     ]),
                 const SizedBox(height: 12),
-                if (horizontalSwipe)
-                  Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        _SwipeHint(
+                ValueListenableBuilder<double>(
+                  valueListenable: _primaryDrag,
+                  builder: (context, drag, _) {
+                    final progress = (drag.abs() / 150).clamp(0.0, 1.0);
+                    final dragState =
+                        drag == 0 ? null : stateForDirection(drag > 0);
+                    final negativeActive = dragState != null &&
+                        dragState == stateForDirection(false);
+                    final positiveActive = dragState != null &&
+                        dragState == stateForDirection(true);
+                    if (horizontalSwipe) {
+                      return Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          _SwipeHint(
                             icon: Icons.keyboard_arrow_left,
-                            color: negativeColor),
-                        _SwipeHint(
+                            label:
+                                stateForDirection(false) == StudyState.memorized
+                                    ? '외움'
+                                    : '다시',
+                            color: negativeColor,
+                            progress: negativeActive ? progress : 0,
+                            leadingIcon: true,
+                          ),
+                          _SwipeHint(
                             icon: Icons.keyboard_arrow_right,
-                            color: positiveColor),
-                      ])
-                else
-                  _SwipeHint(
-                      icon: Icons.keyboard_arrow_up, color: negativeColor),
+                            label:
+                                stateForDirection(true) == StudyState.memorized
+                                    ? '외움'
+                                    : '다시',
+                            color: positiveColor,
+                            progress: positiveActive ? progress : 0,
+                            leadingIcon: false,
+                          ),
+                        ],
+                      );
+                    }
+                    return _SwipeHint(
+                      icon: Icons.keyboard_arrow_up,
+                      label: stateForDirection(false) == StudyState.memorized
+                          ? '외움'
+                          : '다시',
+                      color: negativeColor,
+                      progress: negativeActive ? progress : 0,
+                      leadingIcon: true,
+                    );
+                  },
+                ),
                 const SizedBox(height: 12),
                 Expanded(
                   child: AnimatedSwitcher(
@@ -2535,9 +2572,26 @@ class _CardStudyPageState extends State<CardStudyPage>
                   if (!horizontalSwipe)
                     Expanded(
                       child: Center(
-                        child: _SwipeHint(
-                            icon: Icons.keyboard_arrow_down,
-                            color: positiveColor),
+                        child: ValueListenableBuilder<double>(
+                          valueListenable: _primaryDrag,
+                          builder: (context, drag, _) {
+                            final progress = (drag.abs() / 150).clamp(0.0, 1.0);
+                            final dragState =
+                                drag == 0 ? null : stateForDirection(drag > 0);
+                            final active = dragState != null &&
+                                dragState == stateForDirection(true);
+                            return _SwipeHint(
+                              icon: Icons.keyboard_arrow_down,
+                              label: stateForDirection(true) ==
+                                      StudyState.memorized
+                                  ? '외움'
+                                  : '다시',
+                              color: positiveColor,
+                              progress: active ? progress : 0,
+                              leadingIcon: true,
+                            );
+                          },
+                        ),
                       ),
                     )
                   else
@@ -2579,56 +2633,13 @@ class _StudyBackground extends StatelessWidget {
               : dragState == StudyState.review
                   ? Color.lerp(Colors.white, const Color(0xFFFFE8E6), progress)!
                   : Colors.white;
-          final label = dragState == StudyState.memorized
-              ? '외움'
-              : dragState == StudyState.review
-                  ? '다시'
-                  : '';
-          final labelColor = dragState == StudyState.memorized ? sea : coral;
           return AnimatedContainer(
             key: const ValueKey('study-card-background'),
             duration:
                 drag == 0 ? const Duration(milliseconds: 180) : Duration.zero,
             curve: Curves.easeOut,
             color: color,
-            child: Stack(
-              children: [
-                if (child != null) child,
-                Positioned.fill(
-                  child: IgnorePointer(
-                    child: SafeArea(
-                      child: Align(
-                        alignment: Alignment.topCenter,
-                        child: AnimatedOpacity(
-                          key: const ValueKey('study-drag-decision-label'),
-                          opacity: label.isEmpty ? 0 : progress,
-                          duration: const Duration(milliseconds: 90),
-                          child: Container(
-                            margin: const EdgeInsets.only(top: 72),
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 18, vertical: 8),
-                            decoration: BoxDecoration(
-                              color: labelColor.withValues(alpha: .14),
-                              borderRadius: BorderRadius.circular(999),
-                              border: Border.all(
-                                  color: labelColor.withValues(alpha: .42)),
-                            ),
-                            child: Text(
-                              label,
-                              style: TextStyle(
-                                color: labelColor,
-                                fontSize: 18,
-                                fontWeight: FontWeight.w900,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
+            child: child,
           );
         },
       );
@@ -3305,18 +3316,63 @@ class _JapaneseKanjiDetails extends StatelessWidget {
 }
 
 class _SwipeHint extends StatelessWidget {
-  const _SwipeHint({required this.icon, required this.color});
+  const _SwipeHint({
+    required this.icon,
+    required this.label,
+    required this.color,
+    this.progress = 0,
+    this.leadingIcon = true,
+  });
+
   final IconData icon;
+  final String label;
   final Color color;
+  final double progress;
+  final bool leadingIcon;
 
   @override
-  Widget build(BuildContext context) => Container(
-        padding: const EdgeInsets.all(6),
+  Widget build(BuildContext context) {
+    final clamped = progress.clamp(0.0, 1.0);
+    final foregroundAlpha = _lerpDouble(.50, .94, clamped);
+    final backgroundAlpha = _lerpDouble(.07, .18, clamped);
+    final scale = _lerpDouble(1.0, 1.08, clamped);
+    final iconWidget = Icon(
+      icon,
+      size: _lerpDouble(20, 24, clamped),
+      color: color.withValues(alpha: foregroundAlpha),
+    );
+    final labelWidget = AnimatedDefaultTextStyle(
+      duration: const Duration(milliseconds: 90),
+      style: TextStyle(
+        color: color.withValues(alpha: foregroundAlpha),
+        fontSize: _lerpDouble(12, 15, clamped),
+        fontWeight: FontWeight.w900,
+        letterSpacing: -.1,
+      ),
+      child: Text(label),
+    );
+    final children = leadingIcon
+        ? [iconWidget, const SizedBox(width: 3), labelWidget]
+        : [labelWidget, const SizedBox(width: 3), iconWidget];
+    return AnimatedScale(
+      scale: scale,
+      duration: const Duration(milliseconds: 90),
+      curve: Curves.easeOutCubic,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 90),
+        height: 32,
+        padding: const EdgeInsets.symmetric(horizontal: 10),
         decoration: BoxDecoration(
-            color: color.withValues(alpha: .07),
-            borderRadius: BorderRadius.circular(99)),
-        child: Icon(icon, size: 20, color: color.withValues(alpha: .55)),
-      );
+          color: color.withValues(alpha: backgroundAlpha),
+          borderRadius: BorderRadius.circular(99),
+          border: Border.all(
+            color: color.withValues(alpha: _lerpDouble(.10, .36, clamped)),
+          ),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: children),
+      ),
+    );
+  }
 }
 
 class QuizPage extends StatefulWidget {
@@ -3500,7 +3556,7 @@ class ResultPage extends StatelessWidget {
             FilledButton.icon(
                 onPressed: () => Navigator.pop(context),
                 icon: const Icon(Icons.home),
-                label: const Text('홈으로')),
+                label: const Text('메인으로')),
           ]),
         ))),
       );
