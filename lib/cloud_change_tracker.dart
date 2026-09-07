@@ -43,7 +43,9 @@ class CloudChangeTracker {
   static const _initializedPrefix = 'autoBackup.initialized.';
   static const _networkPrefix = 'autoBackup.network.';
   static const _lastSuccessPrefix = 'autoBackup.lastSuccess.';
+  static const _lastDownloadPrefix = 'autoBackup.lastDownload.';
   static const _lastErrorPrefix = 'autoBackup.lastError.';
+  static const _logKey = 'autoBackup.logs.v1';
 
   final SharedPreferences _prefs;
   void Function()? onChanged;
@@ -186,6 +188,19 @@ class CloudChangeTracker {
           : AutoBackupNetworkPolicy.all;
   DateTime? lastSuccess(String uid) =>
       DateTime.tryParse(_prefs.getString('$_lastSuccessPrefix$uid') ?? '');
+  DateTime? lastDownload(String uid) =>
+      DateTime.tryParse(_prefs.getString('$_lastDownloadPrefix$uid') ?? '');
+  List<String> get logs => _prefs.getStringList(_logKey) ?? <String>[];
+
+  Future<void> recordLog(String message) async {
+    final entries = <String>[
+      DateTime.now().toIso8601String() + ' ' + message,
+      ...logs
+    ];
+    await _prefs.setStringList(_logKey, entries.take(30).toList());
+    onChanged?.call();
+  }
+
   String? lastError(String uid) => _prefs.getString('$_lastErrorPrefix$uid');
 
   Future<void> setInitialized(String uid, bool value) async {
@@ -207,6 +222,11 @@ class CloudChangeTracker {
   Future<void> recordSuccess(String uid, DateTime time) async {
     await _prefs.setString('$_lastSuccessPrefix$uid', time.toIso8601String());
     await _prefs.remove('$_lastErrorPrefix$uid');
+    onChanged?.call();
+  }
+
+  Future<void> recordDownload(String uid, DateTime time) async {
+    await _prefs.setString('$_lastDownloadPrefix$uid', time.toIso8601String());
     onChanged?.call();
   }
 

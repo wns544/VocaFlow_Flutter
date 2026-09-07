@@ -38,6 +38,10 @@ final defaultKanjiLookupService = KanjiLookupService();
 final resumeSnapshotNavigatorObserver = _ResumeSnapshotNavigatorObserver();
 final resumeRouteObserver = RouteObserver<ModalRoute<dynamic>>();
 
+void vocaBackLog(String message) {
+  debugPrint('VOCABACK $message');
+}
+
 class _ResumeSnapshotNavigatorObserver extends NavigatorObserver {
   @override
   void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) {
@@ -183,11 +187,23 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
   Future<bool> _handleNavigationButton(MethodCall call) async {
     final method = call.method;
     if (method != 'back' && method != 'forward') return false;
+    vocaBackLog('flutter channel received method=$method');
     final browserHandler = activeBrowserNavigationButtonHandler;
-    if (browserHandler != null && await browserHandler(method)) return true;
-    if (method == 'back') {
-      return navigatorKey.currentState?.maybePop() ?? false;
+    if (browserHandler != null) {
+      vocaBackLog('flutter channel dispatch to browser method=$method');
+      final handled = await browserHandler(method);
+      vocaBackLog('flutter channel browser handled=$handled method=$method');
+      if (handled) return true;
+    } else {
+      vocaBackLog('flutter channel no active browser method=$method');
     }
+    if (method == 'back') {
+      final handled = await (navigatorKey.currentState?.maybePop() ??
+          Future<bool>.value(false));
+      vocaBackLog('flutter navigator maybePop handled=$handled');
+      return handled;
+    }
+    vocaBackLog('flutter channel forward unhandled');
     return false;
   }
 
@@ -233,7 +249,7 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
     if (!coordinator.enabled || !coordinator.initialized) return;
     final hadInitialStudy = initialStudy != null || store?.activeStudy != null;
     try {
-      await coordinator.mergeFromCloud();
+      await coordinator.mergeFromCloud(uploadMerged: false);
       final restored = store?.activeStudy;
       if (!mounted) return;
       setState(() => initialStudy = restored ?? initialStudy);
@@ -1923,15 +1939,25 @@ class _CardStudyPageState extends State<CardStudyPage>
   }
 
   Future<void> requestExitStudy({bool confirm = false}) async {
+    vocaBackLog(
+        'study requestExit confirm=$confirm exiting=$exiting routeCurrent=${_route?.isCurrent}');
     if (exiting) return;
-    if (confirm && !(_route?.isCurrent ?? true)) return;
-    if (confirm && !await _confirmExitStudy()) return;
+    if (confirm && !(_route?.isCurrent ?? true)) {
+      vocaBackLog('study requestExit ignored because route is not current');
+      return;
+    }
+    if (confirm && !await _confirmExitStudy()) {
+      vocaBackLog('study requestExit cancelled by dialog');
+      return;
+    }
+    vocaBackLog('study requestExit proceeding to exitStudy');
     await exitStudy();
   }
 
   Future<bool> _confirmExitStudy() async {
     if (!mounted) return false;
-    return await showDialog<bool>(
+    vocaBackLog('study confirm dialog show');
+    final result = await showDialog<bool>(
           context: context,
           builder: (context) => AlertDialog(
             title: const Text('학습을 잠시 중지할까요?'),
@@ -1949,6 +1975,8 @@ class _CardStudyPageState extends State<CardStudyPage>
           ),
         ) ??
         false;
+    vocaBackLog('study confirm dialog result=$result');
+    return result;
   }
 
   Future<void> exitStudy() async {
@@ -2051,6 +2079,7 @@ class _CardStudyPageState extends State<CardStudyPage>
   }
 
   Future<void> showKanjiDetails(String character, Word word) async {
+    vocaBackLog('kanji sheet show character=$character word=${word.term}');
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -2063,6 +2092,7 @@ class _CardStudyPageState extends State<CardStudyPage>
         service: widget.kanjiLookupService ?? defaultKanjiLookupService,
       ),
     );
+    vocaBackLog('kanji sheet closed character=$character word=${word.term}');
   }
 
   Future<void> editCurrentWord() async {
@@ -2373,6 +2403,8 @@ class _CardStudyPageState extends State<CardStudyPage>
     return PopScope(
       canPop: exiting,
       onPopInvokedWithResult: (didPop, _) {
+        vocaBackLog(
+            'study PopScope didPop=$didPop exiting=$exiting routeCurrent=${_route?.isCurrent}');
         if (!didPop && (_route?.isCurrent ?? true)) {
           requestExitStudy(confirm: true);
         }
@@ -5449,8 +5481,12 @@ class _SettingsPageState extends State<SettingsPage> {
     final user = firebaseReady ? FirebaseAuth.instance.currentUser : null;
     final auto = widget.autoBackup;
     final lastSuccess = auto?.lastSuccess?.toLocal();
+    final lastDownload = auto?.lastDownload?.toLocal();
     final lastSuccessText =
         lastSuccess == null ? '아직 없음' : lastSuccess.toString().substring(0, 16);
+    final lastDownloadText = lastDownload == null
+        ? '아직 없음'
+        : lastDownload.toString().substring(0, 16);
     return ListView(
       padding: const EdgeInsets.fromLTRB(24, 32, 24, 28),
       children: [
@@ -5560,7 +5596,10 @@ class _SettingsPageState extends State<SettingsPage> {
                         },
                 ),
                 const SizedBox(height: 12),
-                Text('마지막 성공: $lastSuccessText',
+                Text('마지막 업로드: $lastSuccessText',
+                    style: const TextStyle(
+                        color: Color(0xFF8E8E93), fontSize: 12)),
+                Text('마지막 내려받기: $lastDownloadText',
                     style: const TextStyle(
                         color: Color(0xFF8E8E93), fontSize: 12)),
                 Text(
@@ -5570,6 +5609,20 @@ class _SettingsPageState extends State<SettingsPage> {
                 if (auto?.isUploading == true)
                   const Text('증분 백업 중...',
                       style: TextStyle(color: sea, fontSize: 12)),
+                if (auto?.isDownloading == true)
+                  const Text('클라우드 확인 중...',
+                      style: TextStyle(color: sea, fontSize: 12)),
+                if (auto?.logs.isNotEmpty == true) ...[
+                  const SizedBox(height: 8),
+                  const Text('최근 동기화 기록',
+                      style:
+                          TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+                  ...auto!.logs.take(5).map((entry) => Text(entry,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          color: Color(0xFF8E8E93), fontSize: 11))),
+                ],
                 if (auto?.lastError != null) ...[
                   const SizedBox(height: 4),
                   Text('마지막 오류: ${auto!.lastError}',

@@ -39,10 +39,13 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   int? _scheduledGeneration;
   StreamSubscription<User?>? _authSubscription;
   bool _uploading = false;
+  bool _downloading = false;
+  DateTime? _lastDownloadAttempt;
   bool _flushingForBackground = false;
   int _failureCount = 0;
 
   bool get isUploading => _uploading;
+  bool get isDownloading => _downloading;
   User? get user => FirebaseAuth.instance.currentUser;
   bool get enabled => user != null && store.cloudChanges.isEnabled(user!.uid);
   bool get initialized =>
@@ -50,6 +53,9 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   int get pendingCount => store.cloudChanges.pendingCount;
   DateTime? get lastSuccess =>
       user == null ? null : store.cloudChanges.lastSuccess(user!.uid);
+  List<String> get logs => store.cloudChanges.logs;
+  DateTime? get lastDownload =>
+      user == null ? null : store.cloudChanges.lastDownload(user!.uid);
   String? get lastError =>
       user == null ? null : store.cloudChanges.lastError(user!.uid);
   AutoBackupNetworkPolicy get networkPolicy => user == null
@@ -65,6 +71,8 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       _cancelScheduledUpload();
       onChanged?.call();
       if (enabled && pendingCount > 0) requestImmediateBackup();
+      if (enabled && initialized)
+        unawaited(mergeFromCloud(uploadMerged: false));
     });
     if (enabled && pendingCount > 0) requestImmediateBackup();
   }
@@ -149,6 +157,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         }
       }
       await store.cloudChanges.recordSuccess(current.uid, _now());
+      await store.cloudChanges.recordLog('자동 업로드 완료');
       _failureCount = 0;
       onChanged?.call();
     } catch (error) {
@@ -164,22 +173,42 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     await store.replaceWithBackupJson(backup);
     await store.cloudChanges.clearPending();
     await store.cloudChanges.recordSuccess(current.uid, _now());
+    await store.cloudChanges.recordDownload(current.uid, _now());
     _failureCount = 0;
     onChanged?.call();
   }
 
-  Future<void> mergeFromCloud() async {
+  Future<void> mergeFromCloud({bool uploadMerged = true}) async {
     final current = user;
-    if (current == null || !enabled || !initialized) return;
-    final local = store.toBackupJson();
-    final remote = await cloud.downloadBackupJson();
-    final merged = mergeBackupJson(cloud: remote, local: local);
-    await store.replaceWithBackupJson(merged);
-    await cloud.upload(store);
-    await store.cloudChanges.clearPending();
-    await store.cloudChanges.recordSuccess(current.uid, _now());
-    _failureCount = 0;
+    if (current == null || !enabled || !initialized || _downloading) return;
+    final now = _now();
+    if (!uploadMerged &&
+        _lastDownloadAttempt != null &&
+        now.difference(_lastDownloadAttempt!) < const Duration(seconds: 30))
+      return;
+    _lastDownloadAttempt = now;
+    _downloading = true;
+    await store.cloudChanges.recordLog('클라우드 내려받기 시작');
     onChanged?.call();
+    try {
+      if (pendingCount > 0) await _uploadPending();
+      if (pendingCount > 0) return;
+      final local = store.toBackupJson();
+      final remote = await cloud.downloadBackupJson();
+      final merged = mergeBackupJson(cloud: remote, local: local);
+      await store.replaceWithBackupJson(merged);
+      await store.cloudChanges.clearPending();
+      if (uploadMerged) await cloud.upload(store);
+      await store.cloudChanges.recordDownload(current.uid, _now());
+      await store.cloudChanges.recordLog('클라우드 내려받기 완료');
+      _failureCount = 0;
+    } catch (error) {
+      await store.cloudChanges.recordError(current.uid, error);
+      await store.cloudChanges.recordLog('자동 동기화 오류 · ' + error.toString());
+    } finally {
+      _downloading = false;
+      onChanged?.call();
+    }
   }
 
   void requestImmediateBackup({bool ignoreMinimumInterval = false}) =>
@@ -258,6 +287,8 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     // clear profileDirty before the latest local study persistence.
     final hasActiveCourse = store.activeStudies.isNotEmpty;
     _uploading = true;
+    await store.cloudChanges
+        .recordLog('자동 업로드 시작 · ' + changes.pendingCount.toString() + '개 변경');
     onChanged?.call();
     try {
       await cloud.uploadIncremental(
@@ -267,6 +298,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       );
       await store.cloudChanges.acknowledge(changes);
       await store.cloudChanges.recordSuccess(current.uid, _now());
+      await store.cloudChanges.recordLog('자동 업로드 완료');
       _failureCount = 0;
       if (pendingCount > 0) _schedule(idleDelay);
     } catch (error) {
@@ -325,6 +357,8 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       if (enabled && pendingCount > 0) requestImmediateBackup();
+      if (enabled && initialized)
+        unawaited(mergeFromCloud(uploadMerged: false));
       return;
     }
     if (state == AppLifecycleState.paused ||

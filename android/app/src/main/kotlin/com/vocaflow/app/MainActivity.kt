@@ -11,6 +11,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.speech.tts.TextToSpeech
+import android.util.Log
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.PixelCopy
@@ -26,6 +27,7 @@ import java.io.FileOutputStream
 import java.util.Locale
 
 class MainActivity : FlutterActivity() {
+    private val backLogTag = "VOCABACK"
     private val channelName = "com.vocaflow.app/study_speech"
     private val externalChannelName = "com.vocaflow.app/external_links"
     private val snapshotChannelName = "com.vocaflow.app/resume_snapshot"
@@ -114,28 +116,35 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        Log.d(backLogTag, "android key event action=${event.action} keyCode=${event.keyCode} repeat=${event.repeatCount} alt=${event.isAltPressed}")
         if (event.action == KeyEvent.ACTION_UP) {
             when (event.keyCode) {
-                KeyEvent.KEYCODE_BACK,
+                KeyEvent.KEYCODE_BACK -> {
+                    Log.d(backLogTag, "android key system back passthrough")
+                }
                 KeyEvent.KEYCODE_NAVIGATE_PREVIOUS,
                 KeyEvent.KEYCODE_BUTTON_4 -> {
+                    Log.d(backLogTag, "android key -> back keyCode=${event.keyCode}")
                     sendNavigationButton("back")
                     return true
                 }
                 KeyEvent.KEYCODE_FORWARD,
                 KeyEvent.KEYCODE_NAVIGATE_NEXT,
                 KeyEvent.KEYCODE_BUTTON_5 -> {
+                    Log.d(backLogTag, "android key -> forward keyCode=${event.keyCode}")
                     sendNavigationButton("forward")
                     return true
                 }
                 KeyEvent.KEYCODE_DPAD_LEFT -> {
                     if (event.isAltPressed) {
+                        Log.d(backLogTag, "android alt-left -> back")
                         sendNavigationButton("back")
                         return true
                     }
                 }
                 KeyEvent.KEYCODE_DPAD_RIGHT -> {
                     if (event.isAltPressed) {
+                        Log.d(backLogTag, "android alt-right -> forward")
                         sendNavigationButton("forward")
                         return true
                     }
@@ -146,12 +155,19 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        val hasBackButton = (event.buttonState and MotionEvent.BUTTON_BACK) != 0
+        val hasForwardButton = (event.buttonState and MotionEvent.BUTTON_FORWARD) != 0
+        if (event.action == MotionEvent.ACTION_BUTTON_PRESS || hasBackButton || hasForwardButton) {
+            Log.d(backLogTag, "android motion event action=${event.action} buttonState=${event.buttonState} back=$hasBackButton forward=$hasForwardButton")
+        }
         if (event.action == MotionEvent.ACTION_BUTTON_PRESS) {
-            if ((event.buttonState and MotionEvent.BUTTON_BACK) != 0) {
+            if (hasBackButton) {
+                Log.d(backLogTag, "android mouse -> back")
                 sendNavigationButton("back")
                 return true
             }
-            if ((event.buttonState and MotionEvent.BUTTON_FORWARD) != 0) {
+            if (hasForwardButton) {
+                Log.d(backLogTag, "android mouse -> forward")
                 sendNavigationButton("forward")
                 return true
             }
@@ -160,6 +176,7 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun sendNavigationButton(direction: String) {
+        Log.d(backLogTag, "android sendNavigationButton direction=$direction channelReady=${navigationButtonChannel != null}")
         navigationButtonChannel?.invokeMethod(direction, null)
     }
     private fun showResumeSnapshot() {
@@ -335,5 +352,8 @@ class MainActivity : FlutterActivity() {
         private const val SNAPSHOT_TIMEOUT_MS = 3000L
     }
 }
+
+
+
 
 

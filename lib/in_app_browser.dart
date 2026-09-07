@@ -22,6 +22,7 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
   var _loading = true;
   var _canGoBack = false;
   var _canGoForward = false;
+  var _closing = false;
   String? _errorMessage;
 
   @override
@@ -132,12 +133,20 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
   }
 
   Future<void> _goBack() async {
+    if (_closing) return;
     if (await _controller.canGoBack()) {
       await _controller.goBack();
       await _refreshHistoryState();
       return;
     }
-    if (mounted) Navigator.of(context).pop();
+    if (mounted) {
+      _closing = true;
+      if (identical(
+          activeBrowserNavigationButtonHandler, _handleNavigationButton)) {
+        activeBrowserNavigationButtonHandler = null;
+      }
+      Navigator.of(context).pop();
+    }
   }
 
   Future<void> _goForward() async {
@@ -148,6 +157,7 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
   }
 
   Future<bool> _handleNavigationButton(String direction) async {
+    if (_closing) return true;
     if (direction == 'back') {
       await _goBack();
       return true;
