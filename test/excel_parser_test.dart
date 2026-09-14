@@ -67,4 +67,38 @@ void main() {
     expect(words.single.reading, 'いせき');
     expect(words.single.meaning, '유적');
   });
+  test('xlsx related words column is preserved in import result', () {
+    final workbook = Excel.createExcel();
+    final sheet = workbook['Sheet1'];
+    sheet.appendRow([
+      TextCellValue('term'),
+      TextCellValue('meaning'),
+      TextCellValue('reading'),
+      TextCellValue('relatedWords'),
+    ]);
+    sheet.appendRow([
+      TextCellValue('貢献'),
+      TextCellValue('공헌'),
+      TextCellValue('こうけん'),
+      TextCellValue('寄与; 協力'),
+    ]);
+    sheet.appendRow([
+      TextCellValue('寄与'),
+      TextCellValue('기여'),
+      TextCellValue('きよ'),
+      TextCellValue(''),
+    ]);
+    sheet.appendRow([
+      TextCellValue('協力'),
+      TextCellValue('협력'),
+      TextCellValue('きょうりょく'),
+      TextCellValue(''),
+    ]);
+
+    final result = parseWordImportXlsx(workbook.encode()!);
+
+    expect(result.words, hasLength(3));
+    expect(
+        result.relations.map((relation) => relation.targetTerm), ['寄与', '協力']);
+  });
 }

@@ -10,6 +10,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+
+import android.os.SystemClock
 import android.speech.tts.TextToSpeech
 import android.util.Log
 import android.view.KeyEvent
@@ -32,6 +34,7 @@ class MainActivity : FlutterActivity() {
     private val externalChannelName = "com.vocaflow.app/external_links"
     private val snapshotChannelName = "com.vocaflow.app/resume_snapshot"
     private val navigationButtonChannelName = "com.vocaflow.app/navigation_buttons"
+    private val navigationDiagnosticChannelName = "com.vocaflow.app/navigation_diagnostics"
     private val snapshotFile by lazy { File(cacheDir, "resume_snapshot.jpg") }
     private val snapshotTempFile by lazy { File(cacheDir, "resume_snapshot.tmp") }
     private val snapshotPreferences by lazy {
@@ -43,10 +46,18 @@ class MainActivity : FlutterActivity() {
     private var snapshotOverlay: ImageView? = null
     private var snapshotCaptureInProgress = false
     private var navigationButtonChannel: MethodChannel? = null
+    private var navigationDiagnosticChannel: MethodChannel? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val snapshotTimeout = Runnable {
         removeSnapshotOverlay(deleteFile = true)
     }
+    // Samsung One Hand Operation+ can emit a duplicated ACTION_UP and a
+    // second KEY_BACK shortly after a single gesture. Consume only that
+    // short burst before Flutter starts popping the next route.
+    private var lastAcceptedSystemBackDownAt = 0L
+    private var lastAcceptedSystemBackUpAt = 0L
+    private var suppressCurrentSystemBack = false
+    private var hasAcceptedSystemBackDown = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -95,6 +106,7 @@ class MainActivity : FlutterActivity() {
                 }
             }
         navigationButtonChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, navigationButtonChannelName)
+        navigationDiagnosticChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, navigationDiagnosticChannelName)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, snapshotChannelName)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
@@ -116,7 +128,49 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+            recordNavigationInput("key", mapOf(
+                "action" to event.action,
+                "repeatCount" to event.repeatCount,
+                "downTime" to event.downTime,
+                "eventTime" to event.eventTime,
+                "deviceId" to event.deviceId,
+                "source" to event.source,
+                "flags" to event.flags,
+            ))
+        }
         Log.d(backLogTag, "android key event action=${event.action} keyCode=${event.keyCode} repeat=${event.repeatCount} alt=${event.isAltPressed}")
+        if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+            val now = SystemClock.elapsedRealtime()
+            if (event.action == KeyEvent.ACTION_DOWN) {
+                val deltaMs = now - lastAcceptedSystemBackDownAt
+                if (lastAcceptedSystemBackDownAt > 0 && deltaMs < SYSTEM_BACK_DEBOUNCE_MS) {
+                    suppressCurrentSystemBack = true
+                    hasAcceptedSystemBackDown = false
+                    Log.d(backLogTag, "android key system back suppressed on down deltaMs=$deltaMs")
+                    return true
+                }
+                suppressCurrentSystemBack = false
+                lastAcceptedSystemBackDownAt = now
+                hasAcceptedSystemBackDown = true
+                Log.d(backLogTag, "android key system back accepted on down")
+            } else if (event.action == KeyEvent.ACTION_UP) {
+                val deltaMs = now - lastAcceptedSystemBackUpAt
+                val hasMatchingDown = hasAcceptedSystemBackDown &&
+                    now - lastAcceptedSystemBackDownAt <= SYSTEM_BACK_UP_MAX_AFTER_DOWN_MS
+                if (suppressCurrentSystemBack ||
+                    !hasMatchingDown ||
+                    (lastAcceptedSystemBackUpAt > 0 && deltaMs < SYSTEM_BACK_DUPLICATE_UP_MS)
+                ) {
+                    suppressCurrentSystemBack = false
+                    hasAcceptedSystemBackDown = false
+                    Log.d(backLogTag, "android key system back suppressed on up deltaMs=$deltaMs matchingDown=$hasMatchingDown")
+                    return true
+                }
+                hasAcceptedSystemBackDown = false
+                lastAcceptedSystemBackUpAt = now
+            }
+        }
         if (event.action == KeyEvent.ACTION_UP) {
             when (event.keyCode) {
                 KeyEvent.KEYCODE_BACK -> {
@@ -175,6 +229,12 @@ class MainActivity : FlutterActivity() {
         return super.dispatchGenericMotionEvent(event)
     }
 
+    private fun recordNavigationInput(kind: String, values: Map<String, Any>) {
+        val data = HashMap<String, Any>(values)
+        data["kind"] = kind
+        data["elapsedRealtime"] = SystemClock.elapsedRealtime()
+        navigationDiagnosticChannel?.invokeMethod("event", data)
+    }
     private fun sendNavigationButton(direction: String) {
         Log.d(backLogTag, "android sendNavigationButton direction=$direction channelReady=${navigationButtonChannel != null}")
         navigationButtonChannel?.invokeMethod(direction, null)
@@ -347,6 +407,9 @@ class MainActivity : FlutterActivity() {
     }
 
     companion object {
+        private const val SYSTEM_BACK_DEBOUNCE_MS = 700L
+        private const val SYSTEM_BACK_DUPLICATE_UP_MS = 80L
+        private const val SYSTEM_BACK_UP_MAX_AFTER_DOWN_MS = 250L
         private const val SNAPSHOT_MAX_WIDTH = 1600
         private const val SNAPSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000L
         private const val SNAPSHOT_TIMEOUT_MS = 3000L

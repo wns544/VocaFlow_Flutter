@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:shared_preferences/shared_preferences.dart';
@@ -268,6 +269,7 @@ class VocaStore {
   static const _flipCardKey = 'flipCard';
   static const _activeStudyKey = 'activeStudy';
   static const _lastMainTabKey = 'lastMainTab';
+  static const _mainTabMigrationKey = 'mainTabMigrationV2';
   static const _japaneseFontKey = 'japaneseFont';
   static const _termFontSizeKey = 'termFontSize';
   static const _readingFontSizeKey = 'readingFontSize';
@@ -303,10 +305,26 @@ class VocaStore {
     store.books = store._loadBooks();
     store.cloudChanges = await CloudChangeTracker.load();
     await store._migrateOpenDictionaryInAppSetting();
+    await store._migrateMainTab();
     store.wordSearch = LocalWordSearchIndex(() => store.books);
     await store._migrateRangeCourses();
     await store._repairSwappedJapaneseFields();
     return store;
+  }
+
+  Future<void> _migrateMainTab() async {
+    if (_prefs.getBool(_mainTabMigrationKey) ?? false) return;
+    final old = _prefs.getInt(_lastMainTabKey);
+    if (old != null && old > 0) {
+      await _prefs.setInt(
+          _lastMainTabKey,
+          old == 1
+              ? 2
+              : old == 2
+                  ? 3
+                  : old);
+    }
+    await _prefs.setBool(_mainTabMigrationKey, true);
   }
 
   Future<void> _migrateRangeCourses() async {
@@ -325,7 +343,11 @@ class VocaStore {
   }
 
   int get sessionSize => _prefs.getInt(_sessionSizeKey) ?? 10;
-  int get lastMainTab => (_prefs.getInt(_lastMainTabKey) ?? 0).clamp(0, 2);
+  int get lastMainTab {
+    final value = _prefs.getInt(_lastMainTabKey) ?? 0;
+    return value.clamp(0, 3);
+  }
+
   bool get horizontalSwipe => _prefs.getBool(_horizontalSwipeKey) ?? false;
   bool get reverseSwipe => _prefs.getBool(_reverseSwipeKey) ?? false;
   bool get readingAboveTerm => _prefs.getBool(_readingAboveTermKey) ?? false;
@@ -818,7 +840,21 @@ class VocaStore {
     if (tombstones.remove(resolvedKey) != null) {
       await _saveActiveStudyTombstones(tombstones);
     }
-    if (markCloudChange) await cloudChanges.markProfile();
+    if (markCloudChange) await cloudChanges.markLearningState();
+    unawaited(cloudChanges.recordDiagnostic('active_study_saved', data: {
+      'studyKey': resolvedKey,
+      'bookId': updatedActive.bookId,
+      'sessionIndexes': updatedActive.sessionIndexes,
+      'rangeStart': updatedActive.rangeStart,
+      'rangeEnd': updatedActive.rangeEnd,
+      'queueCount': updatedActive.queueIds.length,
+      'queueHeadWordId':
+          updatedActive.queueIds.isEmpty ? null : updatedActive.queueIds.first,
+      'memorized': updatedActive.memorized,
+      'total': updatedActive.total,
+      'lastWordId': updatedActive.lastWordId,
+      'lastState': updatedActive.lastState?.name,
+    }));
   }
 
   Future<void> _saveActiveStudies(Map<String, ActiveStudy> studies) {
@@ -836,7 +872,7 @@ class VocaStore {
       studies.remove(key);
       await _saveActiveStudies(studies);
       await _markActiveStudyTombstone(key);
-      if (markCloudChange) await cloudChanges.markProfile();
+      if (markCloudChange) await cloudChanges.markLearningState();
     }
   }
 
@@ -855,7 +891,7 @@ class VocaStore {
     await _prefs.remove(_activeStudiesKey);
     await _prefs.remove(_activeStudyKey);
     await _saveActiveStudyTombstones(tombstones);
-    if (markCloudChange) await cloudChanges.markProfile();
+    if (markCloudChange) await cloudChanges.markLearningState();
   }
 
   ActiveStudy? get activeStudy {
@@ -966,7 +1002,7 @@ class VocaStore {
   }
 
   Future<void> setLastMainTab(int index) =>
-      _prefs.setInt(_lastMainTabKey, index.clamp(0, 2));
+      _prefs.setInt(_lastMainTabKey, index.clamp(0, 3));
 
   int get streak {
     final days = (_prefs.getStringList(_studyDaysKey) ?? []).toSet();
@@ -1174,7 +1210,7 @@ class VocaStore {
     await cloudChanges.markProfile();
   }
 
-  Future<void> addBook(String name, List<Word> words) async {
+  Future<WordBook> addBook(String name, List<Word> words) async {
     books.add(WordBook(
       id: _newBookId(),
       name: name.trim().isEmpty ? '가져온 단어장' : name.trim(),
@@ -1186,6 +1222,7 @@ class VocaStore {
     await cloudChanges.markBook(added.id);
     await cloudChanges.markWords(added.id, added.words.map((word) => word.id));
     await cloudChanges.markProfile();
+    return added;
   }
 
   Future<void> updateBook(WordBook updated) async {
@@ -1207,7 +1244,29 @@ class VocaStore {
     for (final book in books) {
       final index = book.words.indexWhere((word) => word.id == updated.id);
       if (index < 0) continue;
+      final previous = book.words[index];
+      if (previous.isFavorite != updated.isFavorite &&
+          previous.favoriteUpdatedAt == updated.favoriteUpdatedAt) {
+        updated.favoriteUpdatedAt = DateTime.now().toUtc();
+      }
       book.words[index] = updated;
+      await _saveBooks();
+      wordSearch.invalidate();
+      await cloudChanges.markWord(book.id, updated.id);
+      return;
+    }
+  }
+
+  Future<void> setWordFavorite(Word word, bool value, {String? bookId}) async {
+    final now = DateTime.now().toUtc();
+    for (final book in books) {
+      if (bookId != null && book.id != bookId) continue;
+      final index =
+          book.words.indexWhere((candidate) => candidate.id == word.id);
+      if (index < 0) continue;
+      final updated = book.words[index];
+      updated.isFavorite = value;
+      updated.favoriteUpdatedAt = now;
       await _saveBooks();
       wordSearch.invalidate();
       await cloudChanges.markWord(book.id, updated.id);
@@ -1299,6 +1358,9 @@ class VocaStore {
     String? bookId,
     List<int> sessionIndexes = const [],
   }) async {
+    final beforeState = word.state;
+    final beforeCorrect = word.correctCount;
+    final beforeWrong = word.wrongCount;
     word.state = state;
     WordBook? book;
     for (final candidate in books) {
@@ -1325,8 +1387,23 @@ class VocaStore {
       );
     }
     await _saveBooks();
-    if (book != null) await cloudChanges.markWord(book.id, word.id);
-    if (recordAttempt) await cloudChanges.markProfile();
+    if (recordAttempt) {
+      await cloudChanges.markLearningState();
+      unawaited(cloudChanges.recordDiagnostic('card_decision', data: {
+        'bookId': bookId ?? book?.id,
+        'wordId': word.id,
+        'term': word.term,
+        'reading': word.reading,
+        'decision': state.name,
+        'beforeState': beforeState.name,
+        'afterState': word.state.name,
+        'beforeCorrectCount': beforeCorrect,
+        'afterCorrectCount': word.correctCount,
+        'beforeWrongCount': beforeWrong,
+        'afterWrongCount': word.wrongCount,
+        'sessionIndexes': sessionIndexes,
+      }));
+    }
   }
 
   Future<void> completeCurrentSession() async {
@@ -1344,7 +1421,12 @@ class VocaStore {
       ..add(_dayKey(DateTime.now()));
     await _prefs.setStringList(_studyDaysKey, days.toList());
     await _clearActiveStudiesForSessions(quickBook.id, {completedIndex});
-    await cloudChanges.markProfile();
+    await cloudChanges.markLearningState();
+    unawaited(cloudChanges.recordDiagnostic('session_completed', data: {
+      'bookId': quickBook.id,
+      'sessionIndex': completedIndex,
+      'completedCount': completed.length,
+    }));
     onSessionCompleted?.call();
   }
 
@@ -1367,14 +1449,220 @@ class VocaStore {
     await _prefs.remove(_studyDaysKey);
     await _prefs.remove(_dailyStudyStatsKey);
     await _prefs.remove(_studyEventLogKey);
-    await clearAllActiveStudies();
+    await clearAllActiveStudies(markCloudChange: false);
     await _saveBooks();
-    await cloudChanges.markProfile();
-    for (final book in books) {
-      await cloudChanges.markWords(book.id, book.words.map((word) => word.id));
-    }
+    await cloudChanges.markLearningState();
   }
 
+  /// A card-content-free snapshot. Only learning metadata is sent to the
+  /// dedicated learningState collection; Firebase words remain read-only.
+  Map<String, dynamic> toLearningStateJson() => {
+        'schema': 1,
+        'wordStates': {
+          for (final book in books)
+            book.id: {
+              for (final word in book.words)
+                word.id.toString(): {
+                  'state': word.state.name,
+                  'correctCount': word.correctCount,
+                  'wrongCount': word.wrongCount,
+                  'lastStudiedAt': word.lastStudiedAt?.toIso8601String(),
+                  'lastWrongAt': word.lastWrongAt?.toIso8601String(),
+                },
+            },
+        },
+        'completed': _prefs.getStringList(_completedKey) ?? <String>[],
+        'completedAt': completedAt.map(
+          (key, value) => MapEntry(key, value.toIso8601String()),
+        ),
+        'rangeCoursePasses': coursePasses,
+        'studyDays': _prefs.getStringList(_studyDaysKey) ?? <String>[],
+        'dailyStudyStats': dailyStudyStats.map(
+          (key, value) => MapEntry(key, value.toJson()),
+        ),
+        'studyEventLog': _prunedStudyEventLog(studyEventLog)
+            .map((event) => event.toJson())
+            .toList(),
+        'activeStudies':
+            activeStudies.map((key, value) => MapEntry(key, value.toJson())),
+        'activeStudyTombstones': activeStudyTombstones.map(
+          (key, value) => MapEntry(key, value.toIso8601String()),
+        ),
+        'resetMarkers': resetMarkers.map(
+          (key, value) => MapEntry(key, value.toIso8601String()),
+        ),
+      };
+
+  /// Applies the union of this phone's and every other phone's dedicated
+  /// learning snapshots. No word text field is read from or written to here.
+  Future<void> applyLearningStateSnapshots(
+      Iterable<Map<String, dynamic>> snapshots) async {
+    final remoteSnapshotCount = snapshots.length;
+    final all = [toLearningStateJson(), ...snapshots];
+    final reset = <String, DateTime>{};
+    final tombstones = <String, DateTime>{};
+    final completed = <String>{};
+    final completedTimes = <String, DateTime>{};
+    final passes = <String, int>{};
+    final days = <String>{};
+    final stats = <String, DailyStudyStats>{};
+    final events = <String, StudyEventLog>{};
+    final activeCandidates = <String, List<Map<String, dynamic>>>{};
+
+    DateTime? asDate(dynamic raw) =>
+        raw is String ? DateTime.tryParse(raw)?.toUtc() : null;
+    void latestInto(Map<String, DateTime> target, dynamic raw) {
+      if (raw is! Map) return;
+      raw.forEach((key, value) {
+        final date = asDate(value);
+        final old = target[key.toString()];
+        if (date != null && (old == null || date.isAfter(old)))
+          target[key.toString()] = date;
+      });
+    }
+
+    for (final snapshot in all) {
+      latestInto(reset, snapshot['resetMarkers']);
+      latestInto(tombstones, snapshot['activeStudyTombstones']);
+      completed.addAll((snapshot['completed'] as List<dynamic>? ?? const [])
+          .map((item) => item.toString()));
+      latestInto(completedTimes, snapshot['completedAt']);
+      final rawPasses = snapshot['rangeCoursePasses'];
+      if (rawPasses is Map)
+        rawPasses.forEach((key, value) {
+          final count = (value as num?)?.toInt() ?? 0;
+          if (count > (passes[key.toString()] ?? 0))
+            passes[key.toString()] = count;
+        });
+      days.addAll((snapshot['studyDays'] as List<dynamic>? ?? const [])
+          .map((item) => item.toString()));
+      final rawStats = snapshot['dailyStudyStats'];
+      if (rawStats is Map)
+        rawStats.forEach((key, value) {
+          if (value is! Map) return;
+          final incoming =
+              DailyStudyStats.fromJson(Map<String, dynamic>.from(value));
+          final current = stats[key.toString()] ?? const DailyStudyStats();
+          stats[key.toString()] = DailyStudyStats(
+            studiedCards: current.studiedCards > incoming.studiedCards
+                ? current.studiedCards
+                : incoming.studiedCards,
+            completedSessions:
+                current.completedSessions > incoming.completedSessions
+                    ? current.completedSessions
+                    : incoming.completedSessions,
+            correctCount: current.correctCount > incoming.correctCount
+                ? current.correctCount
+                : incoming.correctCount,
+            wrongCount: current.wrongCount > incoming.wrongCount
+                ? current.wrongCount
+                : incoming.wrongCount,
+          );
+        });
+      for (final raw
+          in snapshot['studyEventLog'] as List<dynamic>? ?? const []) {
+        if (raw is! Map) continue;
+        final event = StudyEventLog.fromJson(Map<String, dynamic>.from(raw));
+        final old = events[event.id];
+        if (old == null || event.timestamp.isAfter(old.timestamp))
+          events[event.id] = event;
+      }
+      final rawActive = snapshot['activeStudies'];
+      if (rawActive is Map)
+        rawActive.forEach((key, value) {
+          if (value is Map)
+            activeCandidates
+                .putIfAbsent(key.toString(), () => [])
+                .add(Map<String, dynamic>.from(value));
+        });
+    }
+
+    for (final snapshot in all) {
+      final rawBooks = snapshot['wordStates'];
+      if (rawBooks is! Map) continue;
+      for (final book in books) {
+        final rawWords = rawBooks[book.id];
+        if (rawWords is! Map) continue;
+        for (final word in book.words) {
+          final raw = rawWords[word.id.toString()];
+          if (raw is! Map) continue;
+          final state = StudyState.values.firstWhere(
+              (item) => item.name == raw['state'],
+              orElse: () => StudyState.fresh);
+          if (_studyStateRank(state) > _studyStateRank(word.state))
+            word.state = state;
+          word.correctCount =
+              word.correctCount > ((raw['correctCount'] as num?)?.toInt() ?? 0)
+                  ? word.correctCount
+                  : ((raw['correctCount'] as num?)?.toInt() ?? 0);
+          word.wrongCount =
+              word.wrongCount > ((raw['wrongCount'] as num?)?.toInt() ?? 0)
+                  ? word.wrongCount
+                  : ((raw['wrongCount'] as num?)?.toInt() ?? 0);
+          final studied = asDate(raw['lastStudiedAt']);
+          if (studied != null &&
+              (word.lastStudiedAt == null ||
+                  studied.isAfter(word.lastStudiedAt!)))
+            word.lastStudiedAt = studied;
+          final wrong = asDate(raw['lastWrongAt']);
+          if (wrong != null &&
+              (word.lastWrongAt == null || wrong.isAfter(word.lastWrongAt!)))
+            word.lastWrongAt = wrong;
+        }
+      }
+    }
+
+    final chosenStudies = <String, ActiveStudy>{};
+    activeCandidates.forEach((key, values) {
+      values.sort((a, b) {
+        final memorized = ((b['memorized'] as num?)?.toInt() ?? 0)
+            .compareTo((a['memorized'] as num?)?.toInt() ?? 0);
+        if (memorized != 0) return memorized;
+        final queue = ((a['queueIds'] as List?)?.length ?? 999999)
+            .compareTo((b['queueIds'] as List?)?.length ?? 999999);
+        if (queue != 0) return queue;
+        final at =
+            asDate(a['updatedAt']) ?? DateTime.fromMillisecondsSinceEpoch(0);
+        final bt =
+            asDate(b['updatedAt']) ?? DateTime.fromMillisecondsSinceEpoch(0);
+        return bt.compareTo(at);
+      });
+      final chosen = ActiveStudy.fromJson(values.first);
+      final deletedAt = tombstones[key];
+      final startedAt = chosen.startedAt ?? chosen.updatedAt;
+      if (deletedAt == null ||
+          startedAt == null ||
+          !deletedAt.isAfter(startedAt)) {
+        chosenStudies[key] = chosen;
+      }
+    });
+
+    await _saveBooks();
+    wordSearch.invalidate();
+    await _prefs.setStringList(_completedKey, completed.toList());
+    await _saveCompletedAt(completedTimes);
+    await _prefs.setString(_coursePassesKey, jsonEncode(passes));
+    await _prefs.setStringList(_studyDaysKey, days.toList());
+    await _saveDailyStudyStats(stats);
+    await _saveStudyEventLog(_prunedStudyEventLog(events.values.toList()));
+    await _saveActiveStudies(chosenStudies);
+    await _saveActiveStudyTombstones(tombstones);
+    await _saveResetMarkers(reset);
+    unawaited(cloudChanges.recordDiagnostic('learning_state_merged', data: {
+      'remoteSnapshotCount': remoteSnapshotCount,
+      'completedSessionCount': completed.length,
+      'activeStudyCount': chosenStudies.length,
+      'activeStudyKeys': chosenStudies.keys.toList(),
+      'studyDayCount': days.length,
+      'eventCount': events.length,
+    }));
+  }
+
+  int _studyStateRank(StudyState state) => switch (state) {
+        StudyState.fresh => 0,
+        StudyState.review => 1,
+        StudyState.memorized => 2,
+      };
   Map<String, dynamic> toBackupJson() => {
         'version': 4,
         'rangeCourseSchema': rangeCourseSchemaVersion,

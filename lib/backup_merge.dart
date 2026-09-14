@@ -281,6 +281,7 @@ Word _mergeWord(
   final lastStudiedAt = _latestDate(cloud.lastStudiedAt, local.lastStudiedAt);
   final lastWrongAt = _latestDate(cloud.lastWrongAt, local.lastWrongAt);
   final state = _higherState(cloud.state, local.state);
+  final favorite = _mergeFavorite(cloud, local);
   final merged = cloud.copyWith(
     state: state,
     correctCount: cloud.correctCount > local.correctCount
@@ -291,6 +292,8 @@ Word _mergeWord(
         : local.wrongCount,
     lastStudiedAt: lastStudiedAt,
     lastWrongAt: lastWrongAt,
+    isFavorite: favorite.$1,
+    favoriteUpdatedAt: favorite.$2,
   );
   if (_resetAfterWord(
     bookId: bookId,
@@ -308,7 +311,19 @@ Word _mergeWord(
   return merged;
 }
 
-StudyState _higherState(StudyState left, StudyState right) =>
+
+(bool, DateTime?) _mergeFavorite(Word cloud, Word local) {
+  final ct = cloud.favoriteUpdatedAt;
+  final lt = local.favoriteUpdatedAt;
+  if (ct == null && lt == null) {
+    return (cloud.isFavorite || local.isFavorite, null);
+  }
+  if (ct == null) return (local.isFavorite, lt);
+  if (lt == null) return (cloud.isFavorite, ct);
+  if (ct.isAfter(lt)) return (cloud.isFavorite, ct);
+  if (lt.isAfter(ct)) return (local.isFavorite, lt);
+  return (cloud.isFavorite && local.isFavorite, ct);
+}StudyState _higherState(StudyState left, StudyState right) =>
     _stateRank(left) >= _stateRank(right) ? left : right;
 
 int _stateRank(StudyState state) => switch (state) {

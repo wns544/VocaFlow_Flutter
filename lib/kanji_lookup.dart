@@ -1,8 +1,9 @@
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
+import 'package:url_launcher/url_launcher.dart';
 
 class KoreanHanjaEntry {
   const KoreanHanjaEntry({required this.character, required this.hunEum});
@@ -108,6 +109,9 @@ Future<bool> openExternalUrl(Uri uri) async {
   final isTongHanjaHttp = uri.scheme == 'http' &&
       (uri.host == 'tonghanja.com' || uri.host == 'www.tonghanja.com');
   if (uri.scheme != 'https' && !isTongHanjaHttp) return false;
+  if (kIsWeb) {
+    return launchUrl(uri, webOnlyWindowName: '_blank');
+  }
   try {
     return await externalLinkChannel.invokeMethod<bool>(
           'openUrl',
@@ -146,6 +150,10 @@ Uri tongHanjaSearchUri(String character) => Uri.http(
       '/',
       {'s': character},
     );
+
+bool isHanjaCharacter(String value) => RegExp(
+        r'^[\u2E80-\u2EFF\u2F00-\u2FD5\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]$')
+    .hasMatch(value);
 
 Uri nihongoKanjiSearchUri(String character) => Uri.https(
       'nihongokanji.com',
@@ -220,18 +228,14 @@ Map<String, String> _decodeKoreanTable(String source) {
 List<String> _stringList(dynamic value) =>
     (value as List<dynamic>? ?? const []).whereType<String>().toList();
 
-final HttpClient _sharedHttpClient = HttpClient();
-
 Future<Map<String, dynamic>> _fetchJapaneseJson(Uri uri) async {
-  final request =
-      await _sharedHttpClient.getUrl(uri).timeout(const Duration(seconds: 8));
-  request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-  final response = await request.close().timeout(const Duration(seconds: 8));
-  if (response.statusCode != HttpStatus.ok) {
-    throw HttpException('KanjiAPI returned ${response.statusCode}', uri: uri);
+  final response = await http.get(uri, headers: const {
+    'Accept': 'application/json'
+  }).timeout(const Duration(seconds: 8));
+  if (response.statusCode != 200) {
+    throw StateError('KanjiAPI returned ${response.statusCode}');
   }
-  final body = await response.transform(utf8.decoder).join();
-  final decoded = jsonDecode(body);
+  final decoded = jsonDecode(response.body);
   if (decoded is! Map<String, dynamic>) {
     throw const FormatException('KanjiAPI returned invalid JSON.');
   }

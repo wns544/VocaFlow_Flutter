@@ -108,7 +108,7 @@ void main() {
         tester
             .widget<BottomNavigationBar>(find.byType(BottomNavigationBar))
             .currentIndex,
-        2);
+        3);
   });
 
   testWidgets('creates a word book from the add dialog',

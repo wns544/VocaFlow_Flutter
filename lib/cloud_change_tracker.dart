@@ -1,6 +1,9 @@
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'sync_diagnostic_log.dart';
 
 enum AutoBackupNetworkPolicy { all, wifiOnly }
 
@@ -13,6 +16,8 @@ class CloudChangeSnapshot {
     required this.wordIdsByBook,
     required this.deletedWordIdsByBook,
     required this.deletedBookIds,
+    required this.learningStateDirty,
+    required this.learningStateGeneration,
   });
 
   final int generation;
@@ -22,6 +27,8 @@ class CloudChangeSnapshot {
   final Map<String, Set<int>> wordIdsByBook;
   final Map<String, Set<int>> deletedWordIdsByBook;
   final Set<String> deletedBookIds;
+  final bool learningStateDirty;
+  final int learningStateGeneration;
 
   bool get isEmpty => pendingCount == 0;
   int get pendingCount =>
@@ -30,11 +37,13 @@ class CloudChangeSnapshot {
       bookIds.length +
       wordIdsByBook.values.fold<int>(0, (sum, ids) => sum + ids.length) +
       deletedWordIdsByBook.values.fold<int>(0, (sum, ids) => sum + ids.length) +
-      deletedBookIds.length;
+      deletedBookIds.length +
+      (learningStateDirty ? 1 : 0);
 }
 
 class CloudChangeTracker {
   CloudChangeTracker._(this._prefs) {
+    _diagnosticSequence = _prefs.getInt(_diagnosticSequenceKey) ?? 0;
     _restore();
   }
 
@@ -46,9 +55,13 @@ class CloudChangeTracker {
   static const _lastDownloadPrefix = 'autoBackup.lastDownload.';
   static const _lastErrorPrefix = 'autoBackup.lastError.';
   static const _logKey = 'autoBackup.logs.v1';
+  static const _deviceIdKey = 'learningState.deviceId.v1';
+  static const _diagnosticSequenceKey = 'syncDiagnostics.sequence.v1';
 
   final SharedPreferences _prefs;
+  final SyncDiagnosticLog diagnostics = SyncDiagnosticLog();
   void Function()? onChanged;
+  int _diagnosticSequence = 0;
 
   int _generation = 0;
   bool _profileDirty = false;
@@ -57,6 +70,8 @@ class CloudChangeTracker {
   final Map<String, Set<int>> _wordIdsByBook = {};
   final Map<String, Set<int>> _deletedWordIdsByBook = {};
   final Set<String> _deletedBookIds = {};
+  bool _learningStateDirty = false;
+  int _learningStateGeneration = 0;
 
   static Future<CloudChangeTracker> load() async =>
       CloudChangeTracker._(await SharedPreferences.getInstance());
@@ -69,9 +84,55 @@ class CloudChangeTracker {
         wordIdsByBook: _copyMap(_wordIdsByBook),
         deletedWordIdsByBook: _copyMap(_deletedWordIdsByBook),
         deletedBookIds: Set.of(_deletedBookIds),
+        learningStateDirty: _learningStateDirty,
+        learningStateGeneration: _learningStateGeneration,
       );
 
   int get pendingCount => snapshot.pendingCount;
+  bool get learningStateDirty => _learningStateDirty;
+
+  /// Stable per-installation identity: each phone owns a separate remote
+  /// learning-state document, so a stale phone cannot overwrite another.
+  Future<String> deviceId() async {
+    final saved = _prefs.getString(_deviceIdKey);
+    if (saved != null && saved.isNotEmpty) return saved;
+    final value =
+        'device-${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}-${Random.secure().nextInt(1 << 32).toRadixString(36)}';
+    await _prefs.setString(_deviceIdKey, value);
+    return value;
+  }
+
+  /// Full-fidelity local-only journal entry. This never writes Firestore.
+  Future<void> recordDiagnostic(String event,
+      {Map<String, Object?> data = const {}}) async {
+    try {
+      _diagnosticSequence++;
+      await _prefs.setInt(_diagnosticSequenceKey, _diagnosticSequence);
+      await diagnostics.record(
+        deviceId: await deviceId(),
+        sequence: _diagnosticSequence,
+        event: event,
+        data: data,
+      );
+    } catch (_) {
+      // Diagnostics must never block study or synchronization.
+    }
+  }
+
+  Future<void> markLearningState() => _mutate(() {
+        _learningStateDirty = true;
+        _learningStateGeneration++;
+        return true;
+      });
+
+  Future<void> acknowledgeLearningState(CloudChangeSnapshot uploaded) async {
+    if (!_learningStateDirty ||
+        _learningStateGeneration != uploaded.learningStateGeneration) return;
+    _learningStateDirty = false;
+    _generation++;
+    await _persist();
+    onChanged?.call();
+  }
 
   Future<void> markProfile() => _mutate(() {
         if (_profileDirty) return false;
@@ -175,6 +236,7 @@ class CloudChangeTracker {
     _wordIdsByBook.clear();
     _deletedWordIdsByBook.clear();
     _deletedBookIds.clear();
+    _learningStateDirty = false;
     await _persist();
     onChanged?.call();
   }
@@ -197,8 +259,13 @@ class CloudChangeTracker {
       DateTime.now().toIso8601String() + ' ' + message,
       ...logs
     ];
-    await _prefs.setStringList(_logKey, entries.take(30).toList());
-    onChanged?.call();
+    await _prefs.setStringList(_logKey, entries.take(200).toList());
+    // A human-readable sync log is not sync data. Notifying the backup
+    // coordinator here used to re-enter its scheduler and reset the timer.
+  }
+
+  Future<void> clearLogs() async {
+    await _prefs.remove(_logKey);
   }
 
   String? lastError(String uid) => _prefs.getString('$_lastErrorPrefix$uid');
@@ -257,6 +324,9 @@ class CloudChangeTracker {
       _restoreMap(json['deletedWordIdsByBook'], _deletedWordIdsByBook);
       _deletedBookIds.addAll(
           (json['deletedBookIds'] as List<dynamic>? ?? []).cast<String>());
+      _learningStateDirty = json['learningStateDirty'] as bool? ?? false;
+      _learningStateGeneration =
+          (json['learningStateGeneration'] as num?)?.toInt() ?? 0;
     } catch (_) {
       // A corrupt journal must not prevent the local app from opening.
     }
@@ -272,6 +342,8 @@ class CloudChangeTracker {
           'wordIdsByBook': _encodeMap(_wordIdsByBook),
           'deletedWordIdsByBook': _encodeMap(_deletedWordIdsByBook),
           'deletedBookIds': _deletedBookIds.toList(),
+          'learningStateDirty': _learningStateDirty,
+          'learningStateGeneration': _learningStateGeneration,
         }),
       );
 

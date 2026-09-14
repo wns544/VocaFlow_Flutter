@@ -2,15 +2,18 @@ import 'dart:async';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 
-import 'backup_merge.dart';
 import 'cloud_backup.dart';
 import 'cloud_change_tracker.dart';
 import 'store.dart';
 
 enum InitialSyncChoice { cloudReplace, merge }
 
+/// Synchronizes only the dedicated learningState collection. It deliberately
+/// never uploads vocabBooks/words, so existing Firebase card documents remain
+/// read-only from this app version.
 class AutoBackupCoordinator with WidgetsBindingObserver {
   static AutoBackupCoordinator? activeInstance;
 
@@ -35,22 +38,21 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   final Duration minimumInterval;
 
   Timer? _timer;
-  DateTime? _scheduledUploadAt;
-  int? _scheduledGeneration;
   StreamSubscription<User?>? _authSubscription;
-  bool _uploading = false;
+  bool _syncing = false;
   bool _downloading = false;
-  DateTime? _lastDownloadAttempt;
   bool _flushingForBackground = false;
+  DateTime? _lastSuccessAt;
   int _failureCount = 0;
+  Future<void>? _webInitialSync;
 
-  bool get isUploading => _uploading;
+  bool get isUploading => _syncing && !_downloading;
   bool get isDownloading => _downloading;
   User? get user => FirebaseAuth.instance.currentUser;
   bool get enabled => user != null && store.cloudChanges.isEnabled(user!.uid);
   bool get initialized =>
       user != null && store.cloudChanges.isInitialized(user!.uid);
-  int get pendingCount => store.cloudChanges.pendingCount;
+  int get pendingCount => store.cloudChanges.learningStateDirty ? 1 : 0;
   DateTime? get lastSuccess =>
       user == null ? null : store.cloudChanges.lastSuccess(user!.uid);
   List<String> get logs => store.cloudChanges.logs;
@@ -69,12 +71,37 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     store.onSessionCompleted = requestImmediateBackup;
     _authSubscription = FirebaseAuth.instance.authStateChanges().listen((_) {
       _cancelScheduledUpload();
+      _startWebInitialSyncIfNeeded();
+      if (enabled && initialized) {
+        unawaited(mergeFromCloud(uploadMerged: false, reason: '앱 복귀'));
+        unawaited(_seedLearningState());
+      }
       onChanged?.call();
-      if (enabled && pendingCount > 0) requestImmediateBackup();
-      if (enabled && initialized)
-        unawaited(mergeFromCloud(uploadMerged: false));
     });
-    if (enabled && pendingCount > 0) requestImmediateBackup();
+    _startWebInitialSyncIfNeeded();
+    if (enabled && initialized) unawaited(_seedLearningState());
+  }
+
+  /// A browser starts without app storage, so requiring an extra confirmation
+  /// there leaves a successfully logged-in user looking like they have no
+  /// progress. The web can safely pull the dedicated learning-state snapshots
+  /// first; it never replaces word-card content.
+  Future<void> initializeWebFromCloud() {
+    if (!kIsWeb || initialized) return Future<void>.value();
+    return _webInitialSync ??= () async {
+      try {
+        await initialize(InitialSyncChoice.cloudReplace);
+      } catch (_) {
+        // A retry is allowed on the next auth change or app start.
+        _webInitialSync = null;
+      }
+    }();
+  }
+
+  void _startWebInitialSyncIfNeeded() {
+    if (kIsWeb && user != null && !initialized) {
+      unawaited(initializeWebFromCloud());
+    }
   }
 
   void dispose() {
@@ -88,30 +115,21 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     _authSubscription?.cancel();
   }
 
-  Future<bool> hasCloudBackup() => cloud.hasBackup();
+  Future<bool> hasCloudBackup() => cloud.hasLearningState();
 
   Future<void> initialize(InitialSyncChoice? choice) async {
     final current = user;
     if (current == null) throw StateError('Google login is required.');
-    final hasCloud = await cloud.hasBackup();
+    final hasCloud = await cloud.hasLearningState();
     if (hasCloud && choice == null) return;
-
-    if (!hasCloud) {
-      await cloud.upload(store);
-    } else if (choice == InitialSyncChoice.cloudReplace) {
-      final backup = await cloud.downloadBackupJson();
-      await store.replaceWithBackupJson(backup);
-    } else {
-      final local = store.toBackupJson();
-      final remote = await cloud.downloadBackupJson();
-      final merged = mergeBackupJson(cloud: remote, local: local);
-      await store.replaceWithBackupJson(merged);
-      await cloud.upload(store);
+    if (hasCloud) {
+      await store
+          .applyLearningStateSnapshots(await cloud.downloadLearningStates());
     }
-    await store.cloudChanges.clearPending();
     await store.cloudChanges.setInitialized(current.uid, true);
     await store.cloudChanges.setEnabled(current.uid, true);
-    await store.cloudChanges.recordSuccess(current.uid, _now());
+    await store.cloudChanges.markLearningState();
+    await _uploadPending(reason: '초기 학습 상태 저장');
     onChanged?.call();
   }
 
@@ -121,8 +139,8 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     await store.cloudChanges.setEnabled(current.uid, value);
     if (!value) {
       _cancelScheduledUpload();
-    } else if (pendingCount > 0) {
-      requestImmediateBackup();
+    } else {
+      await _seedLearningState();
     }
     onChanged?.call();
   }
@@ -131,82 +149,39 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     final current = user;
     if (current == null) return;
     await store.cloudChanges.setNetworkPolicy(current.uid, value);
-    if (enabled && pendingCount > 0) requestImmediateBackup();
+    if (enabled && store.cloudChanges.learningStateDirty)
+      requestImmediateBackup();
     onChanged?.call();
   }
 
   Future<void> manualFullUpload() async {
     final current = user;
     if (current == null) throw StateError('Google login is required.');
-    try {
-      // A full snapshot is needed only when this account has no cloud data yet.
-      // Later manual syncs use the same durable change journal as auto-sync.
-      if (!initialized || !await cloud.hasBackup()) {
-        await cloud.upload(store);
-        await store.cloudChanges.clearPending();
-      } else {
-        final changes = store.cloudChanges.snapshot;
-        // A manual upload is the user's explicit "save this device now"
-        // action. Always rewrite the compact profile snapshot so the active
-        // course (queue, progress and range) cannot be skipped merely because
-        // an earlier journal acknowledgement already cleared profileDirty.
-        // Word documents still use the incremental journal below.
-        await cloud.uploadIncremental(store, changes, forceProfile: true);
-        if (!changes.isEmpty) {
-          await store.cloudChanges.acknowledge(changes);
-        }
-      }
-      await store.cloudChanges.recordSuccess(current.uid, _now());
-      await store.cloudChanges.recordLog('자동 업로드 완료');
-      _failureCount = 0;
-      onChanged?.call();
-    } catch (error) {
-      await store.cloudChanges.recordError(current.uid, error);
-      rethrow;
-    }
+    await store.cloudChanges.markLearningState();
+    await _uploadPending(reason: '이 기기 데이터 내보내기');
   }
 
   Future<void> manualRestore() async {
     final current = user;
     if (current == null) throw StateError('Google login is required.');
-    final backup = await cloud.downloadBackupJson();
-    await store.replaceWithBackupJson(backup);
-    await store.cloudChanges.clearPending();
-    await store.cloudChanges.recordSuccess(current.uid, _now());
-    await store.cloudChanges.recordDownload(current.uid, _now());
-    _failureCount = 0;
-    onChanged?.call();
+    await _pullLearningState(reason: '클라우드 데이터 가져오기');
   }
 
-  Future<void> mergeFromCloud({bool uploadMerged = true}) async {
-    final current = user;
-    if (current == null || !enabled || !initialized || _downloading) return;
-    final now = _now();
-    if (!uploadMerged &&
-        _lastDownloadAttempt != null &&
-        now.difference(_lastDownloadAttempt!) < const Duration(seconds: 30))
-      return;
-    _lastDownloadAttempt = now;
-    _downloading = true;
-    await store.cloudChanges.recordLog('클라우드 내려받기 시작');
-    onChanged?.call();
+  Future<void> mergeFromCloud({
+    bool uploadMerged = true,
+    String reason = '클라우드 확인',
+  }) async {
+    if (!enabled || !initialized || _syncing) return;
+    _syncing = true;
     try {
-      if (pendingCount > 0) await _uploadPending();
-      if (pendingCount > 0) return;
-      final local = store.toBackupJson();
-      final remote = await cloud.downloadBackupJson();
-      final merged = mergeBackupJson(cloud: remote, local: local);
-      await store.replaceWithBackupJson(merged);
-      await store.cloudChanges.clearPending();
-      if (uploadMerged) await cloud.upload(store);
-      await store.cloudChanges.recordDownload(current.uid, _now());
-      await store.cloudChanges.recordLog('클라우드 내려받기 완료');
-      _failureCount = 0;
+      await _pullLearningState(reason: reason, ownsGate: true);
+      if (uploadMerged && store.cloudChanges.learningStateDirty) {
+        await _sendLearningState(reason: '$reason · 병합 반영');
+      }
     } catch (error) {
-      await store.cloudChanges.recordError(current.uid, error);
-      await store.cloudChanges.recordLog('자동 동기화 오류 · ' + error.toString());
+      await _recordFailure(error, reason);
     } finally {
-      _downloading = false;
+      _syncing = false;
       onChanged?.call();
     }
   }
@@ -214,140 +189,177 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   void requestImmediateBackup({bool ignoreMinimumInterval = false}) =>
       _schedule(Duration.zero, ignoreMinimumInterval: ignoreMinimumInterval);
 
-  /// Sends the durable local change journal before the app moves to background.
-  /// Android can stop the process afterwards, so this bypasses the idle delay.
   Future<void> flushPendingBackup() async {
-    if (_flushingForBackground || _uploading || !enabled || pendingCount == 0) {
-      return;
-    }
+    if (_flushingForBackground ||
+        _syncing ||
+        !enabled ||
+        !store.cloudChanges.learningStateDirty) return;
     _flushingForBackground = true;
     _cancelScheduledUpload();
     try {
-      await _uploadPending();
+      await _uploadPending(reason: '앱 백그라운드');
     } finally {
       _flushingForBackground = false;
     }
   }
 
+  Future<void> _seedLearningState() async {
+    if (!enabled || !initialized || store.cloudChanges.learningStateDirty)
+      return;
+    // One compact document per app launch makes legacy local progress visible
+    // without writing a single existing word document.
+    await store.cloudChanges.markLearningState();
+    requestImmediateBackup();
+  }
+
   void _handleTrackedChange() {
     onChanged?.call();
-    if (enabled && pendingCount > 0 && !_uploading) _schedule(idleDelay);
+    if (enabled && store.cloudChanges.learningStateDirty && !_syncing) {
+      _schedule(idleDelay, reason: '학습 변경 후 대기');
+    }
   }
 
   void _schedule(Duration requestedDelay,
-      {bool ignoreMinimumInterval = false}) {
-    if (_uploading || !enabled || pendingCount == 0) return;
-    final last = lastSuccess;
+      {bool ignoreMinimumInterval = false, String reason = '자동 업로드'}) {
+    if (_syncing || !enabled || !store.cloudChanges.learningStateDirty) return;
     var delay = requestedDelay;
-    if (!ignoreMinimumInterval && last != null) {
-      final untilAllowed = last.add(minimumInterval).difference(_now());
+    if (!ignoreMinimumInterval && _lastSuccessAt != null) {
+      final untilAllowed =
+          _lastSuccessAt!.add(minimumInterval).difference(_now());
       if (untilAllowed > delay) delay = untilAllowed;
     }
     if (delay.isNegative) delay = Duration.zero;
-    final generation = store.cloudChanges.snapshot.generation;
-    final scheduledAt = _now().add(delay);
-    final existingAt = _scheduledUploadAt;
-    if (_timer?.isActive == true &&
-        _scheduledGeneration == generation &&
-        existingAt != null &&
-        !existingAt.isAfter(scheduledAt)) {
-      return;
-    }
     _cancelScheduledUpload();
-    _scheduledGeneration = generation;
-    _scheduledUploadAt = scheduledAt;
-    _timer = Timer(delay, () {
-      _scheduledGeneration = null;
-      _scheduledUploadAt = null;
-      unawaited(_uploadPending());
-    });
+    unawaited(store.cloudChanges
+        .recordLog('$reason 예약 · ${delay.inSeconds}초 후 · learningState 대기'));
+    unawaited(store.cloudChanges.recordDiagnostic('sync_scheduled', data: {
+      'reason': reason,
+      'delaySeconds': delay.inSeconds,
+      'pendingLearningState': store.cloudChanges.learningStateDirty,
+    }));
+    _timer = Timer(delay, () => unawaited(_uploadPending(reason: reason)));
   }
 
-  Future<void> _uploadPending() async {
-    _scheduledGeneration = null;
-    _scheduledUploadAt = null;
-    final current = user;
-    if (_uploading || current == null || !enabled || pendingCount == 0) return;
-    bool networkAllowed;
+  Future<void> _uploadPending({String reason = '자동 업로드'}) async {
+    if (_syncing || !enabled || !store.cloudChanges.learningStateDirty) return;
+    // This lock is intentionally set before checkConnectivity awaits.
+    _syncing = true;
     try {
-      networkAllowed = await _networkAllowed();
-    } catch (error) {
-      await _scheduleRetry(error);
-      return;
-    }
-    if (!networkAllowed) {
-      await _scheduleRetry(StateError('선택한 네트워크에 연결되어 있지 않습니다.'));
-      return;
-    }
-
-    final changes = store.cloudChanges.snapshot;
-    // The profile contains the active course's exact queue and progress.
-    // Keep that snapshot current on every batched automatic upload while a
-    // course is in progress, even if a previous acknowledgement happened to
-    // clear profileDirty before the latest local study persistence.
-    final hasActiveCourse = store.activeStudies.isNotEmpty;
-    _uploading = true;
-    await store.cloudChanges
-        .recordLog('자동 업로드 시작 · ' + changes.pendingCount.toString() + '개 변경');
-    onChanged?.call();
-    try {
-      await cloud.uploadIncremental(
-        store,
-        changes,
-        forceProfile: hasActiveCourse,
-      );
-      await store.cloudChanges.acknowledge(changes);
-      await store.cloudChanges.recordSuccess(current.uid, _now());
-      await store.cloudChanges.recordLog('자동 업로드 완료');
-      _failureCount = 0;
-      if (pendingCount > 0) _schedule(idleDelay);
-    } catch (error) {
-      if (error is CloudQuotaExceededException) {
-        await store.cloudChanges.recordError(current.uid, error);
-      } else {
-        await _scheduleRetry(error);
+      await store.cloudChanges.recordDiagnostic('sync_started', data: {
+        'reason': reason,
+        'pendingLearningState': store.cloudChanges.learningStateDirty,
+      });
+      final networkAllowed = await _networkAllowed();
+      await store.cloudChanges.recordDiagnostic('network_checked', data: {
+        'reason': reason,
+        'allowed': networkAllowed,
+        'policy': networkPolicy.name,
+      });
+      if (!networkAllowed) {
+        throw StateError('선택한 네트워크에 연결되어 있지 않습니다.');
       }
+      // Pull first. Each phone later writes only its own document, never a
+      // shared profile or another phone's snapshot.
+      await _pullLearningState(reason: '$reason · 선행 병합', ownsGate: true);
+      await _sendLearningState(reason: reason);
+      _failureCount = 0;
+    } catch (error) {
+      await _recordFailure(error, reason);
     } finally {
-      _uploading = false;
+      _syncing = false;
+      if (enabled && store.cloudChanges.learningStateDirty) {
+        _schedule(idleDelay, reason: '전송 중 새 학습 변경');
+      }
       onChanged?.call();
     }
   }
 
-  Future<void> _scheduleRetry(Object error) async {
-    final current = user;
-    if (current != null) {
-      await store.cloudChanges.recordError(current.uid, error);
+  Future<void> _pullLearningState({
+    required String reason,
+    bool ownsGate = false,
+  }) async {
+    if (!ownsGate && _syncing) return;
+    if (!ownsGate) _syncing = true;
+    _downloading = true;
+    try {
+      await store.cloudChanges.recordLog('$reason · learningState 내려받기 시작');
+      await store.cloudChanges.recordDiagnostic('sync_download_started', data: {
+        'reason': reason,
+      });
+      final snapshots = await cloud.downloadLearningStates();
+      await store.applyLearningStateSnapshots(snapshots);
+      final current = user;
+      if (current != null) {
+        await store.cloudChanges.recordDownload(current.uid, _now());
+      }
+      await store.cloudChanges.recordLog('$reason · learningState 병합 완료');
+      await store.cloudChanges
+          .recordDiagnostic('sync_download_succeeded', data: {
+        'reason': reason,
+        'remoteSnapshotCount': snapshots.length,
+      });
+    } finally {
+      _downloading = false;
+      if (!ownsGate) _syncing = false;
     }
-    const retryDelays = [
+  }
+
+  Future<void> _sendLearningState({required String reason}) async {
+    final current = user;
+    if (current == null || !store.cloudChanges.learningStateDirty) return;
+    final snapshot = store.cloudChanges.snapshot;
+    await store.cloudChanges.recordLog(
+        '$reason · learningState 전송 시작 · 순번 ${snapshot.learningStateGeneration}');
+    await store.cloudChanges.recordDiagnostic('sync_upload_started', data: {
+      'reason': reason,
+      'learningStateGeneration': snapshot.learningStateGeneration,
+      'pendingCount': snapshot.pendingCount,
+    });
+    await cloud.uploadLearningState(store, snapshot);
+    await store.cloudChanges.acknowledgeLearningState(snapshot);
+    await store.cloudChanges.recordSuccess(current.uid, _now());
+    _lastSuccessAt = _now();
+    await store.cloudChanges.recordLog('$reason · learningState 전송 완료');
+    await store.cloudChanges.recordDiagnostic('sync_upload_succeeded', data: {
+      'reason': reason,
+      'learningStateGeneration': snapshot.learningStateGeneration,
+    });
+  }
+
+  Future<void> _recordFailure(Object error, String reason) async {
+    final current = user;
+    if (current != null)
+      await store.cloudChanges.recordError(current.uid, error);
+    await store.cloudChanges.recordLog('$reason · learningState 오류 · $error');
+    await store.cloudChanges.recordDiagnostic('sync_failed', data: {
+      'reason': reason,
+      'error': error.toString(),
+      'failureCount': _failureCount,
+    });
+    const delays = [
       Duration(minutes: 1),
       Duration(minutes: 5),
-      Duration(minutes: 30),
+      Duration(minutes: 30)
     ];
-    if (_failureCount >= retryDelays.length) return;
-    final index = _failureCount.clamp(0, retryDelays.length - 1);
-    _failureCount++;
-    _cancelScheduledUpload();
-    final delay = retryDelays[index];
-    _scheduledGeneration = store.cloudChanges.snapshot.generation;
-    _scheduledUploadAt = _now().add(delay);
-    _timer = Timer(delay, () {
-      _scheduledGeneration = null;
-      _scheduledUploadAt = null;
-      unawaited(_uploadPending());
-    });
+    if (_failureCount++ < delays.length &&
+        enabled &&
+        store.cloudChanges.learningStateDirty) {
+      _schedule(delays[_failureCount - 1], reason: '자동 재시도');
+    }
   }
 
   void _cancelScheduledUpload() {
     _timer?.cancel();
     _timer = null;
-    _scheduledGeneration = null;
-    _scheduledUploadAt = null;
   }
 
   Future<bool> _networkAllowed() async {
     final results = await connectivity.checkConnectivity();
     if (networkPolicy == AutoBackupNetworkPolicy.all) {
-      return results.any((result) => result != ConnectivityResult.none);
+      // VPN and Android's per-app routing can transiently report `none` even
+      // while Firebase is reachable. Let the actual request decide in this
+      // permissive mode; failures are still logged and retried.
+      return true;
     }
     return results.contains(ConnectivityResult.wifi) ||
         results.contains(ConnectivityResult.ethernet);
@@ -355,14 +367,16 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    unawaited(store.cloudChanges.recordDiagnostic('app_lifecycle', data: {
+      'state': state.name,
+      'pendingLearningState': store.cloudChanges.learningStateDirty,
+    }));
     if (state == AppLifecycleState.resumed) {
-      if (enabled && pendingCount > 0) requestImmediateBackup();
-      if (enabled && initialized)
-        unawaited(mergeFromCloud(uploadMerged: false));
-      return;
-    }
-    if (state == AppLifecycleState.paused ||
+      unawaited(mergeFromCloud(uploadMerged: false, reason: '앱 복귀'));
+    } else if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
+      unawaited(
+          store.cloudChanges.recordLog('앱 백그라운드 · learningState 즉시 전송 시도'));
       unawaited(flushPendingBackup());
     }
   }

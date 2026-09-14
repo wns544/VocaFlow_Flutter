@@ -158,6 +158,27 @@ void main() {
     expect(reloaded.resolveActiveWords(active).first.term, 'resilience');
   });
 
+  test('learning state snapshot merges study status without changing card text',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final first = await VocaStore.load();
+    final firstWord = first.books.first.words.first;
+    final originalTerm = firstWord.term;
+    final originalMeaning = firstWord.meaning;
+    await first.mark(firstWord, StudyState.memorized,
+        bookId: first.books.first.id, sessionIndexes: const [0]);
+    final snapshot = first.toLearningStateJson();
+
+    SharedPreferences.setMockInitialValues({});
+    final second = await VocaStore.load();
+    final secondWord = second.books.first.words.first;
+    await second.applyLearningStateSnapshots([snapshot]);
+
+    expect(secondWord.term, originalTerm);
+    expect(secondWord.meaning, originalMeaning);
+    expect(secondWord.state, StudyState.memorized);
+    expect(secondWord.correctCount, 1);
+  });
   test('Japanese font setting persists', () async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();
@@ -409,6 +430,6 @@ void main() {
     expect((await VocaStore.load()).lastMainTab, 2);
 
     await store.setLastMainTab(99);
-    expect((await VocaStore.load()).lastMainTab, 2);
+    expect((await VocaStore.load()).lastMainTab, 3);
   });
 }

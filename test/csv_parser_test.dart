@@ -23,4 +23,14 @@ void main() {
     expect(words.single.reading, 'いせき');
     expect(words.single.meaning, '유적');
   });
+  test('related words column is parsed separately from card fields', () {
+    final result = parseWordImportCsv(
+        '단어,뜻,발음,관련단어\n貢献,공헌,こうけん,"寄与, 協力"\n寄与,기여,きよ\n協力,협력,きょうりょく');
+
+    expect(result.words.map((word) => word.term), ['貢献', '寄与', '協力']);
+    expect(result.relations, hasLength(2));
+    expect(result.relations.first.sourceWordIndex, 0);
+    expect(
+        result.relations.map((relation) => relation.targetTerm), ['寄与', '協力']);
+  });
 }

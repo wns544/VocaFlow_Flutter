@@ -17,10 +17,7 @@ import 'package:flutter/foundation.dart'
 class DefaultFirebaseOptions {
   static FirebaseOptions get currentPlatform {
     if (kIsWeb) {
-      throw UnsupportedError(
-        'DefaultFirebaseOptions have not been configured for web - '
-        'you can reconfigure this by running the FlutterFire CLI again.',
-      );
+      return web;
     }
     switch (defaultTargetPlatform) {
       case TargetPlatform.android:
@@ -58,5 +55,15 @@ class DefaultFirebaseOptions {
     messagingSenderId: '551902347979',
     projectId: 'vocaflow-51274',
     storageBucket: 'vocaflow-51274.firebasestorage.app',
+  );
+
+  static const FirebaseOptions web = FirebaseOptions(
+    apiKey: 'AIzaSyAXlvb-0-k0itXBcPzIpI7Q4xT5opqgoto',
+    appId: '1:551902347979:web:ff7ee443109e6d93e2914e',
+    messagingSenderId: '551902347979',
+    projectId: 'vocaflow-51274',
+    authDomain: 'vocaflow-51274.firebaseapp.com',
+    storageBucket: 'vocaflow-51274.firebasestorage.app',
+    measurementId: 'G-H4QX2S2K36',
   );
 }

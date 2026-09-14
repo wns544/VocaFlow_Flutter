@@ -59,6 +59,11 @@ void main() {
   });
 
   test('external lookup URLs and ChatGPT prompt keep the study context', () {
+    expect(tongHanjaSearchUri('正').toString(),
+        'http://tonghanja.com/?s=%E6%AD%A3');
+    expect(isHanjaCharacter('正'), isTrue);
+    expect(isHanjaCharacter('⻌'), isTrue);
+    expect(isHanjaCharacter('正月'), isFalse);
     expect(
       naverHanjaSearchUri('新').toString(),
       'https://hanja.dict.naver.com/#/search?query=%E6%96%B0',

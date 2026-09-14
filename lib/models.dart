@@ -14,6 +14,8 @@ class Word {
     this.wrongCount = 0,
     this.lastStudiedAt,
     this.lastWrongAt,
+    this.isFavorite = false,
+    this.favoriteUpdatedAt,
   }) : id = id ?? Object.hash(term, meaning, reading);
 
   final int id;
@@ -28,6 +30,8 @@ class Word {
   int wrongCount;
   DateTime? lastStudiedAt;
   DateTime? lastWrongAt;
+  bool isFavorite;
+  DateTime? favoriteUpdatedAt;
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -42,6 +46,8 @@ class Word {
         'wrongCount': wrongCount,
         'lastStudiedAt': lastStudiedAt?.toIso8601String(),
         'lastWrongAt': lastWrongAt?.toIso8601String(),
+        'isFavorite': isFavorite,
+        'favoriteUpdatedAt': favoriteUpdatedAt?.toIso8601String(),
       };
 
   factory Word.fromJson(Map<String, dynamic> json) => Word(
@@ -56,6 +62,8 @@ class Word {
         wrongCount: (json['wrongCount'] as num?)?.toInt() ?? 0,
         lastStudiedAt: _dateTimeFromJson(json['lastStudiedAt']),
         lastWrongAt: _dateTimeFromJson(json['lastWrongAt']),
+        isFavorite: json['isFavorite'] as bool? ?? false,
+        favoriteUpdatedAt: _dateTimeFromJson(json['favoriteUpdatedAt']),
         state: StudyState.values.firstWhere(
           (value) => value.name == json['state'],
           orElse: () => StudyState.fresh,
@@ -74,6 +82,8 @@ class Word {
     int? wrongCount,
     DateTime? lastStudiedAt,
     DateTime? lastWrongAt,
+    bool? isFavorite,
+    DateTime? favoriteUpdatedAt,
     bool clearStudyStats = false,
   }) =>
       Word(
@@ -90,6 +100,8 @@ class Word {
         lastStudiedAt:
             clearStudyStats ? null : lastStudiedAt ?? this.lastStudiedAt,
         lastWrongAt: clearStudyStats ? null : lastWrongAt ?? this.lastWrongAt,
+        isFavorite: isFavorite ?? this.isFavorite,
+        favoriteUpdatedAt: favoriteUpdatedAt ?? this.favoriteUpdatedAt,
       );
 }
 

@@ -1,7 +1,7 @@
 name: vocaflow
 description: A calm, focused vocabulary study app.
 publish_to: "none"
-version: 1.0.10+11
+version: 1.0.10+17
 
 environment:
   sdk: ">=3.4.0 <4.0.0"
@@ -19,6 +19,13 @@ dependencies:
   google_sign_in: ^7.2.0
   connectivity_plus: ^6.1.4
   webview_flutter: ^4.13.0
+  firebase_storage: ^13.0.6
+  path_provider: ^2.1.5
+  http: ^1.2.2
+  url_launcher: ^6.3.1
+  flutter_tts: ^4.2.3
+  archive: ^3.6.1
+  share_plus: ^10.1.4
 
 dev_dependencies:
   flutter_test:
@@ -34,6 +41,7 @@ flutter:
     - assets/data/hanja_ko.json
     - assets/licenses/hanjadict-LICENSE.txt
     - assets/splash_design.png
+    - assets/icon/vocaflow_icon_1024_coral.png
   fonts:
     - family: Nunito
       fonts:

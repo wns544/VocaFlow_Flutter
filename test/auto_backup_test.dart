@@ -45,7 +45,7 @@ void main() {
     expect(snapshot.pendingCount, 2);
   });
 
-  test('fifty studied words remain one profile plus fifty word writes',
+  test('fifty studied words become one dedicated learning-state snapshot',
       () async {
     final words = List.generate(
       50,
@@ -69,10 +69,11 @@ void main() {
     await store.completeSessions('book', [0]);
 
     final snapshot = store.cloudChanges.snapshot;
-    expect(snapshot.profileDirty, isTrue);
-    expect(snapshot.wordIdsByBook['book'], hasLength(50));
+    // Legacy profile migration may still be pending, but no card is queued.
+    expect(snapshot.wordIdsByBook['book'], isNull);
     expect(snapshot.bookIds, isEmpty);
-    expect(snapshot.pendingCount, 51);
+    expect(snapshot.learningStateDirty, isTrue);
+    expect(snapshot.pendingCount, greaterThanOrEqualTo(1));
   });
 
   test('changes survive restart and failed acknowledgement', () async {

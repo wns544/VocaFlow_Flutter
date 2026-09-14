@@ -4,6 +4,10 @@ import 'csv_parser.dart';
 import 'models.dart';
 
 List<Word> parseWordsXlsx(List<int> bytes) {
+  return parseWordImportXlsx(bytes).words;
+}
+
+WordImportResult parseWordImportXlsx(List<int> bytes) {
   final workbook = Excel.decodeBytes(bytes);
   for (final sheetName in workbook.tables.keys) {
     final sheet = workbook.tables[sheetName];
@@ -14,8 +18,8 @@ List<Word> parseWordsXlsx(List<int> bytes) {
             .map((cell) => cell?.value?.toString() ?? '')
             .toList(growable: false))
         .toList(growable: false);
-    final words = parseWordRows(rows);
-    if (words.isNotEmpty) return words;
+    final result = parseWordImportRows(rows);
+    if (result.words.isNotEmpty) return result;
   }
-  return [];
+  return const WordImportResult(words: []);
 }

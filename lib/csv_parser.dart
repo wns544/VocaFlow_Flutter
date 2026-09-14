@@ -1,11 +1,19 @@
 import 'models.dart';
 
 List<Word> parseWordsCsv(String content) {
-  return parseWordRows(
+  return parseWordImportCsv(content).words;
+}
+
+WordImportResult parseWordImportCsv(String content) {
+  return parseWordImportRows(
       content.split(RegExp(r'\r?\n')).map(_parseLine).toList(growable: false));
 }
 
 List<Word> parseWordRows(List<List<String>> rows) {
+  return parseWordImportRows(rows).words;
+}
+
+WordImportResult parseWordImportRows(List<List<String>> rows) {
   final headerIndex = rows.take(10).toList().indexWhere(
         (row) => _ColumnMapping.fromHeader(row) != null,
       );
@@ -13,6 +21,7 @@ List<Word> parseWordRows(List<List<String>> rows) {
       headerIndex < 0 ? null : _ColumnMapping.fromHeader(rows[headerIndex]);
   final dataRows = headerIndex < 0 ? rows : rows.skip(headerIndex + 1);
   final words = <Word>[];
+  final relations = <ImportedWordRelation>[];
   for (final columns in dataRows) {
     if (columns.length < 3) continue;
     final term = _valueAt(columns, mapping?.term ?? 0);
@@ -35,8 +44,18 @@ List<Word> parseWordRows(List<List<String>> rows) {
       exampleMeaning: _valueAt(columns, mapping?.exampleMeaning ?? 4),
       explanation: _valueAt(columns, mapping?.explanation ?? 5),
     ));
+    final relatedIndex = mapping?.relatedWords;
+    if (relatedIndex != null) {
+      for (final relatedTerm
+          in _splitRelatedWords(_valueAt(columns, relatedIndex))) {
+        relations.add(ImportedWordRelation(
+          sourceWordIndex: words.length - 1,
+          targetTerm: relatedTerm,
+        ));
+      }
+    }
   }
-  return words;
+  return WordImportResult(words: words, relations: relations);
 }
 
 String _valueAt(List<String> columns, int index) =>
@@ -56,6 +75,7 @@ class _ColumnMapping {
     required this.example,
     required this.exampleMeaning,
     required this.explanation,
+    required this.relatedWords,
   });
 
   final int term;
@@ -64,6 +84,7 @@ class _ColumnMapping {
   final int example;
   final int exampleMeaning;
   final int explanation;
+  final int? relatedWords;
 
   static _ColumnMapping? fromHeader(List<String> columns) {
     final normalized = columns.map(_normalizeHeader).toList();
@@ -88,11 +109,18 @@ class _ColumnMapping {
           const {'examplemeaning', 'exampletranslation', '예문뜻', '예문해석'}),
       explanation: _find(normalized,
           const {'explanation', 'description', 'note', '설명', '설명문', '메모'}),
+      relatedWords: _nullableFind(
+          normalized, const {'relatedwords', 'relatedword', '관련단어', '관련'}),
     );
   }
 
   static int _find(List<String> columns, Set<String> candidates) =>
       columns.indexWhere(candidates.contains);
+
+  static int? _nullableFind(List<String> columns, Set<String> candidates) {
+    final index = _find(columns, candidates);
+    return index < 0 ? null : index;
+  }
 }
 
 String _normalizeHeader(String value) =>
@@ -120,4 +148,31 @@ List<String> _parseLine(String line) {
   }
   columns.add(current.toString());
   return columns;
+}
+
+List<String> _splitRelatedWords(String value) => value
+    .split(RegExp(r'[,;、，\n]+'))
+    .map((item) => item.trim())
+    .where((item) => item.isNotEmpty)
+    .toSet()
+    .toList(growable: false);
+
+class WordImportResult {
+  const WordImportResult({
+    required this.words,
+    this.relations = const [],
+  });
+
+  final List<Word> words;
+  final List<ImportedWordRelation> relations;
+}
+
+class ImportedWordRelation {
+  const ImportedWordRelation({
+    required this.sourceWordIndex,
+    required this.targetTerm,
+  });
+
+  final int sourceWordIndex;
+  final String targetTerm;
 }

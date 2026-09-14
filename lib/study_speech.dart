@@ -1,4 +1,6 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_tts/flutter_tts.dart';
 
 enum StudySpeechLanguage {
   japanese('ja-JP'),
@@ -30,6 +32,7 @@ class StudySpeechRequest {
 }
 
 const studySpeechChannel = MethodChannel('com.vocaflow.app/study_speech');
+final _webStudySpeech = FlutterTts();
 
 StudySpeechLanguage detectStudySpeechLanguage(String text) {
   if (RegExp(r'[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]')
@@ -69,6 +72,12 @@ Future<void> speakStudyWord(String text) async {
 Future<void> speakStudySpeechRequest(StudySpeechRequest request) async {
   if (request.text.trim().isEmpty) return;
   try {
+    if (kIsWeb) {
+      await _webStudySpeech.setLanguage(request.language.tag);
+      await _webStudySpeech.setSpeechRate(0.45);
+      await _webStudySpeech.speak(request.text);
+      return;
+    }
     await studySpeechChannel.invokeMethod<void>(
       'speak',
       request.toMethodChannelArgs(),

@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_storage/firebase_storage.dart';
 
 import 'cloud_change_tracker.dart';
 import 'models.dart';
@@ -81,11 +83,14 @@ class CloudBackup {
   CloudBackup({
     FirebaseAuth? auth,
     FirebaseFirestore? firestore,
+    FirebaseStorage? storage,
   })  : auth = auth ?? FirebaseAuth.instance,
-        firestore = firestore ?? FirebaseFirestore.instance;
+        firestore = firestore ?? FirebaseFirestore.instance,
+        storage = storage ?? FirebaseStorage.instance;
 
   final FirebaseAuth auth;
   final FirebaseFirestore firestore;
+  final FirebaseStorage storage;
 
   static const _operationTimeout = Duration(seconds: 90);
 
@@ -119,6 +124,77 @@ class CloudBackup {
   CollectionReference<Map<String, dynamic>> get _booksRef =>
       firestore.collection('users').doc(_user.uid).collection('vocabBooks');
 
+  /// Separate from vocabBooks/words. Learning progress never rewrites card
+  /// documents, including their content and legacy study fields.
+  CollectionReference<Map<String, dynamic>> get _learningStatesRef =>
+      firestore.collection('users').doc(_user.uid).collection('learningState');
+
+  /// User-authored card relations live beside learningState, never inside
+  /// vocabBooks/*/words. Existing card documents stay read-only.
+  CollectionReference<Map<String, dynamic>> get _relationsRef =>
+      firestore.collection('users').doc(_user.uid).collection('relations');
+
+  Future<bool> hasLearningState() => _runCloudOperation(
+      () async => !(await _learningStatesRef.limit(1).get()).docs.isEmpty);
+
+  Future<void> uploadLearningState(
+    VocaStore store,
+    CloudChangeSnapshot changes,
+  ) =>
+      _runCloudOperation(() async {
+        final deviceId = await store.cloudChanges.deviceId();
+        await _learningStatesRef.doc(deviceId).set({
+          'schema': 1,
+          'deviceId': deviceId,
+          'sequence': changes.learningStateGeneration,
+          'clientUpdatedAt': DateTime.now().toUtc().toIso8601String(),
+          'updatedAt': FieldValue.serverTimestamp(),
+          'payload': store.toLearningStateJson(),
+        }, SetOptions(merge: true));
+      });
+
+  Future<List<Map<String, dynamic>>> downloadLearningStates() =>
+      _runCloudOperation(() async {
+        final snapshot = await _learningStatesRef.get();
+        return snapshot.docs
+            .map((doc) => doc.data()['payload'])
+            .whereType<Map>()
+            .map((payload) => Map<String, dynamic>.from(payload))
+            .toList();
+      });
+
+  Future<void> uploadRelation(Map<String, dynamic> relation) =>
+      _runCloudOperation(() async {
+        final id = relation['id'] as String?;
+        if (id == null || id.isEmpty) throw ArgumentError('Missing relation id');
+        await _relationsRef.doc(id).set({
+          ...relation,
+          'serverUpdatedAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+      });
+
+  Future<List<Map<String, dynamic>>> downloadRelations() =>
+      _runCloudOperation(() async {
+        final snapshot = await _relationsRef.get();
+        return snapshot.docs
+            .map((document) => Map<String, dynamic>.from(document.data()))
+            .toList(growable: false);
+      });
+  /// Uploads an explicitly user-requested local diagnostic archive. It never
+  /// reads or writes profile or vocabBooks/words documents.
+  Future<String> uploadDiagnosticArchive(Uint8List archive,
+          {required String deviceId}) =>
+      _runCloudOperation(() async {
+        final stamp =
+            DateTime.now().toUtc().toIso8601String().replaceAll(':', '-');
+        final ref = storage.ref(
+            'users/${_user.uid}/diagnostics/$deviceId/learning-state-$stamp.ndjson.gz');
+        await ref.putData(
+          archive,
+          SettableMetadata(contentType: 'application/gzip'),
+        );
+        return ref.fullPath;
+      });
   Future<bool> hasBackup() =>
       _runCloudOperation(() async => (await _profileRef.get()).exists);
 
@@ -468,6 +544,8 @@ class CloudBackup {
         'wrongCount': (data['wrongCount'] as num?)?.toInt() ?? 0,
         'lastStudiedAt': data['lastStudiedAt'] as String?,
         'lastWrongAt': data['lastWrongAt'] as String?,
+        'isFavorite': data['isFavorite'] as bool? ?? false,
+        'favoriteUpdatedAt': data['favoriteUpdatedAt'] as String?,
       };
 
   Future<void> _syncDictionaryOpenSetting(VocaStore store) async {

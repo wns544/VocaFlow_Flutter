@@ -17,14 +17,18 @@ import 'cloud_backup.dart';
 import 'csv_parser.dart';
 import 'excel_exporter.dart';
 import 'excel_parser.dart';
+import 'diagnostic_export.dart';
 import 'firebase_options.dart';
+import 'google_sheets_import.dart';
 import 'in_app_browser.dart';
 import 'kanji_lookup.dart';
 import 'local_word_search.dart';
 import 'models.dart';
+import 'navigation_trace.dart';
 import 'store.dart';
 import 'study_course.dart';
 import 'study_speech.dart';
+import 'word_relations.dart';
 
 const ink = Color(0xFF1C1C1E);
 const sea = Color(0xFF34C759);
@@ -34,12 +38,43 @@ const flutterSplashMinimumDuration = Duration(milliseconds: 900);
 const resumeSnapshotChannel = MethodChannel('com.vocaflow.app/resume_snapshot');
 const navigationButtonChannel =
     MethodChannel('com.vocaflow.app/navigation_buttons');
+const navigationDiagnosticChannel =
+    MethodChannel('com.vocaflow.app/navigation_diagnostics');
 final defaultKanjiLookupService = KanjiLookupService();
 final resumeSnapshotNavigatorObserver = _ResumeSnapshotNavigatorObserver();
 final resumeRouteObserver = RouteObserver<ModalRoute<dynamic>>();
+final navigationRouteObserver = _NavigationRouteObserver();
 
 void vocaBackLog(String message) {
   debugPrint('VOCABACK $message');
+  NavigationTrace.record('navigation_debug', {'message': message});
+}
+
+class _NavigationRouteObserver extends NavigatorObserver {
+  String _label(Route<dynamic>? route) {
+    if (route == null) return 'none';
+    return route.settings.name ?? route.runtimeType.toString();
+  }
+
+  @override
+  void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    super.didPush(route, previousRoute);
+    NavigationTrace.record('navigation_route_pushed', {
+      'route': _label(route),
+      'routeType': route.runtimeType.toString(),
+      'previousRoute': _label(previousRoute),
+    });
+  }
+
+  @override
+  void didPop(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    super.didPop(route, previousRoute);
+    navigationBackGate.reserveAfterRoutePop(
+      route: _label(route),
+      routeType: route.runtimeType.toString(),
+      previousRoute: _label(previousRoute),
+    );
+  }
 }
 
 class _ResumeSnapshotNavigatorObserver extends NavigatorObserver {
@@ -176,18 +211,40 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
   final navigatorKey = GlobalKey<NavigatorState>();
   ActiveStudy? initialStudy;
   var restorationNotified = false;
+  DateTime? _lastNavigationButtonAt;
 
   @override
   void initState() {
     super.initState();
     navigationButtonChannel.setMethodCallHandler(_handleNavigationButton);
+    navigationDiagnosticChannel
+        .setMethodCallHandler(_handleNavigationDiagnostic);
     _loadLocalState();
+  }
+
+  Future<bool> _handleNavigationDiagnostic(MethodCall call) async {
+    if (call.method != 'event') return false;
+    final data = Map<String, Object?>.from(call.arguments as Map? ?? const {});
+    NavigationTrace.record('navigation_android_input', data);
+    return true;
   }
 
   Future<bool> _handleNavigationButton(MethodCall call) async {
     final method = call.method;
     if (method != 'back' && method != 'forward') return false;
+    final now = DateTime.now();
+    final last = _lastNavigationButtonAt;
+    if (last != null &&
+        now.difference(last) < const Duration(milliseconds: 350)) {
+      vocaBackLog('flutter channel duplicate ignored method=$method');
+      return true;
+    }
+    _lastNavigationButtonAt = now;
     vocaBackLog('flutter channel received method=$method');
+    NavigationTrace.record('navigation_native_channel_received', {
+      'method': method,
+      'hasBrowserHandler': activeBrowserNavigationButtonHandler != null,
+    });
     final browserHandler = activeBrowserNavigationButtonHandler;
     if (browserHandler != null) {
       vocaBackLog('flutter channel dispatch to browser method=$method');
@@ -213,6 +270,7 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
       await Future<void>.delayed(flutterSplashMinimumDuration);
     }
     final value = await localState;
+    NavigationTrace.bind(value.cloudChanges);
     var active = value.activeStudy;
     if (active != null &&
         value.resolveActiveWords(active).length != active.queueIds.length) {
@@ -343,7 +401,8 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
       ),
       navigatorObservers: [
         resumeSnapshotNavigatorObserver,
-        resumeRouteObserver
+        resumeRouteObserver,
+        navigationRouteObserver,
       ],
       initialRoute: initialStudy == null ? '/' : '/study',
       onGenerateRoute: (settings) {
@@ -391,6 +450,7 @@ class _MouseBackForwardScopeState extends State<_MouseBackForwardScope> {
   }
 
   Future<void> _goBack() async {
+    if (!navigationBackGate.accept('app_keyboard_back')) return;
     await widget.navigatorKey.currentState?.maybePop();
   }
 
@@ -398,9 +458,13 @@ class _MouseBackForwardScopeState extends State<_MouseBackForwardScope> {
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
       return KeyEventResult.ignored;
     }
+    // Backspace is always text editing. It must never become app navigation,
+    // including with a physical keyboard or a phone-mirroring keyboard.
+    if (event.logicalKey == LogicalKeyboardKey.backspace) {
+      return KeyEventResult.ignored;
+    }
     if (event.logicalKey == LogicalKeyboardKey.browserBack ||
         event.logicalKey == LogicalKeyboardKey.goBack ||
-        event.logicalKey == LogicalKeyboardKey.backspace ||
         (event.logicalKey == LogicalKeyboardKey.arrowLeft &&
             HardwareKeyboard.instance.isAltPressed)) {
       _goBack();
@@ -497,6 +561,7 @@ class _MainShellState extends State<MainShell> with RouteAware {
   Widget build(BuildContext context) {
     final pages = [
       HomePage(store: widget.store, refresh: refresh),
+      DictionaryPage(store: widget.store, refresh: refresh),
       BooksPage(store: widget.store, refresh: refresh),
       SettingsPage(
           store: widget.store,
@@ -507,6 +572,9 @@ class _MainShellState extends State<MainShell> with RouteAware {
       body: SafeArea(child: IndexedStack(index: index, children: pages)),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: index,
+        type: BottomNavigationBarType.fixed,
+        showSelectedLabels: true,
+        showUnselectedLabels: true,
         onTap: (value) {
           setState(() => index = value);
           unawaited(widget.store.setLastMainTab(value));
@@ -525,6 +593,10 @@ class _MainShellState extends State<MainShell> with RouteAware {
               icon: Icon(Icons.local_fire_department_outlined, size: 21),
               activeIcon: Icon(Icons.local_fire_department, size: 21),
               label: '학습'),
+          BottomNavigationBarItem(
+              icon: Icon(Icons.search_outlined, size: 21),
+              activeIcon: Icon(Icons.search, size: 21),
+              label: '검색'),
           BottomNavigationBarItem(
               icon: Icon(Icons.menu_book_outlined, size: 21),
               activeIcon: Icon(Icons.menu_book, size: 21),
@@ -1710,10 +1782,12 @@ class _CardStudyPageState extends State<CardStudyPage>
   final reviewed = <String>{};
   final seenWordIds = <int>{};
   final _primaryDrag = ValueNotifier<double>(0);
+  final _keyboardFocusNode = FocusNode(debugLabel: 'study-keyboard');
   Future<void> _persistenceChain = Future<void>.value();
   var memorized = 0;
   var revealed = false;
   var showingExplanation = false;
+  var _relatedCurrentScopeOnly = false;
   var exiting = false;
   var finishingStudy = false;
   var completionValidated = false;
@@ -1751,9 +1825,79 @@ class _CardStudyPageState extends State<CardStudyPage>
     return memorized ? StudyState.memorized : StudyState.review;
   }
 
+  KeyEventResult _handleStudyKeyEvent(FocusNode node, KeyEvent event) {
+    // A held-down key must not make an accidental run of decisions.
+    if (event is! KeyDownEvent || queue.isEmpty || exiting) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    if (key == LogicalKeyboardKey.space || key == LogicalKeyboardKey.enter) {
+      toggleReveal(queue.first);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.digit1 ||
+        key == LogicalKeyboardKey.arrowLeft ||
+        key == LogicalKeyboardKey.arrowUp) {
+      decide(stateForDirection(false));
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.digit2 ||
+        key == LogicalKeyboardKey.arrowRight ||
+        key == LogicalKeyboardKey.arrowDown) {
+      decide(stateForDirection(true));
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.keyZ && undoHistory.isNotEmpty) {
+      undo();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  Future<void> showKeyboardShortcutGuide() => showDialog<void>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Row(children: [
+            Icon(Icons.keyboard_alt_outlined, color: sea),
+            SizedBox(width: 9),
+            Text('키보드 학습'),
+          ]),
+          content: Column(mainAxisSize: MainAxisSize.min, children: [
+            _shortcutGuideRow('Space / Enter', '카드 앞뒤 보기'),
+            _shortcutGuideRow('1 / ← / ↑',
+                '왼쪽·위쪽 판정 (${stateForDirection(false) == StudyState.memorized ? '외움' : '다시'})'),
+            _shortcutGuideRow('2 / → / ↓',
+                '오른쪽·아래쪽 판정 (${stateForDirection(true) == StudyState.memorized ? '외움' : '다시'})'),
+            _shortcutGuideRow('Z', '바로 전 카드 되돌리기'),
+          ]),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('닫기'),
+            ),
+          ],
+        ),
+      );
+
+  Widget _shortcutGuideRow(String key, String description) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Row(children: [
+          SizedBox(
+            width: 122,
+            child:
+                Text(key, style: const TextStyle(fontWeight: FontWeight.w800)),
+          ),
+          Expanded(child: Text(description)),
+        ]),
+      );
+
   @override
   void initState() {
     super.initState();
+    // A newly created study route is a fresh navigation context. Keep the
+    // guard for sheets inside this route, but never inherit a prior route's
+    // short duplicate-back reservation.
+    navigationBackGate.reset('study_page_initialized');
     WidgetsBinding.instance.addObserver(this);
     _bookIdsByWord = {
       for (final book in widget.store.books)
@@ -1843,6 +1987,7 @@ class _CardStudyPageState extends State<CardStudyPage>
 
   @override
   void dispose() {
+    _keyboardFocusNode.dispose();
     WidgetsBinding.instance.removeObserver(this);
     resumeRouteObserver.unsubscribe(this);
     _primaryDrag.dispose();
@@ -1915,6 +2060,60 @@ class _CardStudyPageState extends State<CardStudyPage>
   String _cardIdentity(Word word) =>
       '${_bookIdForWord(word) ?? activeBookId ?? 'unknown'}:${word.id}';
 
+  RelatedWordRef? _relationReferenceFor(Word word) {
+    final bookId = _bookIdForWord(word);
+    return bookId == null
+        ? null
+        : RelatedWordRef(bookId: bookId, wordId: word.id);
+  }
+
+  Set<RelatedWordRef> _currentRelationScope() {
+    final rangeBookId = activeBookId;
+    if (isRangeCourse && rangeBookId != null) {
+      final book = widget.store.books
+          .where((item) => item.id == rangeBookId)
+          .firstOrNull;
+      if (book != null) {
+        return StudyCourse(
+          start: activeRangeStart!,
+          end: activeRangeEnd!,
+          source: StudyCourseSource.cumulative,
+        )
+            .wordsFrom(book)
+            .map((word) => RelatedWordRef(bookId: book.id, wordId: word.id))
+            .toSet();
+      }
+    }
+    final selected = <RelatedWordRef>{};
+    for (final entry in activeSessionSelections.entries) {
+      final book =
+          widget.store.books.where((item) => item.id == entry.key).firstOrNull;
+      if (book == null) continue;
+      final sessions = book.sessions(widget.store.sessionSize);
+      for (final index in entry.value) {
+        if (index >= 0 && index < sessions.length) {
+          selected.addAll(sessions[index]
+              .words
+              .map((word) => RelatedWordRef(bookId: book.id, wordId: word.id)));
+        }
+      }
+    }
+    if (selected.isNotEmpty) return selected;
+    return queue.map(_relationReferenceFor).whereType<RelatedWordRef>().toSet();
+  }
+
+  Future<void> _editRelatedWords(Word word) async {
+    final source = _relationReferenceFor(word);
+    if (source == null) return;
+    await showRelatedWordPicker(
+      context,
+      store: widget.store,
+      source: source,
+      currentScope: _currentRelationScope(),
+    );
+    if (mounted) setState(() {});
+  }
+
   Future<void> _flushStudyPersistence({bool requestBackup = false}) async {
     await _persistenceChain;
     if (queue.isNotEmpty && !exiting) await persistStudy();
@@ -1947,6 +2146,7 @@ class _CardStudyPageState extends State<CardStudyPage>
       return;
     }
     if (confirm && !await _confirmExitStudy()) {
+      navigationBackGate.reset('study_exit_cancelled');
       vocaBackLog('study requestExit cancelled by dialog');
       return;
     }
@@ -2067,6 +2267,12 @@ class _CardStudyPageState extends State<CardStudyPage>
     scheduleResumeSnapshotCapture('study');
   }
 
+  Future<void> toggleFavorite(Word word) async {
+    await widget.store
+        .setWordFavorite(word, !word.isFavorite, bookId: _bookIdForWord(word));
+    if (mounted) setState(() {});
+  }
+
   Future<void> copyText(String text) async {
     await Clipboard.setData(ClipboardData(text: text));
     if (!mounted) return;
@@ -2173,6 +2379,35 @@ class _CardStudyPageState extends State<CardStudyPage>
                 onLongPress: () => showExplanation(word),
               ),
             ),
+          if (back)
+            Positioned(
+              top: 8,
+              left: 8,
+              child: IconButton(
+                key: const ValueKey('card-related-words'),
+                tooltip: '관련 단어 연결',
+                visualDensity: VisualDensity.compact,
+                onPressed: () => _editRelatedWords(word),
+                icon: const Icon(Icons.hub_outlined,
+                    size: 22, color: Color(0xFF8E8E93)),
+              ),
+            ),
+          if (back)
+            Positioned(
+              top: 8,
+              right: 8,
+              child: IconButton(
+                key: const ValueKey('card-favorite'),
+                tooltip: '즐겨찾기',
+                visualDensity: VisualDensity.compact,
+                onPressed: () => toggleFavorite(word),
+                icon: Icon(
+                  word.isFavorite ? Icons.star : Icons.star_border,
+                  size: 22,
+                  color: word.isFavorite ? coral : const Color(0xFF8E8E93),
+                ),
+              ),
+            ),
           if (!back && word.explanation.trim().isNotEmpty) ...[
             const Positioned(
               top: 17,
@@ -2262,6 +2497,16 @@ class _CardStudyPageState extends State<CardStudyPage>
                           fontFamily: japaneseFontFamily(widget.store),
                           fontWeight: fontWeightFromValue(
                               widget.store.meaningFontWeight))),
+                  RelatedWordsPanel(
+                    store: widget.store,
+                    source: _relationReferenceFor(word),
+                    currentScope: _currentRelationScope(),
+                    scopeOnly: _relatedCurrentScopeOnly,
+                    onScopeOnlyChanged: (value) =>
+                        setState(() => _relatedCurrentScopeOnly = value),
+                    onManage: () => _editRelatedWords(word),
+                    compact: true,
+                  ),
                   if (widget.store.showExamples && word.example.isNotEmpty) ...[
                     const SizedBox(height: 28),
                     Text(word.example,
@@ -2405,217 +2650,248 @@ class _CardStudyPageState extends State<CardStudyPage>
       onPopInvokedWithResult: (didPop, _) {
         vocaBackLog(
             'study PopScope didPop=$didPop exiting=$exiting routeCurrent=${_route?.isCurrent}');
-        if (!didPop && (_route?.isCurrent ?? true)) {
+        if (!didPop &&
+            (_route?.isCurrent ?? true) &&
+            navigationBackGate.accept('study_pop_scope', data: {
+              'routeCurrent': _route?.isCurrent ?? true,
+              'exiting': exiting,
+            })) {
           requestExitStudy(confirm: true);
         }
       },
-      child: Scaffold(
-        body: _StudyBackground(
-          primaryDrag: _primaryDrag,
-          stateForDirection: stateForDirection,
-          child: SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 16, 16, 10),
-              child: Column(children: [
-                Row(children: [
-                  _RoundIconButton(
-                      icon: Icons.arrow_back, onTap: requestExitStudy),
-                  const SizedBox(width: 12),
-                  Expanded(
-                      child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                        Text(studyContextLabel,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                                color: Color(0xFF8E8E93), fontSize: 12)),
-                        Text('${queue.length}개 남음',
-                            style: const TextStyle(
-                                color: ink,
-                                fontSize: 14,
-                                height: 1.15,
-                                fontWeight: FontWeight.w800)),
-                      ])),
-                  _RoundIconButton(
-                      icon: Icons.edit_outlined, onTap: editCurrentWord),
-                  const SizedBox(width: 6),
-                  _RoundIconButton(icon: Icons.tune, onTap: editCardFontSizes),
-                ]),
-                const SizedBox(height: 10),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 14),
-                  child: LinearProgressIndicator(
-                      value: total == 0 ? 0 : memorized / total,
-                      minHeight: 9,
-                      borderRadius: BorderRadius.circular(99),
-                      backgroundColor: const Color(0xFFE5E5EA)),
-                ),
-                const SizedBox(height: 5),
-                Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text('$memorized 외움',
-                          style: const TextStyle(
-                              color: Color(0xFF8E8E93), fontSize: 11)),
-                      Text('$total 전체',
-                          style: const TextStyle(
-                              color: Color(0xFF8E8E93), fontSize: 11)),
-                    ]),
-                const SizedBox(height: 12),
-                ValueListenableBuilder<double>(
-                  valueListenable: _primaryDrag,
-                  builder: (context, drag, _) {
-                    final progress = (drag.abs() / 150).clamp(0.0, 1.0);
-                    final dragState =
-                        drag == 0 ? null : stateForDirection(drag > 0);
-                    final negativeActive = dragState != null &&
-                        dragState == stateForDirection(false);
-                    final positiveActive = dragState != null &&
-                        dragState == stateForDirection(true);
-                    if (horizontalSwipe) {
-                      return Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          _SwipeHint(
-                            label: '<',
-                            color: negativeColor,
-                            progress: negativeActive ? progress : 0,
-                            leadingIcon: true,
-                          ),
-                          _SwipeHint(
-                            label: '>',
-                            color: positiveColor,
-                            progress: positiveActive ? progress : 0,
-                            leadingIcon: false,
-                          ),
-                        ],
-                      );
-                    }
-                    return _SwipeHint(
-                      icon: Icons.keyboard_arrow_up,
-                      label: stateForDirection(false) == StudyState.memorized
-                          ? '외움'
-                          : '다시',
-                      color: negativeColor,
-                      progress: negativeActive ? progress : 0,
-                      leadingIcon: true,
-                    );
-                  },
-                ),
-                const SizedBox(height: 12),
-                Expanded(
-                  child: AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 280),
-                    switchInCurve: Curves.easeOutCubic,
-                    switchOutCurve: Curves.easeInCubic,
-                    layoutBuilder: (currentChild, previousChildren) => Stack(
-                      clipBehavior: Clip.none,
-                      fit: StackFit.expand,
+      child: Focus(
+        focusNode: _keyboardFocusNode,
+        autofocus: true,
+        onKeyEvent: _handleStudyKeyEvent,
+        child: Scaffold(
+          body: _StudyBackground(
+            primaryDrag: _primaryDrag,
+            stateForDirection: stateForDirection,
+            child: SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 10),
+                child: Column(children: [
+                  Row(children: [
+                    _RoundIconButton(
+                        icon: Icons.arrow_back, onTap: requestExitStudy),
+                    const SizedBox(width: 12),
+                    Expanded(
+                        child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                          Text(studyContextLabel,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                  color: Color(0xFF8E8E93), fontSize: 12)),
+                          Text('${queue.length}개 남음',
+                              style: const TextStyle(
+                                  color: ink,
+                                  fontSize: 14,
+                                  height: 1.15,
+                                  fontWeight: FontWeight.w800)),
+                        ])),
+                    _RoundIconButton(
+                        icon: Icons.edit_outlined, onTap: editCurrentWord),
+                    const SizedBox(width: 6),
+                    if (kIsWeb) ...[
+                      _RoundIconButton(
+                        icon: Icons.keyboard_alt_outlined,
+                        onTap: showKeyboardShortcutGuide,
+                      ),
+                      const SizedBox(width: 6),
+                    ],
+                    _RoundIconButton(
+                        icon: Icons.tune, onTap: editCardFontSizes),
+                  ]),
+                  const SizedBox(height: 10),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 14),
+                    child: LinearProgressIndicator(
+                        value: total == 0 ? 0 : memorized / total,
+                        minHeight: 9,
+                        borderRadius: BorderRadius.circular(99),
+                        backgroundColor: const Color(0xFFE5E5EA)),
+                  ),
+                  const SizedBox(height: 5),
+                  Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        ...previousChildren,
-                        if (currentChild != null) currentChild,
-                      ],
-                    ),
-                    transitionBuilder: (child, animation) => AnimatedBuilder(
-                      animation: animation,
-                      child: child,
-                      builder: (context, child) {
-                        final leaving =
-                            animation.status == AnimationStatus.reverse;
-                        final distance = (1 - animation.value) * .16;
-                        return Opacity(
-                          opacity: animation.value,
-                          child: Transform.translate(
-                            offset: Offset(leaving ? distance : -distance, 0),
-                            child: Transform.scale(
-                              scale: 1 - (1 - animation.value) * .035,
-                              child: child,
+                        Text('$memorized 외움',
+                            style: const TextStyle(
+                                color: Color(0xFF8E8E93), fontSize: 11)),
+                        Text('$total 전체',
+                            style: const TextStyle(
+                                color: Color(0xFF8E8E93), fontSize: 11)),
+                      ]),
+                  const SizedBox(height: 12),
+                  ValueListenableBuilder<double>(
+                    valueListenable: _primaryDrag,
+                    builder: (context, drag, _) {
+                      final progress = (drag.abs() / 150).clamp(0.0, 1.0);
+                      final dragState =
+                          drag == 0 ? null : stateForDirection(drag > 0);
+                      final negativeActive = dragState != null &&
+                          dragState == stateForDirection(false);
+                      final positiveActive = dragState != null &&
+                          dragState == stateForDirection(true);
+                      if (horizontalSwipe) {
+                        return Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            _SwipeHint(
+                              label: '<',
+                              color: negativeColor,
+                              progress: negativeActive ? progress : 0,
+                              leadingIcon: true,
                             ),
-                          ),
+                            _SwipeHint(
+                              label: '>',
+                              color: positiveColor,
+                              progress: positiveActive ? progress : 0,
+                              leadingIcon: false,
+                            ),
+                          ],
                         );
-                      },
-                    ),
-                    child: KeyedSubtree(
-                      key: ValueKey('undo-card-$_undoTransitionRevision'),
-                      child: _StudyCardDeck(
-                        frontId:
-                            '${_cardIdentity(word)}:${showingExplanation ? 'explanation' : 'card'}',
-                        backId:
-                            nextWord == null ? null : _cardIdentity(nextWord),
-                        horizontalSwipe: horizontalSwipe,
-                        onTap: () => toggleReveal(word),
-                        onPrimaryDragChanged: (value) =>
-                            _primaryDrag.value = value,
-                        onDismissed: (positive) =>
-                            decide(stateForDirection(positive)),
-                        front: showingExplanation
-                            ? explanationFace(word)
-                            : widget.store.flipCard
-                                ? TweenAnimationBuilder<double>(
-                                    key: ValueKey(
-                                        'active-card-${_cardIdentity(word)}'),
-                                    tween:
-                                        Tween(begin: 0, end: revealed ? pi : 0),
-                                    duration: const Duration(milliseconds: 420),
-                                    curve: Curves.easeInOutCubic,
-                                    builder: (context, angle, _) {
-                                      final back = angle > pi / 2;
-                                      return Transform(
-                                        alignment: Alignment.center,
-                                        transform: Matrix4.identity()
-                                          ..setEntry(3, 2, 0.0012)
-                                          ..rotateY(angle),
-                                        child: Transform(
+                      }
+                      return _SwipeHint(
+                        icon: Icons.keyboard_arrow_up,
+                        label: stateForDirection(false) == StudyState.memorized
+                            ? '외움'
+                            : '다시',
+                        color: negativeColor,
+                        progress: negativeActive ? progress : 0,
+                        leadingIcon: true,
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  Expanded(
+                    child: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 280),
+                      switchInCurve: Curves.easeOutCubic,
+                      switchOutCurve: Curves.easeInCubic,
+                      layoutBuilder: (currentChild, previousChildren) => Stack(
+                        clipBehavior: Clip.none,
+                        fit: StackFit.expand,
+                        children: [
+                          ...previousChildren,
+                          if (currentChild != null) currentChild,
+                        ],
+                      ),
+                      transitionBuilder: (child, animation) => AnimatedBuilder(
+                        animation: animation,
+                        child: child,
+                        builder: (context, child) {
+                          final leaving =
+                              animation.status == AnimationStatus.reverse;
+                          final distance = (1 - animation.value) * .16;
+                          return Opacity(
+                            opacity: animation.value,
+                            child: Transform.translate(
+                              offset: Offset(leaving ? distance : -distance, 0),
+                              child: Transform.scale(
+                                scale: 1 - (1 - animation.value) * .035,
+                                child: child,
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                      child: KeyedSubtree(
+                        key: ValueKey('undo-card-$_undoTransitionRevision'),
+                        child: _StudyCardDeck(
+                          frontId:
+                              '${_cardIdentity(word)}:${showingExplanation ? 'explanation' : 'card'}',
+                          backId:
+                              nextWord == null ? null : _cardIdentity(nextWord),
+                          horizontalSwipe: horizontalSwipe,
+                          onTap: () => toggleReveal(word),
+                          onPrimaryDragChanged: (value) =>
+                              _primaryDrag.value = value,
+                          onDismissed: (positive) =>
+                              decide(stateForDirection(positive)),
+                          front: showingExplanation
+                              ? explanationFace(word)
+                              : widget.store.flipCard
+                                  ? TweenAnimationBuilder<double>(
+                                      key: ValueKey(
+                                          'active-card-${_cardIdentity(word)}'),
+                                      tween: Tween(
+                                          begin: 0, end: revealed ? pi : 0),
+                                      duration:
+                                          const Duration(milliseconds: 420),
+                                      curve: Curves.easeInOutCubic,
+                                      builder: (context, angle, _) {
+                                        final back = angle > pi / 2;
+                                        return Transform(
                                           alignment: Alignment.center,
-                                          transform:
-                                              Matrix4.rotationY(back ? pi : 0),
-                                          child: cardFace(word, back),
-                                        ),
-                                      );
-                                    },
-                                  )
-                                : cardFace(word, revealed),
-                        back:
-                            nextWord == null ? null : cardFace(nextWord, false),
+                                          transform: Matrix4.identity()
+                                            ..setEntry(3, 2, 0.0012)
+                                            ..rotateY(angle),
+                                          child: Transform(
+                                            alignment: Alignment.center,
+                                            transform: Matrix4.rotationY(
+                                                back ? pi : 0),
+                                            child: cardFace(word, back),
+                                          ),
+                                        );
+                                      },
+                                    )
+                                  : cardFace(word, revealed),
+                          back: nextWord == null
+                              ? null
+                              : cardFace(nextWord, false),
+                        ),
                       ),
                     ),
                   ),
-                ),
-                const SizedBox(height: 8),
-                Row(children: [
-                  if (!horizontalSwipe)
-                    Expanded(
-                      child: Center(
-                        child: ValueListenableBuilder<double>(
-                          valueListenable: _primaryDrag,
-                          builder: (context, drag, _) {
-                            final progress = (drag.abs() / 150).clamp(0.0, 1.0);
-                            final dragState =
-                                drag == 0 ? null : stateForDirection(drag > 0);
-                            final active = dragState != null &&
-                                dragState == stateForDirection(true);
-                            return _SwipeHint(
-                              icon: Icons.keyboard_arrow_down,
-                              label: stateForDirection(true) ==
-                                      StudyState.memorized
-                                  ? '외움'
-                                  : '다시',
-                              color: positiveColor,
-                              progress: active ? progress : 0,
-                              leadingIcon: true,
-                            );
-                          },
+                  if (kIsWeb) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      '키보드: Space 카드 보기 · 1/←/↑ ${stateForDirection(false) == StudyState.memorized ? '외움' : '다시'} · 2/→/↓ ${stateForDirection(true) == StudyState.memorized ? '외움' : '다시'} · Z 되돌리기',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                          color: Color(0xFF8E8E93), fontSize: 11),
+                    ),
+                  ],
+                  const SizedBox(height: 8),
+                  Row(children: [
+                    if (!horizontalSwipe)
+                      Expanded(
+                        child: Center(
+                          child: ValueListenableBuilder<double>(
+                            valueListenable: _primaryDrag,
+                            builder: (context, drag, _) {
+                              final progress =
+                                  (drag.abs() / 150).clamp(0.0, 1.0);
+                              final dragState = drag == 0
+                                  ? null
+                                  : stateForDirection(drag > 0);
+                              final active = dragState != null &&
+                                  dragState == stateForDirection(true);
+                              return _SwipeHint(
+                                icon: Icons.keyboard_arrow_down,
+                                label: stateForDirection(true) ==
+                                        StudyState.memorized
+                                    ? '외움'
+                                    : '다시',
+                                color: positiveColor,
+                                progress: active ? progress : 0,
+                                leadingIcon: true,
+                              );
+                            },
+                          ),
                         ),
-                      ),
-                    )
-                  else
-                    const Spacer(),
-                  _RoundIconButton(
-                      key: const ValueKey('undo-study'),
-                      icon: Icons.undo,
-                      onTap: undoHistory.isEmpty ? null : undo),
+                      )
+                    else
+                      const Spacer(),
+                    _RoundIconButton(
+                        key: const ValueKey('undo-study'),
+                        icon: Icons.undo,
+                        onTap: undoHistory.isEmpty ? null : undo),
+                  ]),
                 ]),
-              ]),
+              ),
             ),
           ),
         ),
@@ -3075,6 +3351,7 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
           builder: (_) => InAppBrowserPage(
             uri: uri,
             title: '통용한자',
+            enableTongHanjaTextSearch: true,
           ),
         ),
       );
@@ -3697,6 +3974,278 @@ class LegacyBooksPage extends StatelessWidget {
       );
 }
 
+class DictionaryPage extends StatefulWidget {
+  const DictionaryPage({super.key, required this.store, required this.refresh});
+
+  final VocaStore store;
+  final VoidCallback refresh;
+
+  @override
+  State<DictionaryPage> createState() => _DictionaryPageState();
+}
+
+class _DictionaryPageState extends State<DictionaryPage> {
+  final _query = TextEditingController();
+  bool _favoritesOnly = false;
+
+  @override
+  void dispose() {
+    _query.dispose();
+    super.dispose();
+  }
+
+  List<(Word, WordBook)> get _results {
+    final rows = <(Word, WordBook)>[];
+    final query = _query.text.trim().toLowerCase();
+    for (final book in widget.store.books) {
+      for (final word in book.words) {
+        if (_favoritesOnly && !word.isFavorite) continue;
+        if (query.isNotEmpty &&
+            ![word.term, word.reading, word.meaning, word.example]
+                .join(' ')
+                .toLowerCase()
+                .contains(query)) {
+          continue;
+        }
+        rows.add((word, book));
+      }
+    }
+    if (_favoritesOnly) {
+      rows.sort((a, b) => (b.$1.favoriteUpdatedAt ?? DateTime(1970))
+          .compareTo(a.$1.favoriteUpdatedAt ?? DateTime(1970)));
+    }
+    return rows;
+  }
+
+  Future<void> _toggle(Word word, String bookId) async {
+    await widget.store.setWordFavorite(word, !word.isFavorite, bookId: bookId);
+    if (!mounted) return;
+    setState(() {});
+    widget.refresh();
+  }
+
+  Future<void> _showDetails(Word word, WordBook book) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      builder: (sheetContext) => _WordDetailSheet(
+        word: word,
+        book: book,
+        store: widget.store,
+        onChanged: () {
+          if (!mounted) return;
+          setState(() {});
+          widget.refresh();
+        },
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            child: TextField(
+              controller: _query,
+              onChanged: (_) => setState(() {}),
+              decoration: InputDecoration(
+                prefixIcon: const Icon(Icons.search),
+                hintText: '단어·발음·뜻 검색',
+                suffixIcon: _query.text.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.clear),
+                        onPressed: () {
+                          _query.clear();
+                          setState(() {});
+                        },
+                      ),
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: SegmentedButton<bool>(
+              segments: const [
+                ButtonSegment(value: false, label: Text('전체 단어')),
+                ButtonSegment(value: true, label: Text('★ 즐겨찾기')),
+              ],
+              selected: {_favoritesOnly},
+              onSelectionChanged: (value) =>
+                  setState(() => _favoritesOnly = value.first),
+            ),
+          ),
+          Expanded(
+            child: _results.isEmpty
+                ? const Center(child: Text('검색 결과가 없습니다'))
+                : ListView.builder(
+                    padding: const EdgeInsets.all(12),
+                    itemCount: _results.length,
+                    itemBuilder: (_, index) {
+                      final (word, book) = _results[index];
+                      return Card(
+                        child: ListTile(
+                          onTap: () => _showDetails(word, book),
+                          title: Text(word.term,
+                              style:
+                                  const TextStyle(fontWeight: FontWeight.w800)),
+                          subtitle: Text(
+                            '${word.reading}\n${word.meaning}\n${book.name}',
+                            maxLines: 3,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          trailing: IconButton(
+                            tooltip: word.isFavorite ? '즐겨찾기 해제' : '즐겨찾기',
+                            icon: Icon(
+                              word.isFavorite ? Icons.star : Icons.star_border,
+                              color: word.isFavorite ? coral : Colors.grey,
+                            ),
+                            onPressed: () => _toggle(word, book.id),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      );
+}
+
+class _WordDetailSheet extends StatefulWidget {
+  const _WordDetailSheet({
+    required this.word,
+    required this.book,
+    required this.store,
+    required this.onChanged,
+  });
+
+  final Word word;
+  final WordBook book;
+  final VocaStore store;
+  final VoidCallback onChanged;
+
+  @override
+  State<_WordDetailSheet> createState() => _WordDetailSheetState();
+}
+
+class _WordDetailSheetState extends State<_WordDetailSheet> {
+  late Word word;
+
+  @override
+  void initState() {
+    super.initState();
+    word = widget.word;
+  }
+
+  Future<void> _toggleFavorite() async {
+    await widget.store
+        .setWordFavorite(word, !word.isFavorite, bookId: widget.book.id);
+    if (!mounted) return;
+    setState(() {});
+    widget.onChanged();
+  }
+
+  RelatedWordRef get _relationReference =>
+      RelatedWordRef(bookId: widget.book.id, wordId: word.id);
+
+  Future<void> _editRelatedWords() async {
+    await showRelatedWordPicker(
+      context,
+      store: widget.store,
+      source: _relationReference,
+    );
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _edit() async {
+    final updated = await _showWordEditor(context, word);
+    if (!mounted || updated == null) return;
+    await widget.store.updateWord(updated);
+    if (!mounted) return;
+    setState(() => word = updated);
+    widget.onChanged();
+  }
+
+  Widget _section(String label, String value) {
+    if (value.trim().isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 14),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(label, style: const TextStyle(color: Colors.black54)),
+        const SizedBox(height: 5),
+        SelectableText(value,
+            style: const TextStyle(fontSize: 16, height: 1.4)),
+      ]),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+        child: SingleChildScrollView(
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              Expanded(
+                child: Text(word.term,
+                    style: const TextStyle(
+                        fontSize: 32, fontWeight: FontWeight.w900)),
+              ),
+              IconButton(
+                tooltip: word.isFavorite ? '즐겨찾기 해제' : '즐겨찾기',
+                icon: Icon(word.isFavorite ? Icons.star : Icons.star_border,
+                    color: word.isFavorite ? coral : Colors.grey),
+                onPressed: _toggleFavorite,
+              ),
+              IconButton(
+                tooltip: '단어 복사',
+                icon: const Icon(Icons.copy_outlined),
+                onPressed: () async {
+                  await Clipboard.setData(ClipboardData(text: word.term));
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('단어를 복사했어요')),
+                  );
+                },
+              ),
+              IconButton(
+                tooltip: '수정',
+                icon: const Icon(Icons.edit_outlined),
+                onPressed: _edit,
+              ),
+            ]),
+            _section('발음', word.reading),
+            _section('뜻', word.meaning),
+            _section('예문', word.example),
+            _section('예문 뜻', word.exampleMeaning),
+            _section('설명', word.explanation),
+            RelatedWordsPanel(
+              store: widget.store,
+              source: _relationReference,
+              currentScope: null,
+              scopeOnly: false,
+              onScopeOnlyChanged: (_) {},
+              onManage: _editRelatedWords,
+            ),
+            const SizedBox(height: 20),
+            FilledButton.icon(
+              onPressed: () => speakStudySpeechRequest(
+                studySpeechRequestForWord(
+                  term: word.term,
+                  reading: word.reading,
+                ),
+              ),
+              icon: const Icon(Icons.volume_up_outlined),
+              label: const Text('발음 듣기'),
+            ),
+          ]),
+        ),
+      );
+}
+
 class BooksPage extends StatefulWidget {
   const BooksPage({super.key, required this.store, required this.refresh});
 
@@ -3945,6 +4494,12 @@ class _BooksPageState extends State<BooksPage> {
               subtitle: const Text('.csv, .xlsx'),
               onTap: () => Navigator.pop(context, 'import'),
             ),
+            ListTile(
+              leading: const Icon(Icons.table_chart_outlined),
+              title: const Text('Google 스프레드시트 가져오기'),
+              subtitle: const Text('공유 링크 또는 CSV 링크'),
+              onTap: () => Navigator.pop(context, 'sheets'),
+            ),
           ]),
         ),
       ),
@@ -3952,6 +4507,7 @@ class _BooksPageState extends State<BooksPage> {
     if (!mounted) return;
     if (action == 'new') await addBook();
     if (action == 'import') await importFile();
+    if (action == 'sheets') await importGoogleSheet();
   }
 
   Future<void> addBook() async {
@@ -3970,14 +4526,15 @@ class _BooksPageState extends State<BooksPage> {
     if (result == null || result.files.single.bytes == null || !mounted) return;
     final file = result.files.single;
     final extension = file.extension?.toLowerCase();
-    List<Word> words;
+    WordImportResult importResult;
     try {
-      words = extension == 'xlsx'
-          ? parseWordsXlsx(file.bytes!)
-          : parseWordsCsv(utf8.decode(file.bytes!, allowMalformed: true));
+      importResult = extension == 'xlsx'
+          ? parseWordImportXlsx(file.bytes!)
+          : parseWordImportCsv(utf8.decode(file.bytes!, allowMalformed: true));
     } catch (_) {
-      words = [];
+      importResult = const WordImportResult(words: []);
     }
+    final words = importResult.words;
     if (words.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('읽을 수 있는 단어가 없습니다. 파일 양식을 확인해 주세요.')));
@@ -3989,9 +4546,140 @@ class _BooksPageState extends State<BooksPage> {
         file.name
             .replaceAll(RegExp(r'\.(csv|xlsx)$', caseSensitive: false), ''));
     if (!mounted || name == null) return;
-    await widget.store.addBook(name, words);
+    final book = await widget.store.addBook(name, words);
+    final relatedCount =
+        await _addImportedRelations(book, importResult.relations);
     if (!mounted) return;
     widget.refresh();
+    if (importResult.relations.isNotEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content:
+            Text('단어 ${words.length}개를 가져왔고 관련 단어 $relatedCount개를 연결했습니다.'),
+      ));
+    }
+  }
+
+  Future<void> importGoogleSheet() async {
+    final url = await _askText(
+      context,
+      'Google 스프레드시트 링크 붙여넣기',
+      '',
+    );
+    if (!mounted || url == null || url.trim().isEmpty) return;
+
+    GoogleSheetsImportDownload download;
+    try {
+      download = await GoogleSheetsImporter().download(url);
+    } on GoogleSheetsImportException catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(error.message)));
+      return;
+    }
+    if (!mounted) return;
+
+    final confirmed = await _confirmGoogleSheetImport(download);
+    if (!mounted || confirmed != true) return;
+    final name = await _askText(
+      context,
+      '단어장 이름',
+      download.source.suggestedBookName,
+    );
+    if (!mounted || name == null || name.trim().isEmpty) return;
+    final book = await widget.store.addBook(name, download.importResult.words);
+    final relatedCount =
+        await _addImportedRelations(book, download.importResult.relations);
+    if (!mounted) return;
+    widget.refresh();
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(
+        '단어 ${book.words.length}개를 가져왔고 관련 단어 $relatedCount개를 연결했습니다.',
+      ),
+    ));
+  }
+
+  Future<bool?> _confirmGoogleSheetImport(
+    GoogleSheetsImportDownload download,
+  ) =>
+      showDialog<bool>(
+        context: context,
+        builder: (context) {
+          final sample = download.importResult.words.take(5).toList();
+          return AlertDialog(
+            title: const Text('가져오기 미리보기'),
+            content: SizedBox(
+              width: 420,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('단어 ${download.importResult.words.length}개'),
+                  Text(
+                      '관련 단어 연결 후보 ${download.importResult.relations.length}개'),
+                  Text('건너뛴 행 ${download.skippedRows}개'),
+                  const SizedBox(height: 12),
+                  const Text('처음 5개',
+                      style: TextStyle(fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 4),
+                  ...sample.map((word) => Padding(
+                        padding: const EdgeInsets.only(bottom: 4),
+                        child: Text(
+                            '${word.term} · ${word.reading} · ${word.meaning}'),
+                      )),
+                  const SizedBox(height: 8),
+                  const Text(
+                    '가져오면 앱 단어장으로 복사됩니다. 이후 시트를 수정하거나 삭제해도 이 단어장은 사라지지 않습니다.',
+                    style: TextStyle(color: Color(0xFF6E6E73), fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('취소'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('가져오기'),
+              ),
+            ],
+          );
+        },
+      );
+  Future<int> _addImportedRelations(
+    WordBook book,
+    List<ImportedWordRelation> imports,
+  ) async {
+    if (imports.isEmpty) return 0;
+    final termIndexes = <String, List<int>>{};
+    for (var index = 0; index < book.words.length; index++) {
+      termIndexes
+          .putIfAbsent(book.words[index].term.trim(), () => <int>[])
+          .add(index);
+    }
+    final pairs = <WordRelationPair>[];
+    for (final relation in imports) {
+      if (relation.sourceWordIndex < 0 ||
+          relation.sourceWordIndex >= book.words.length) {
+        continue;
+      }
+      final candidates = termIndexes[relation.targetTerm.trim()];
+      if (candidates == null || candidates.length != 1) continue;
+      final targetIndex = candidates.single;
+      if (targetIndex == relation.sourceWordIndex) continue;
+      pairs.add(WordRelationPair(
+        RelatedWordRef(
+          bookId: book.id,
+          wordId: book.words[relation.sourceWordIndex].id,
+        ),
+        RelatedWordRef(
+          bookId: book.id,
+          wordId: book.words[targetIndex].id,
+        ),
+      ));
+    }
+    return wordRelations.addAll(pairs);
   }
 
   Future<void> openBook(WordBook book) async {
@@ -5240,6 +5928,12 @@ class _SettingsPageState extends State<SettingsPage> {
     if (coordinator == null || coordinator.initialized) return;
     setState(() => syncing = true);
     try {
+      if (kIsWeb) {
+        await coordinator.initializeWebFromCloud();
+        widget.refresh();
+        if (mounted) _showSnack('클라우드 학습 기록을 자동으로 가져왔습니다.');
+        return;
+      }
       final hasCloud = await coordinator.hasCloudBackup();
       if (!mounted) return;
       InitialSyncChoice? choice;
@@ -5354,15 +6048,18 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> uploadToCloud() async {
     final confirmed = await _confirm(
       title: '클라우드 백업',
-      message: '현재 이 기기의 단어장과 학습 기록을 서버에 저장할까요?',
+      message: '이 기기의 학습 진행도만 별도 동기화 저장소에 올릴까요? 기존 카드 데이터는 변경하지 않습니다.',
       action: '업로드',
     );
     if (!confirmed) return;
     await _runCloudTask(() async {
       final coordinator = widget.autoBackup;
       if (coordinator == null) {
-        await CloudBackup().upload(widget.store);
-        await widget.store.cloudChanges.clearPending();
+        final changes = widget.store.cloudChanges;
+        await changes.markLearningState();
+        final snapshot = changes.snapshot;
+        await CloudBackup().uploadLearningState(widget.store, snapshot);
+        await changes.acknowledgeLearningState(snapshot);
       } else {
         await coordinator.manualFullUpload();
       }
@@ -5373,7 +6070,7 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> restoreFromCloud() async {
     final confirmed = await _confirm(
       title: '클라우드 데이터 가져오기',
-      message: '서버 데이터를 이 기기로 가져옵니다. 현재 기기의 데이터는 덮어써집니다.',
+      message: '다른 기기의 학습 진행도를 병합해 가져옵니다. 단어 카드 내용은 변경하지 않습니다.',
       action: '가져오기',
       destructive: true,
     );
@@ -5381,9 +6078,8 @@ class _SettingsPageState extends State<SettingsPage> {
     await _runCloudTask(() async {
       final coordinator = widget.autoBackup;
       if (coordinator == null) {
-        final backup = await CloudBackup().downloadBackupJson();
-        await widget.store.replaceWithBackupJson(backup);
-        await widget.store.cloudChanges.clearPending();
+        await widget.store.applyLearningStateSnapshots(
+            await CloudBackup().downloadLearningStates());
       } else {
         await coordinator.manualRestore();
       }
@@ -5469,6 +6165,119 @@ class _SettingsPageState extends State<SettingsPage> {
         ),
       ) ??
       false;
+
+  Future<String> _detailedSyncLogText() async {
+    final auto = widget.autoBackup;
+    final detail = await widget.store.cloudChanges.diagnostics.readAll();
+    return [
+      'VocaFlow 상세 동기화 진단 기록',
+      '생성 시각: ${DateTime.now().toLocal().toIso8601String()}',
+      '자동 백업: ${auto?.enabled == true ? '켜짐' : '꺼짐'}',
+      '네트워크: ${auto?.networkPolicy == AutoBackupNetworkPolicy.wifiOnly ? 'Wi-Fi만' : '모든 네트워크'}',
+      '대기 중 변경: ${auto?.pendingCount ?? 0}개',
+      '마지막 업로드: ${auto?.lastSuccess?.toLocal().toIso8601String() ?? '없음'}',
+      '마지막 내려받기: ${auto?.lastDownload?.toLocal().toIso8601String() ?? '없음'}',
+      '마지막 오류: ${auto?.lastError ?? '없음'}',
+      '',
+      detail.isEmpty ? '(아직 상세 기록이 없습니다.)' : detail,
+    ].join('\n');
+  }
+
+  Future<void> _markDiagnosticIssue() async {
+    await widget.store.cloudChanges
+        .recordDiagnostic('user_reported_issue', data: {
+      'screen': ModalRoute.of(context)?.settings.name ?? 'settings',
+      'message': '사용자가 방금 문제 발생을 표시함',
+    });
+    if (mounted) _showSnack('문제 시점을 기록했습니다. 이제 보고서를 공유할 수 있어요.');
+  }
+
+  Future<void> _shareDiagnosticReport() async {
+    final stamp = DateTime.now().toUtc().toIso8601String().replaceAll(':', '-');
+    final shared = await shareDiagnosticText(
+      await _detailedSyncLogText(),
+      fileName: 'vocaflow-diagnostic-$stamp.txt',
+    );
+    if (mounted) {
+      _showSnack(shared ? '공유를 완료했습니다.' : '공유 대상을 고르지 않았습니다.');
+    }
+  }
+
+  Future<void> _copySyncLog() async {
+    await Clipboard.setData(ClipboardData(text: await _detailedSyncLogText()));
+    if (mounted) _showSnack('상세 동기화 기록 전체를 복사했습니다.');
+  }
+
+  Future<void> _viewSyncLogs() async {
+    final entries = await widget.store.cloudChanges.diagnostics.readRecent();
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('상세 동기화 기록'),
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 440,
+          child: entries.isEmpty
+              ? const Center(child: Text('아직 기록이 없습니다.'))
+              : ListView.separated(
+                  itemCount: entries.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1),
+                  itemBuilder: (_, index) => SelectableText(entries[index],
+                      style: const TextStyle(fontSize: 11)),
+                ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('닫기'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _exportSyncLog() async {
+    final saved = await saveDiagnosticText(
+        await widget.store.cloudChanges.diagnostics.exportText());
+    if (saved && mounted) _showSnack('상세 기록 파일을 저장했습니다.');
+  }
+
+  Future<void> _uploadSyncLog() async {
+    final auto = widget.autoBackup;
+    if (auto == null || auto.user == null) return;
+    final confirmed = await _confirm(
+      title: '진단 기록 서버 전송',
+      message:
+          '현재 기기의 상세 동기화 기록만 압축해 Firebase Storage 진단 경로로 보냅니다. 카드·단어·프로필 문서는 수정하지 않습니다.',
+      action: '전송',
+    );
+    if (!confirmed) return;
+    await _runCloudTask(() async {
+      await widget.store.cloudChanges
+          .recordDiagnostic('diagnostic_upload_started');
+      final archive = await widget.store.cloudChanges.diagnostics.gzipBytes();
+      final path = await auto.cloud.uploadDiagnosticArchive(archive,
+          deviceId: await widget.store.cloudChanges.deviceId());
+      await widget.store.cloudChanges.recordDiagnostic(
+          'diagnostic_upload_succeeded',
+          data: {'storagePath': path, 'bytes': archive.length});
+      if (mounted) _showSnack('진단 기록을 서버로 전송했습니다.');
+    });
+  }
+
+  Future<void> _clearSyncLogs() async {
+    final confirmed = await _confirm(
+      title: '상세 동기화 기록 지우기',
+      message: '이 기기에 저장된 진단 기록만 지웁니다. 서버의 카드·학습 데이터는 건드리지 않습니다.',
+      action: '지우기',
+      destructive: true,
+    );
+    if (!confirmed) return;
+    await widget.store.cloudChanges.clearLogs();
+    await widget.store.cloudChanges.diagnostics.clear();
+    if (mounted) setState(() {});
+  }
 
   void _showSnack(String message) {
     if (!mounted) return;
@@ -5557,7 +6366,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   title: const Text('자동 백업',
                       style:
                           TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
-                  subtitle: const Text('변경 후 60초가 지나면 필요한 항목만 백업합니다.'),
+                  subtitle: const Text('변경 후 약 15초 뒤 필요한 항목만 백업합니다.'),
                   value: auto?.enabled ?? false,
                   onChanged: syncing || user == null || auto == null
                       ? null
@@ -5612,17 +6421,76 @@ class _SettingsPageState extends State<SettingsPage> {
                 if (auto?.isDownloading == true)
                   const Text('클라우드 확인 중...',
                       style: TextStyle(color: sea, fontSize: 12)),
-                if (auto?.logs.isNotEmpty == true) ...[
-                  const SizedBox(height: 8),
-                  const Text('최근 동기화 기록',
-                      style:
-                          TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
-                  ...auto!.logs.take(5).map((entry) => Text(entry,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                          color: Color(0xFF8E8E93), fontSize: 11))),
-                ],
+                const SizedBox(height: 10),
+                const Text('상세 동기화 진단',
+                    style:
+                        TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+                const SizedBox(height: 4),
+                const Text('카드 판정·현재 카드·대기열·전송·병합·오류를 이 기기에 최대 64MB까지 보관합니다.',
+                    style: TextStyle(color: Color(0xFF8E8E93), fontSize: 11)),
+                const SizedBox(height: 8),
+                Row(children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _viewSyncLogs,
+                      icon: const Icon(Icons.article_outlined, size: 17),
+                      label: const Text('기록 보기'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _copySyncLog,
+                      icon: const Icon(Icons.copy_outlined, size: 17),
+                      label: const Text('전체 복사'),
+                    ),
+                  ),
+                ]),
+                const SizedBox(height: 8),
+                Row(children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _exportSyncLog,
+                      icon: const Icon(Icons.file_download_outlined, size: 17),
+                      label: const Text('파일 내보내기'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed:
+                          user == null || syncing ? null : _uploadSyncLog,
+                      icon: const Icon(Icons.cloud_upload_outlined, size: 17),
+                      label: const Text('수동 서버 전송'),
+                    ),
+                  ),
+                ]),
+                const SizedBox(height: 8),
+                Row(children: [
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: _markDiagnosticIssue,
+                      icon: const Icon(Icons.bug_report_outlined, size: 17),
+                      label: const Text('방금 문제 발생'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _shareDiagnosticReport,
+                      icon: const Icon(Icons.ios_share_outlined, size: 17),
+                      label: const Text('보고서 공유'),
+                    ),
+                  ),
+                ]),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton.icon(
+                    onPressed: _clearSyncLogs,
+                    icon: const Icon(Icons.delete_outline, size: 17),
+                    label: const Text('기록 비우기'),
+                  ),
+                ),
                 if (auto?.lastError != null) ...[
                   const SizedBox(height: 4),
                   Text('마지막 오류: ${auto!.lastError}',
@@ -6817,6 +7685,7 @@ class _WordEditorSheetState extends State<_WordEditorSheet> {
   late final TextEditingController example;
   late final TextEditingController exampleMeaning;
   late final TextEditingController explanation;
+  late bool isFavorite;
 
   @override
   void initState() {
@@ -6827,6 +7696,7 @@ class _WordEditorSheetState extends State<_WordEditorSheet> {
     example = TextEditingController(text: widget.word.example);
     exampleMeaning = TextEditingController(text: widget.word.exampleMeaning);
     explanation = TextEditingController(text: widget.word.explanation);
+    isFavorite = widget.word.isFavorite;
   }
 
   @override
@@ -6851,6 +7721,7 @@ class _WordEditorSheetState extends State<_WordEditorSheet> {
         example: example.text.trim(),
         exampleMeaning: exampleMeaning.text.trim(),
         explanation: explanation.text.trim(),
+        isFavorite: isFavorite,
       ),
     );
   }
@@ -6906,6 +7777,15 @@ class _WordEditorSheetState extends State<_WordEditorSheet> {
                 controller: exampleMeaning,
                 maxLines: 2,
                 decoration: const InputDecoration(labelText: '예문 뜻')),
+            const SizedBox(height: 10),
+            SwitchListTile.adaptive(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('즐겨찾기'),
+              value: isFavorite,
+              onChanged: (value) => setState(() => isFavorite = value),
+              secondary: Icon(isFavorite ? Icons.star : Icons.star_border,
+                  color: isFavorite ? coral : Colors.grey),
+            ),
             const SizedBox(height: 10),
             TextField(
                 key: const ValueKey('word-explanation'),
@@ -6967,6 +7847,224 @@ class _TextInputDialogState extends State<_TextInputDialog> {
               onPressed: () => Navigator.pop(context, controller.text),
               child: const Text('저장')),
         ],
+      );
+}
+
+Future<void> showRelatedWordPicker(
+  BuildContext context, {
+  required VocaStore store,
+  required RelatedWordRef source,
+  Set<RelatedWordRef>? currentScope,
+}) =>
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      builder: (_) => _RelatedWordPickerSheet(
+        store: store,
+        source: source,
+        currentScope: currentScope,
+      ),
+    );
+
+class RelatedWordsPanel extends StatelessWidget {
+  const RelatedWordsPanel({
+    super.key,
+    required this.store,
+    required this.source,
+    required this.currentScope,
+    required this.scopeOnly,
+    required this.onScopeOnlyChanged,
+    required this.onManage,
+    this.compact = false,
+  });
+
+  final VocaStore store;
+  final RelatedWordRef? source;
+  final Set<RelatedWordRef>? currentScope;
+  final bool scopeOnly;
+  final ValueChanged<bool> onScopeOnlyChanged;
+  final VoidCallback onManage;
+  final bool compact;
+
+  (Word, WordBook)? _lookup(RelatedWordRef reference) {
+    for (final book in store.books) {
+      if (book.id != reference.bookId) continue;
+      for (final word in book.words) {
+        if (word.id == reference.wordId) return (word, book);
+      }
+    }
+    return null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final reference = source;
+    if (reference == null) return const SizedBox.shrink();
+    return ListenableBuilder(
+      listenable: wordRelations,
+      builder: (context, _) {
+        var relations = wordRelations.forWord(reference);
+        if (scopeOnly && currentScope != null) {
+          relations = relations
+              .where((relation) =>
+                  currentScope!.contains(relation.otherThan(reference)))
+              .toList(growable: false);
+        }
+        final rows = relations
+            .map((relation) => _lookup(relation.otherThan(reference)))
+            .whereType<(Word, WordBook)>()
+            .toList(growable: false);
+        if (rows.isEmpty && compact) return const SizedBox.shrink();
+        return Padding(
+          padding: EdgeInsets.only(top: compact ? 12 : 20),
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              const Icon(Icons.hub_outlined, size: 17, color: sea),
+              const SizedBox(width: 6),
+              Text('관련 단어',
+                  style: TextStyle(
+                      color: compact ? Colors.black54 : ink,
+                      fontWeight: FontWeight.w800)),
+              const Spacer(),
+              if (currentScope != null)
+                TextButton(
+                  onPressed: () => onScopeOnlyChanged(!scopeOnly),
+                  child: Text(scopeOnly ? '현재 학습' : '전체'),
+                ),
+              IconButton(
+                tooltip: '관련 단어 편집',
+                visualDensity: VisualDensity.compact,
+                onPressed: onManage,
+                icon: const Icon(Icons.add_link_outlined, size: 20),
+              ),
+            ]),
+            if (rows.isEmpty)
+              Text('연결한 단어가 없습니다.',
+                  style: const TextStyle(color: Colors.black45, fontSize: 13))
+            else
+              Wrap(
+                spacing: 7,
+                runSpacing: 6,
+                children: [
+                  for (final row in rows)
+                    Chip(
+                      visualDensity: VisualDensity.compact,
+                      label: Text('${row.$1.term} · ${row.$1.meaning}'),
+                    ),
+                ],
+              ),
+          ]),
+        );
+      },
+    );
+  }
+}
+
+class _RelatedWordPickerSheet extends StatefulWidget {
+  const _RelatedWordPickerSheet({
+    required this.store,
+    required this.source,
+    required this.currentScope,
+  });
+
+  final VocaStore store;
+  final RelatedWordRef source;
+  final Set<RelatedWordRef>? currentScope;
+
+  @override
+  State<_RelatedWordPickerSheet> createState() =>
+      _RelatedWordPickerSheetState();
+}
+
+class _RelatedWordPickerSheetState extends State<_RelatedWordPickerSheet> {
+  final query = TextEditingController();
+  var scopeOnly = false;
+
+  @override
+  void dispose() {
+    query.dispose();
+    super.dispose();
+  }
+
+  List<(Word, WordBook)> get _results {
+    final normalized = query.text.trim().toLowerCase();
+    final rows = <(Word, WordBook)>[];
+    for (final book in widget.store.books) {
+      for (final word in book.words) {
+        final reference = RelatedWordRef(bookId: book.id, wordId: word.id);
+        if (reference == widget.source ||
+            (scopeOnly &&
+                !(widget.currentScope?.contains(reference) ?? false))) {
+          continue;
+        }
+        final text = '${word.term} ${word.reading} ${word.meaning}';
+        if (normalized.isNotEmpty && !text.toLowerCase().contains(normalized)) {
+          continue;
+        }
+        rows.add((word, book));
+      }
+    }
+    return rows;
+  }
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+        child: SizedBox(
+          height: MediaQuery.sizeOf(context).height * .74,
+          child: Column(children: [
+            const Text('관련 단어 연결',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900)),
+            const SizedBox(height: 12),
+            TextField(
+              controller: query,
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(
+                prefixIcon: Icon(Icons.search),
+                hintText: '단어·발음·뜻 검색',
+              ),
+            ),
+            if (widget.currentScope != null)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: FilterChip(
+                  label: const Text('현재 학습 범위만'),
+                  selected: scopeOnly,
+                  onSelected: (value) => setState(() => scopeOnly = value),
+                ),
+              ),
+            Expanded(
+              child: ListenableBuilder(
+                listenable: wordRelations,
+                builder: (context, _) => ListView.builder(
+                  itemCount: _results.length,
+                  itemBuilder: (context, index) {
+                    final row = _results[index];
+                    final target =
+                        RelatedWordRef(bookId: row.$2.id, wordId: row.$1.id);
+                    final related =
+                        wordRelations.isRelated(widget.source, target);
+                    return ListTile(
+                      leading: Icon(related ? Icons.link : Icons.add_link,
+                          color: related ? sea : Colors.black54),
+                      title: Text(row.$1.term),
+                      subtitle: Text(
+                          '${row.$1.reading} · ${row.$1.meaning}\n${row.$2.name}'),
+                      isThreeLine: true,
+                      onTap: () async {
+                        await wordRelations.toggle(widget.source, target);
+                        if (mounted) setState(() {});
+                      },
+                    );
+                  },
+                ),
+              ),
+            ),
+          ]),
+        ),
       );
 }
 
