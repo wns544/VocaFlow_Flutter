@@ -106,13 +106,18 @@ class CloudChangeTracker {
   Future<void> recordDiagnostic(String event,
       {Map<String, Object?> data = const {}}) async {
     try {
-      _diagnosticSequence++;
-      await _prefs.setInt(_diagnosticSequenceKey, _diagnosticSequence);
+      // Reserve both values before the first await. Multiple UI and platform
+      // callbacks can arrive in the same frame, and each must retain its own
+      // ordering and actual arrival time in the journal.
+      final sequence = ++_diagnosticSequence;
+      final timestamp = DateTime.now().toUtc();
+      await _prefs.setInt(_diagnosticSequenceKey, sequence);
       await diagnostics.record(
         deviceId: await deviceId(),
-        sequence: _diagnosticSequence,
+        sequence: sequence,
         event: event,
         data: data,
+        timestamp: timestamp,
       );
     } catch (_) {
       // Diagnostics must never block study or synchronization.

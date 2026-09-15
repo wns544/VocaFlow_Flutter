@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -38,6 +39,10 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   final Duration minimumInterval;
 
   Timer? _timer;
+  int? _scheduledGeneration;
+  bool _scheduledIsRetry = false;
+  int? _failedGeneration;
+  bool _retryBudgetExhausted = false;
   StreamSubscription<User?>? _authSubscription;
   bool _syncing = false;
   bool _downloading = false;
@@ -219,34 +224,77 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     }
   }
 
-  void _schedule(Duration requestedDelay,
-      {bool ignoreMinimumInterval = false, String reason = '자동 업로드'}) {
-    if (_syncing || !enabled || !store.cloudChanges.learningStateDirty) return;
+  void _schedule(
+    Duration requestedDelay, {
+    bool ignoreMinimumInterval = false,
+    String reason = '자동 업로드',
+    bool isRetry = false,
+  }) {
+    if ((!isRetry && _syncing) ||
+        !enabled ||
+        !store.cloudChanges.learningStateDirty) return;
+    final generation = store.cloudChanges.snapshot.learningStateGeneration;
+    if (_timer != null &&
+        _scheduledGeneration == generation &&
+        _scheduledIsRetry &&
+        !isRetry) {
+      // Do not let an unrelated UI rebuild or bookkeeping callback replace the
+      // explicit backoff timer with the normal 15-second idle timer.
+      unawaited(store.cloudChanges.recordDiagnostic(
+        'sync_schedule_preserved',
+        data: {
+          'reason': reason,
+          'generation': generation,
+          'scheduledAsRetry': true,
+        },
+      ));
+      return;
+    }
+    if (!isRetry && _failedGeneration != generation) {
+      _failureCount = 0;
+      _failedGeneration = null;
+      _retryBudgetExhausted = false;
+    }
     var delay = requestedDelay;
-    if (!ignoreMinimumInterval && _lastSuccessAt != null) {
+    if (!isRetry && !ignoreMinimumInterval && _lastSuccessAt != null) {
       final untilAllowed =
           _lastSuccessAt!.add(minimumInterval).difference(_now());
       if (untilAllowed > delay) delay = untilAllowed;
     }
     if (delay.isNegative) delay = Duration.zero;
     _cancelScheduledUpload();
-    unawaited(store.cloudChanges
-        .recordLog('$reason 예약 · ${delay.inSeconds}초 후 · learningState 대기'));
+    _scheduledGeneration = generation;
+    _scheduledIsRetry = isRetry;
+    unawaited(store.cloudChanges.recordLog(
+      '$reason 예약 · ${delay.inSeconds}초 후 · learningState 세대 $generation${isRetry ? ' · 재시도' : ''}',
+    ));
     unawaited(store.cloudChanges.recordDiagnostic('sync_scheduled', data: {
       'reason': reason,
       'delaySeconds': delay.inSeconds,
+      'generation': generation,
+      'isRetry': isRetry,
+      'failureCount': _failureCount,
       'pendingLearningState': store.cloudChanges.learningStateDirty,
     }));
-    _timer = Timer(delay, () => unawaited(_uploadPending(reason: reason)));
+    _timer = Timer(delay, () {
+      _timer = null;
+      _scheduledGeneration = null;
+      _scheduledIsRetry = false;
+      unawaited(_uploadPending(reason: reason));
+    });
   }
 
   Future<void> _uploadPending({String reason = '자동 업로드'}) async {
     if (_syncing || !enabled || !store.cloudChanges.learningStateDirty) return;
     // This lock is intentionally set before checkConnectivity awaits.
     _syncing = true;
+    final generationAtStart =
+        store.cloudChanges.snapshot.learningStateGeneration;
+    var failed = false;
     try {
       await store.cloudChanges.recordDiagnostic('sync_started', data: {
         'reason': reason,
+        'generation': generationAtStart,
         'pendingLearningState': store.cloudChanges.learningStateDirty,
       });
       final networkAllowed = await _networkAllowed();
@@ -263,12 +311,25 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       await _pullLearningState(reason: '$reason · 선행 병합', ownsGate: true);
       await _sendLearningState(reason: reason);
       _failureCount = 0;
-    } catch (error) {
-      await _recordFailure(error, reason);
+      _failedGeneration = null;
+      _retryBudgetExhausted = false;
+    } catch (error, stackTrace) {
+      failed = true;
+      await _recordFailure(error, reason, stackTrace: stackTrace);
     } finally {
       _syncing = false;
-      if (enabled && store.cloudChanges.learningStateDirty) {
+      final generationNow = store.cloudChanges.snapshot.learningStateGeneration;
+      if (!failed && enabled && store.cloudChanges.learningStateDirty) {
         _schedule(idleDelay, reason: '전송 중 새 학습 변경');
+      } else if (failed && generationNow != generationAtStart) {
+        // The failure retry remains authoritative. A subsequent user change,
+        // after this request finishes, will schedule its own quiet-period run.
+        await store.cloudChanges
+            .recordDiagnostic('sync_retry_preserved', data: {
+          'reason': reason,
+          'startGeneration': generationAtStart,
+          'currentGeneration': generationNow,
+        });
       }
       onChanged?.call();
     }
@@ -304,16 +365,62 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     }
   }
 
+  Map<String, Object?> _learningStateMetrics() {
+    final payload = store.toLearningStateJson();
+    final wordStates = payload['wordStates'];
+    var wordCount = 0;
+    var bookCount = 0;
+    if (wordStates is Map) {
+      bookCount = wordStates.length;
+      for (final words in wordStates.values) {
+        if (words is Map) wordCount += words.length;
+      }
+    }
+    try {
+      final bytes = utf8.encode(jsonEncode(payload)).length;
+      return {
+        'jsonEncodable': true,
+        'utf8Bytes': bytes,
+        'bookCount': bookCount,
+        'wordStateCount': wordCount,
+        'completedCount': (payload['completed'] as List?)?.length ?? 0,
+        'activeStudyCount': (payload['activeStudies'] as Map?)?.length ?? 0,
+        'studyEventCount': (payload['studyEventLog'] as List?)?.length ?? 0,
+        'dailyStatCount': (payload['dailyStudyStats'] as Map?)?.length ?? 0,
+      };
+    } catch (error) {
+      return {
+        'jsonEncodable': false,
+        'encodingError': error.toString(),
+        'bookCount': bookCount,
+        'wordStateCount': wordCount,
+      };
+    }
+  }
+
   Future<void> _sendLearningState({required String reason}) async {
     final current = user;
     if (current == null || !store.cloudChanges.learningStateDirty) return;
     final snapshot = store.cloudChanges.snapshot;
+    final metrics = _learningStateMetrics();
     await store.cloudChanges.recordLog(
-        '$reason · learningState 전송 시작 · 순번 ${snapshot.learningStateGeneration}');
+      '$reason · learningState 전송 시작 · 순번 ${snapshot.learningStateGeneration} · ${metrics['utf8Bytes'] ?? '?'} bytes',
+    );
+    await store.cloudChanges
+        .recordDiagnostic('sync_upload_payload_prepared', data: {
+      'reason': reason,
+      'learningStateGeneration': snapshot.learningStateGeneration,
+      'pendingCount': snapshot.pendingCount,
+      ...metrics,
+    });
+    if (metrics['jsonEncodable'] != true) {
+      throw StateError('learningState JSON 직렬화에 실패했습니다.');
+    }
     await store.cloudChanges.recordDiagnostic('sync_upload_started', data: {
       'reason': reason,
       'learningStateGeneration': snapshot.learningStateGeneration,
       'pendingCount': snapshot.pendingCount,
+      ...metrics,
     });
     await cloud.uploadLearningState(store, snapshot);
     await store.cloudChanges.acknowledgeLearningState(snapshot);
@@ -323,34 +430,74 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     await store.cloudChanges.recordDiagnostic('sync_upload_succeeded', data: {
       'reason': reason,
       'learningStateGeneration': snapshot.learningStateGeneration,
+      ...metrics,
     });
   }
 
-  Future<void> _recordFailure(Object error, String reason) async {
+  Future<void> _recordFailure(
+    Object error,
+    String reason, {
+    StackTrace? stackTrace,
+  }) async {
     final current = user;
+    final generation = store.cloudChanges.snapshot.learningStateGeneration;
+    if (_failedGeneration != generation) {
+      _failedGeneration = generation;
+      _failureCount = 0;
+      _retryBudgetExhausted = false;
+    }
     if (current != null)
       await store.cloudChanges.recordError(current.uid, error);
-    await store.cloudChanges.recordLog('$reason · learningState 오류 · $error');
+    final stackPreview = stackTrace
+        ?.toString()
+        .split('\n')
+        .where((line) => line.trim().isNotEmpty)
+        .take(8)
+        .join('\n');
+    await store.cloudChanges.recordLog(
+      '$reason · learningState 오류 · 세대 $generation · ${error.runtimeType} · $error',
+    );
     await store.cloudChanges.recordDiagnostic('sync_failed', data: {
       'reason': reason,
+      'generation': generation,
       'error': error.toString(),
-      'failureCount': _failureCount,
+      'errorType': error.runtimeType.toString(),
+      'stackPreview': stackPreview,
+      'failureCountBefore': _failureCount,
     });
     const delays = [
       Duration(minutes: 1),
       Duration(minutes: 5),
-      Duration(minutes: 30)
+      Duration(minutes: 30),
     ];
-    if (_failureCount++ < delays.length &&
+    _failureCount++;
+    if (_failureCount <= delays.length &&
         enabled &&
         store.cloudChanges.learningStateDirty) {
-      _schedule(delays[_failureCount - 1], reason: '자동 재시도');
+      _schedule(
+        delays[_failureCount - 1],
+        reason: '자동 재시도 $_failureCount/${delays.length}',
+        isRetry: true,
+      );
+      return;
     }
+    _retryBudgetExhausted = true;
+    await store.cloudChanges.recordLog(
+      '$reason · 자동 재시도 한도 도달 · 새 학습 변경 또는 수동 전송 대기',
+    );
+    await store.cloudChanges.recordDiagnostic('sync_retry_paused', data: {
+      'reason': reason,
+      'generation': generation,
+      'failureCount': _failureCount,
+      'retryBudgetExhausted': _retryBudgetExhausted,
+    });
   }
 
   void _cancelScheduledUpload() {
     _timer?.cancel();
     _timer = null;
+    _scheduledGeneration = null;
+    _scheduledIsRetry = false;
   }
 
   Future<bool> _networkAllowed() async {

@@ -1,22 +1,48 @@
+import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
-Future<bool> saveDiagnosticText(String text) async {
-  final path = await FilePicker.platform.saveFile(
-    dialogTitle: '상세 동기화 기록 내보내기',
-    fileName: 'vocaflow-sync-diagnostics.ndjson',
-    type: FileType.custom,
-    allowedExtensions: ['ndjson', 'txt'],
-  );
-  if (path == null) return false;
-  await File(path).writeAsString(text, flush: true);
-  return true;
+class DiagnosticSaveResult {
+  const DiagnosticSaveResult._(this.saved, this.cancelled, this.error);
+
+  const DiagnosticSaveResult.saved() : this._(true, false, null);
+  const DiagnosticSaveResult.cancelled() : this._(false, true, null);
+  const DiagnosticSaveResult.failed(String error) : this._(false, false, error);
+
+  final bool saved;
+  final bool cancelled;
+  final String? error;
 }
 
-Future<bool> shareDiagnosticText(String text, {required String fileName}) async {
+Future<DiagnosticSaveResult> saveDiagnosticText(
+  String text, {
+  required String fileName,
+}) async {
+  try {
+    final path = await FilePicker.platform.saveFile(
+      dialogTitle: '상세 동기화 기록 내보내기',
+      fileName: fileName,
+      type: FileType.custom,
+      allowedExtensions: ['ndjson', 'txt'],
+      // Android and iOS save the supplied bytes themselves. A returned path
+      // is not necessarily writable by the app, so it must not be written
+      // again afterwards.
+      bytes: Uint8List.fromList(utf8.encode(text)),
+    );
+    return path == null
+        ? const DiagnosticSaveResult.cancelled()
+        : const DiagnosticSaveResult.saved();
+  } catch (error) {
+    return DiagnosticSaveResult.failed(error.toString());
+  }
+}
+
+Future<bool> shareDiagnosticText(String text,
+    {required String fileName}) async {
   final directory = await getTemporaryDirectory();
   final file = File('${directory.path}${Platform.pathSeparator}$fileName');
   await file.writeAsString(text, flush: true);

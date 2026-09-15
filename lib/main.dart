@@ -36,8 +36,6 @@ const mist = Color(0xFFF2F2F7);
 const coral = Color(0xFFFF3B30);
 const flutterSplashMinimumDuration = Duration(milliseconds: 900);
 const resumeSnapshotChannel = MethodChannel('com.vocaflow.app/resume_snapshot');
-const navigationButtonChannel =
-    MethodChannel('com.vocaflow.app/navigation_buttons');
 const navigationDiagnosticChannel =
     MethodChannel('com.vocaflow.app/navigation_diagnostics');
 final defaultKanjiLookupService = KanjiLookupService();
@@ -69,6 +67,13 @@ class _NavigationRouteObserver extends NavigatorObserver {
   @override
   void didPop(Route<dynamic> route, Route<dynamic>? previousRoute) {
     super.didPop(route, previousRoute);
+    NavigationTrace.record('navigation_route_popped', {
+      'route': _label(route),
+      'routeType': route.runtimeType.toString(),
+      'previousRoute': _label(previousRoute),
+      'isActive': route.isActive,
+      'isCurrent': route.isCurrent,
+    });
     navigationBackGate.reserveAfterRoutePop(
       route: _label(route),
       routeType: route.runtimeType.toString(),
@@ -211,12 +216,10 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
   final navigatorKey = GlobalKey<NavigatorState>();
   ActiveStudy? initialStudy;
   var restorationNotified = false;
-  DateTime? _lastNavigationButtonAt;
 
   @override
   void initState() {
     super.initState();
-    navigationButtonChannel.setMethodCallHandler(_handleNavigationButton);
     navigationDiagnosticChannel
         .setMethodCallHandler(_handleNavigationDiagnostic);
     _loadLocalState();
@@ -227,41 +230,6 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
     final data = Map<String, Object?>.from(call.arguments as Map? ?? const {});
     NavigationTrace.record('navigation_android_input', data);
     return true;
-  }
-
-  Future<bool> _handleNavigationButton(MethodCall call) async {
-    final method = call.method;
-    if (method != 'back' && method != 'forward') return false;
-    final now = DateTime.now();
-    final last = _lastNavigationButtonAt;
-    if (last != null &&
-        now.difference(last) < const Duration(milliseconds: 350)) {
-      vocaBackLog('flutter channel duplicate ignored method=$method');
-      return true;
-    }
-    _lastNavigationButtonAt = now;
-    vocaBackLog('flutter channel received method=$method');
-    NavigationTrace.record('navigation_native_channel_received', {
-      'method': method,
-      'hasBrowserHandler': activeBrowserNavigationButtonHandler != null,
-    });
-    final browserHandler = activeBrowserNavigationButtonHandler;
-    if (browserHandler != null) {
-      vocaBackLog('flutter channel dispatch to browser method=$method');
-      final handled = await browserHandler(method);
-      vocaBackLog('flutter channel browser handled=$handled method=$method');
-      if (handled) return true;
-    } else {
-      vocaBackLog('flutter channel no active browser method=$method');
-    }
-    if (method == 'back') {
-      final handled = await (navigatorKey.currentState?.maybePop() ??
-          Future<bool>.value(false));
-      vocaBackLog('flutter navigator maybePop handled=$handled');
-      return handled;
-    }
-    vocaBackLog('flutter channel forward unhandled');
-    return false;
   }
 
   Future<void> _loadLocalState() async {
@@ -333,7 +301,6 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
 
   @override
   void dispose() {
-    navigationButtonChannel.setMethodCallHandler(null);
     autoBackup?.dispose();
     autoBackupNotifier.dispose();
     super.dispose();
@@ -395,10 +362,15 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
       debugShowCheckedModeBanner: false,
       title: 'VocaFlow',
       theme: theme,
-      builder: (context, child) => _MouseBackForwardScope(
-        navigatorKey: navigatorKey,
-        child: child ?? const SizedBox.shrink(),
-      ),
+      builder: (context, child) {
+        final content = child ?? const SizedBox.shrink();
+        return kIsWeb
+            ? _MouseBackForwardScope(
+                navigatorKey: navigatorKey,
+                child: content,
+              )
+            : content;
+      },
       navigatorObservers: [
         resumeSnapshotNavigatorObserver,
         resumeRouteObserver,
@@ -2650,6 +2622,12 @@ class _CardStudyPageState extends State<CardStudyPage>
       onPopInvokedWithResult: (didPop, _) {
         vocaBackLog(
             'study PopScope didPop=$didPop exiting=$exiting routeCurrent=${_route?.isCurrent}');
+        NavigationTrace.record('navigation_study_pop_scope', {
+          'didPop': didPop,
+          'exiting': exiting,
+          'routeCurrent': _route?.isCurrent ?? true,
+          'queueLength': queue.length,
+        });
         if (!didPop &&
             (_route?.isCurrent ?? true) &&
             navigationBackGate.accept('study_pop_scope', data: {
@@ -2662,7 +2640,7 @@ class _CardStudyPageState extends State<CardStudyPage>
       child: Focus(
         focusNode: _keyboardFocusNode,
         autofocus: true,
-        onKeyEvent: _handleStudyKeyEvent,
+        onKeyEvent: kIsWeb ? _handleStudyKeyEvent : null,
         child: Scaffold(
           body: _StudyBackground(
             primaryDrag: _primaryDrag,
@@ -5860,6 +5838,7 @@ class _InitialSyncActionLabel extends StatelessWidget {
 class _SettingsPageState extends State<SettingsPage> {
   var signingIn = false;
   var syncing = false;
+  var exportingDiagnostics = false;
 
   @override
   void initState() {
@@ -6169,9 +6148,13 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<String> _detailedSyncLogText() async {
     final auto = widget.autoBackup;
     final detail = await widget.store.cloudChanges.diagnostics.readAll();
+    final appInfo = await _diagnosticAppInfo();
     return [
       'VocaFlow 상세 동기화 진단 기록',
       '생성 시각: ${DateTime.now().toLocal().toIso8601String()}',
+      '앱 버전: ${appInfo['versionName'] ?? '알 수 없음'} (${appInfo['versionCode'] ?? '알 수 없음'})',
+      '기기: ${appInfo['device'] ?? defaultTargetPlatform.name}',
+      '운영체제: ${appInfo['platform'] ?? defaultTargetPlatform.name}',
       '자동 백업: ${auto?.enabled == true ? '켜짐' : '꺼짐'}',
       '네트워크: ${auto?.networkPolicy == AutoBackupNetworkPolicy.wifiOnly ? 'Wi-Fi만' : '모든 네트워크'}',
       '대기 중 변경: ${auto?.pendingCount ?? 0}개',
@@ -6181,6 +6164,16 @@ class _SettingsPageState extends State<SettingsPage> {
       '',
       detail.isEmpty ? '(아직 상세 기록이 없습니다.)' : detail,
     ].join('\n');
+  }
+
+  Future<Map<String, String>> _diagnosticAppInfo() async {
+    try {
+      final raw = await navigationDiagnosticChannel
+          .invokeMapMethod<String, dynamic>('appInfo');
+      return raw?.map((key, value) => MapEntry(key, '$value')) ?? const {};
+    } catch (_) {
+      return {'platform': defaultTargetPlatform.name};
+    }
   }
 
   Future<void> _markDiagnosticIssue() async {
@@ -6238,9 +6231,26 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Future<void> _exportSyncLog() async {
-    final saved = await saveDiagnosticText(
-        await widget.store.cloudChanges.diagnostics.exportText());
-    if (saved && mounted) _showSnack('상세 기록 파일을 저장했습니다.');
+    if (exportingDiagnostics) return;
+    setState(() => exportingDiagnostics = true);
+    try {
+      final stamp =
+          DateTime.now().toUtc().toIso8601String().replaceAll(':', '-');
+      final result = await saveDiagnosticText(
+        await _detailedSyncLogText(),
+        fileName: 'vocaflow-diagnostic-$stamp.txt',
+      );
+      if (!mounted) return;
+      if (result.saved) {
+        _showSnack('진단 보고서 파일을 저장했습니다.');
+      } else if (result.cancelled) {
+        _showSnack('파일 저장을 취소했습니다.');
+      } else {
+        _showSnack('파일 내보내기에 실패했습니다. (${result.error ?? '알 수 없는 오류'})');
+      }
+    } finally {
+      if (mounted) setState(() => exportingDiagnostics = false);
+    }
   }
 
   Future<void> _uploadSyncLog() async {
@@ -6450,7 +6460,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 Row(children: [
                   Expanded(
                     child: OutlinedButton.icon(
-                      onPressed: _exportSyncLog,
+                      onPressed: exportingDiagnostics ? null : _exportSyncLog,
                       icon: const Icon(Icons.file_download_outlined, size: 17),
                       label: const Text('파일 내보내기'),
                     ),

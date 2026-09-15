@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
@@ -37,7 +38,9 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
   @override
   void initState() {
     super.initState();
-    activeBrowserNavigationButtonHandler = _handleNavigationButton;
+    if (kIsWeb) {
+      activeBrowserNavigationButtonHandler = _handleNavigationButton;
+    }
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..addJavaScriptChannel(
@@ -202,6 +205,12 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
   }
 
   Future<void> _goBack({String source = 'browser_ui'}) async {
+    NavigationTrace.record('navigation_browser_back_requested', {
+      'source': source,
+      'canGoBackState': _canGoBack,
+      'canGoForwardState': _canGoForward,
+      'closing': _closing,
+    });
     if (!navigationBackGate.accept(source, data: {
       'canGoBackState': _canGoBack,
       'canGoForwardState': _canGoForward,
@@ -302,12 +311,17 @@ class _InAppBrowserPageState extends State<InAppBrowserPage> {
         body: PopScope(
           canPop: false,
           onPopInvokedWithResult: (didPop, _) async {
+            NavigationTrace.record('navigation_browser_pop_scope', {
+              'didPop': didPop,
+              'closing': _closing,
+              'canGoBackState': _canGoBack,
+            });
             if (!didPop) await _goBack(source: 'browser_pop_scope');
           },
           child: Focus(
             focusNode: _focusNode,
             autofocus: true,
-            onKeyEvent: _handleKeyEvent,
+            onKeyEvent: kIsWeb ? _handleKeyEvent : null,
             child: Stack(
               children: [
                 WebViewWidget(controller: _controller),

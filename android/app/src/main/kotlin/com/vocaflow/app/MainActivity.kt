@@ -15,7 +15,6 @@ import android.os.SystemClock
 import android.speech.tts.TextToSpeech
 import android.util.Log
 import android.view.KeyEvent
-import android.view.MotionEvent
 import android.view.PixelCopy
 import android.view.SurfaceView
 import android.view.View
@@ -33,7 +32,6 @@ class MainActivity : FlutterActivity() {
     private val channelName = "com.vocaflow.app/study_speech"
     private val externalChannelName = "com.vocaflow.app/external_links"
     private val snapshotChannelName = "com.vocaflow.app/resume_snapshot"
-    private val navigationButtonChannelName = "com.vocaflow.app/navigation_buttons"
     private val navigationDiagnosticChannelName = "com.vocaflow.app/navigation_diagnostics"
     private val snapshotFile by lazy { File(cacheDir, "resume_snapshot.jpg") }
     private val snapshotTempFile by lazy { File(cacheDir, "resume_snapshot.tmp") }
@@ -45,7 +43,6 @@ class MainActivity : FlutterActivity() {
     private var pendingSpeech: Pair<String, String>? = null
     private var snapshotOverlay: ImageView? = null
     private var snapshotCaptureInProgress = false
-    private var navigationButtonChannel: MethodChannel? = null
     private var navigationDiagnosticChannel: MethodChannel? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val snapshotTimeout = Runnable {
@@ -105,8 +102,21 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
-        navigationButtonChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, navigationButtonChannelName)
         navigationDiagnosticChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, navigationDiagnosticChannelName)
+        navigationDiagnosticChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "appInfo" -> {
+                    val packageInfo = packageManager.getPackageInfo(packageName, 0)
+                    result.success(mapOf(
+                        "versionName" to (packageInfo.versionName ?: "unknown"),
+                        "versionCode" to packageInfo.longVersionCode.toString(),
+                        "device" to "${Build.MANUFACTURER} ${Build.MODEL}",
+                        "platform" to "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})",
+                    ))
+                }
+                else -> result.notImplemented()
+            }
+        }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, snapshotChannelName)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
@@ -137,6 +147,10 @@ class MainActivity : FlutterActivity() {
                 "deviceId" to event.deviceId,
                 "source" to event.source,
                 "flags" to event.flags,
+                "scanCode" to event.scanCode,
+                "metaState" to event.metaState,
+                "isLongPress" to event.isLongPress,
+                "isCanceled" to event.isCanceled,
             ))
         }
         Log.d(backLogTag, "android key event action=${event.action} keyCode=${event.keyCode} repeat=${event.repeatCount} alt=${event.isAltPressed}")
@@ -171,62 +185,18 @@ class MainActivity : FlutterActivity() {
                 lastAcceptedSystemBackUpAt = now
             }
         }
-        if (event.action == KeyEvent.ACTION_UP) {
-            when (event.keyCode) {
-                KeyEvent.KEYCODE_BACK -> {
-                    Log.d(backLogTag, "android key system back passthrough")
-                }
-                KeyEvent.KEYCODE_NAVIGATE_PREVIOUS,
-                KeyEvent.KEYCODE_BUTTON_4 -> {
-                    Log.d(backLogTag, "android key -> back keyCode=${event.keyCode}")
-                    sendNavigationButton("back")
-                    return true
-                }
-                KeyEvent.KEYCODE_FORWARD,
-                KeyEvent.KEYCODE_NAVIGATE_NEXT,
-                KeyEvent.KEYCODE_BUTTON_5 -> {
-                    Log.d(backLogTag, "android key -> forward keyCode=${event.keyCode}")
-                    sendNavigationButton("forward")
-                    return true
-                }
-                KeyEvent.KEYCODE_DPAD_LEFT -> {
-                    if (event.isAltPressed) {
-                        Log.d(backLogTag, "android alt-left -> back")
-                        sendNavigationButton("back")
-                        return true
-                    }
-                }
-                KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                    if (event.isAltPressed) {
-                        Log.d(backLogTag, "android alt-right -> forward")
-                        sendNavigationButton("forward")
-                        return true
-                    }
-                }
-            }
-        }
         return super.dispatchKeyEvent(event)
     }
 
-    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
-        val hasBackButton = (event.buttonState and MotionEvent.BUTTON_BACK) != 0
-        val hasForwardButton = (event.buttonState and MotionEvent.BUTTON_FORWARD) != 0
-        if (event.action == MotionEvent.ACTION_BUTTON_PRESS || hasBackButton || hasForwardButton) {
-            Log.d(backLogTag, "android motion event action=${event.action} buttonState=${event.buttonState} back=$hasBackButton forward=$hasForwardButton")
-        }
-        if (event.action == MotionEvent.ACTION_BUTTON_PRESS) {
-            if (hasBackButton) {
-                Log.d(backLogTag, "android mouse -> back")
-                sendNavigationButton("back")
-                return true
-            }
-            if (hasForwardButton) {
-                Log.d(backLogTag, "android mouse -> forward")
-                sendNavigationButton("forward")
-                return true
-            }
-        }
-        return super.dispatchGenericMotionEvent(event)
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        // Observation only: FlutterActivity keeps ownership of back behavior.
+        recordNavigationInput("activity_on_back_pressed", mapOf(
+            "sdkInt" to Build.VERSION.SDK_INT,
+            "taskId" to taskId,
+        ))
+        Log.d(backLogTag, "activity onBackPressed passthrough")
+        super.onBackPressed()
     }
 
     private fun recordNavigationInput(kind: String, values: Map<String, Any>) {
@@ -234,10 +204,6 @@ class MainActivity : FlutterActivity() {
         data["kind"] = kind
         data["elapsedRealtime"] = SystemClock.elapsedRealtime()
         navigationDiagnosticChannel?.invokeMethod("event", data)
-    }
-    private fun sendNavigationButton(direction: String) {
-        Log.d(backLogTag, "android sendNavigationButton direction=$direction channelReady=${navigationButtonChannel != null}")
-        navigationButtonChannel?.invokeMethod(direction, null)
     }
     private fun showResumeSnapshot() {
         val savedAt = snapshotPreferences.getLong("savedAt", 0L)
