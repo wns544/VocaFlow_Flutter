@@ -30,7 +30,7 @@ void main() {
     expect(snapshot.wordIdsByBook['book-a'], isNot(contains(1)));
   });
 
-  test('duplicate dirty marks do not rewrite the pending journal', () async {
+  test('later edits keep the pending journal newer than an in-flight upload', () async {
     final tracker = await CloudChangeTracker.load();
 
     await tracker.markProfile();
@@ -39,7 +39,7 @@ void main() {
     await tracker.markWord('book-a', 2);
 
     final snapshot = tracker.snapshot;
-    expect(snapshot.generation, 2);
+    expect(snapshot.generation, 3);
     expect(snapshot.profileDirty, isTrue);
     expect(snapshot.wordIdsByBook['book-a'], {2});
     expect(snapshot.pendingCount, 2);
@@ -436,7 +436,67 @@ void main() {
     expect(restored.isEnabled('b'), isFalse);
     expect(restored.networkPolicy('b'), AutoBackupNetworkPolicy.all);
   });
+
+  test('pending book changes and observed revisions are isolated per account',
+      () async {
+    final tracker = await CloudChangeTracker.load();
+    await tracker.activateAccount('account-a');
+    await tracker.recordRemoteBookRevisions({'book': 4});
+    await tracker.markBook('book');
+    expect(tracker.snapshot.bookBaseRevisions['book'], 4);
+
+    await tracker.activateAccount('account-b');
+    expect(tracker.managedBookContentDirty, isFalse);
+    await tracker.markBook('other');
+
+    await tracker.activateAccount('account-a');
+    expect(tracker.snapshot.bookIds, {'book'});
+    expect(tracker.snapshot.bookBaseRevisions['book'], 4);
+  });
+
+  test('pending recovery points are isolated and survive tracker reload',
+      () async {
+    final tracker = await CloudChangeTracker.load();
+    await tracker.activateAccount('account-a');
+    await tracker.markArchive('archive-a');
+    expect(tracker.snapshot.archiveIds, {'archive-a'});
+
+    await tracker.activateAccount('account-b');
+    expect(tracker.snapshot.archiveIds, isEmpty);
+
+    await tracker.activateAccount('account-a');
+    final reloaded = await CloudChangeTracker.load();
+    await reloaded.activateAccount('account-a');
+    expect(reloaded.snapshot.archiveIds, {'archive-a'});
+    await reloaded.acknowledgeArchives({'archive-a'});
+    expect(reloaded.snapshot.archiveIds, isEmpty);
+  });
+
+  test('remote tombstone removes the local book without creating a book write',
+      () async {
+    SharedPreferences.setMockInitialValues({
+      'books': jsonEncode([
+        WordBook(id: 'book', name: 'Book', words: [_wordModel(1)]).toJson(),
+      ]),
+    });
+    final store = await VocaStore.load();
+    final changed = await store.mergeManagedBooks([
+      {'id': 'book', 'revision': 3, 'deleted': true},
+    ]);
+
+    expect(changed, 1);
+    expect(store.books.any((book) => book.id == 'book'), isFalse);
+    expect(store.cloudChanges.managedBookContentDirty, isFalse);
+    expect(store.cloudChanges.learningStateDirty, isTrue);
+  });
 }
+
+Word _wordModel(int id) => Word(
+      id: id,
+      term: 'term$id',
+      reading: 'term$id',
+      meaning: 'meaning$id',
+    );
 
 Map<String, dynamic> _backup(
   List<Map<String, dynamic>> books, {

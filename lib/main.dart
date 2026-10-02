@@ -12,6 +12,7 @@ import 'package:flutter/services.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 
 import 'auto_backup.dart';
+import 'book_restore_archive.dart';
 import 'cloud_change_tracker.dart';
 import 'cloud_backup.dart';
 import 'csv_parser.dart';
@@ -4041,7 +4042,27 @@ class LegacyBooksPage extends StatelessWidget {
                           await store.selectQuickBook(book.id);
                         }
                         if (value == 'delete') {
-                          await store.deleteBook(book.id);
+                          final confirmed = await showDialog<bool>(
+                                context: context,
+                                builder: (dialogContext) => AlertDialog(
+                                  title: const Text('단어장을 삭제할까요?'),
+                                  content: Text(
+                                      '“${book.name}”과(와) 해당 학습 기록이 모든 기기에서 삭제됩니다.\n\n삭제 전 상태는 계정의 단어장 복원 보관함에서 복원할 수 있습니다.'),
+                                  actions: [
+                                    TextButton(
+                                      onPressed: () => Navigator.pop(dialogContext, false),
+                                      child: const Text('취소'),
+                                    ),
+                                    FilledButton(
+                                      style: FilledButton.styleFrom(backgroundColor: coral),
+                                      onPressed: () => Navigator.pop(dialogContext, true),
+                                      child: const Text('삭제'),
+                                    ),
+                                  ],
+                                ),
+                              ) ??
+                              false;
+                          if (confirmed) await store.deleteBook(book.id);
                         }
                         refresh();
                       },
@@ -4535,16 +4556,17 @@ class _BooksPageState extends State<BooksPage> {
   Future<void> renameBook(WordBook book) async {
     final name = await _askText(context, '단어장 이름', book.name);
     if (!mounted || name == null || name.trim().isEmpty) return;
-    book.name = name.trim();
-    await widget.store.updateBook(book);
+    final updated = WordBook.fromJson(book.toJson())..name = name.trim();
+    await widget.store.updateBook(updated);
     if (!mounted) return;
     if (searchQuery.trim().isNotEmpty) runSearch();
     widget.refresh();
   }
 
   Future<void> toggleFavorite(WordBook book) async {
-    book.isFavorite = !book.isFavorite;
-    await widget.store.updateBook(book);
+    final updated = WordBook.fromJson(book.toJson())
+      ..isFavorite = !book.isFavorite;
+    await widget.store.updateBook(updated);
     if (!mounted) return;
     setState(() {});
     widget.refresh();
@@ -4557,7 +4579,7 @@ class _BooksPageState extends State<BooksPage> {
         icon: const Icon(Icons.warning_amber_rounded, color: coral, size: 32),
         title: const Text('단어장을 삭제할까요?'),
         content: Text(
-            '“${book.name}”\n${book.words.length}개 단어가 함께 삭제되며 복구할 수 없습니다.'),
+            '“${book.name}”\n${book.words.length}개 단어와 이 단어장의 학습 기록이 모든 기기에서 삭제됩니다.\n\n삭제 전 상태는 계정의 단어장 복원 보관함에 남아 나중에 복원할 수 있습니다.'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(context, false),
@@ -5438,8 +5460,8 @@ class _BookDetailPageState extends State<BookDetailPage> {
   Future<void> rename() async {
     final name = await _askText(context, '단어장 이름', book.name);
     if (name == null || name.trim().isEmpty) return;
-    book.name = name.trim();
-    await widget.store.updateBook(book);
+    final updated = WordBook.fromJson(book.toJson())..name = name.trim();
+    await widget.store.updateBook(updated);
     widget.onChanged();
     if (mounted) setState(() {});
   }
@@ -5495,11 +5517,12 @@ class _BookDetailPageState extends State<BookDetailPage> {
     );
     nameController.dispose();
     if (result == null) return;
-    book.sessionOverrides[session.index] = SessionOverride(
+    final updated = WordBook.fromJson(book.toJson());
+    updated.sessionOverrides[session.index] = SessionOverride(
       name: result.$1.isEmpty ? null : result.$1,
       size: result.$2,
     );
-    await widget.store.updateBook(book);
+    await widget.store.updateBook(updated);
     widget.onChanged();
     if (mounted) setState(() {});
   }
@@ -6226,6 +6249,65 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
+  Future<void> _openRestoreArchive() async {
+    final auto = widget.autoBackup;
+    if (auto == null || auto.user == null) {
+      _showSnack('먼저 Google로 로그인해 주세요.');
+      return;
+    }
+    setState(() => syncing = true);
+    try {
+      final points = await auto.restorePoints();
+      final bytes = await auto.restoreArchiveBytes();
+      if (!mounted) return;
+      setState(() => syncing = false);
+      await showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        useSafeArea: true,
+        showDragHandle: true,
+        builder: (sheetContext) => _RestoreArchiveSheet(
+          points: points,
+          usedBytes: bytes,
+          onRestore: (point) async {
+            final confirmed = await _confirm(
+              title: '이 시점으로 복원할까요?',
+              message: '이 단어장과 해당 단어장의 학습 기록만 복원합니다. 현재 상태도 새 복원 기록으로 보관됩니다.',
+              action: '복원',
+            );
+            if (!confirmed) return;
+            Navigator.pop(sheetContext);
+            await _runCloudTask(() async {
+              await auto.restoreBookFromPoint(point);
+              widget.refresh();
+              if (mounted) setState(() {});
+              _showSnack('단어장을 복원했습니다. 다른 기기에도 동기화됩니다.');
+            });
+          },
+          onDelete: (point) async {
+            final confirmed = await _confirm(
+              title: '복원 기록을 영구 삭제할까요?',
+              message: '이 기록은 모든 기기와 계정 보관함에서 지워지며 되돌릴 수 없습니다.',
+              action: '영구 삭제',
+              destructive: true,
+            );
+            if (!confirmed) return;
+            Navigator.pop(sheetContext);
+            await _runCloudTask(() async {
+              await auto.permanentlyDeleteRestorePoint(point);
+              if (mounted) setState(() {});
+              _showSnack('복원 기록을 영구 삭제했습니다.');
+            });
+          },
+        ),
+      );
+    } catch (error) {
+      if (mounted) _showSnack('복원 보관함을 불러오지 못했습니다. ($error)');
+    } finally {
+      if (mounted && syncing) setState(() => syncing = false);
+    }
+  }
+
   Future<void> _runCloudTask(Future<void> Function() task) async {
     if (!firebaseReady || FirebaseAuth.instance.currentUser == null) {
       _showSnack('먼저 Google로 로그인해 주세요.');
@@ -6696,6 +6778,24 @@ class _SettingsPageState extends State<SettingsPage> {
                     label: const Text('클라우드에 저장된 내용 보기'),
                     style: TextButton.styleFrom(
                       foregroundColor: sea,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 6),
+                SizedBox(
+                  width: double.infinity,
+                  height: 44,
+                  child: OutlinedButton.icon(
+                    key: const ValueKey('book-restore-archive'),
+                    onPressed: syncing || user == null ? null : _openRestoreArchive,
+                    icon: const Icon(Icons.history_outlined, size: 18),
+                    label: const Text('단어장 복원 보관함'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: ink,
+                      side: const BorderSide(color: Color(0xFFDADCE0)),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(14),
                       ),
@@ -7190,6 +7290,93 @@ class _SessionSizeDialogState extends State<_SessionSizeDialog> {
       ],
     );
   }
+}
+
+class _RestoreArchiveSheet extends StatelessWidget {
+  const _RestoreArchiveSheet({
+    required this.points,
+    required this.usedBytes,
+    required this.onRestore,
+    required this.onDelete,
+  });
+
+  final List<BookRestorePoint> points;
+  final int usedBytes;
+  final Future<void> Function(BookRestorePoint point) onRestore;
+  final Future<void> Function(BookRestorePoint point) onDelete;
+
+  String _size(int bytes) {
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)}KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)}MB';
+  }
+
+  String _kind(String kind) => switch (kind) {
+        'before_delete' => '삭제 전 보관',
+        'before_restore' => '복원 전 보관',
+        _ => '수정 전 보관',
+      };
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+        height: MediaQuery.sizeOf(context).height * .78,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 4, 20, 20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('단어장 복원 보관함',
+                  style: TextStyle(fontSize: 21, fontWeight: FontWeight.w800)),
+              const SizedBox(height: 6),
+              Text(
+                '계정 사용량 ${_size(usedBytes)} / 100MB · 수정 기록은 단어장별 최근 10개를 보관합니다.',
+                style: const TextStyle(color: Color(0xFF6E6E73), fontSize: 12),
+              ),
+              const SizedBox(height: 12),
+              Expanded(
+                child: points.isEmpty
+                    ? const Center(child: Text('아직 복원 기록이 없습니다.'))
+                    : ListView.separated(
+                        itemCount: points.length,
+                        separatorBuilder: (_, __) => const Divider(height: 1),
+                        itemBuilder: (context, index) {
+                          final point = points[index];
+                          final book = Map<String, dynamic>.from(
+                              point.payload['book'] as Map? ?? const {});
+                          final name = book['name']?.toString() ?? '이름 없는 단어장';
+                          return ListTile(
+                            contentPadding: const EdgeInsets.symmetric(vertical: 5),
+                            leading: Icon(
+                              point.kind == 'before_delete'
+                                  ? Icons.delete_outline
+                                  : Icons.history,
+                              color: point.kind == 'before_delete' ? coral : sea,
+                            ),
+                            title: Text(name,
+                                maxLines: 1, overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(fontWeight: FontWeight.w700)),
+                            subtitle: Text(
+                              '${_kind(point.kind)} · ${point.createdAt.toLocal().toString().substring(0, 16)} · ${_size(point.utf8Bytes.length)}',
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            trailing: PopupMenuButton<String>(
+                              onSelected: (action) async {
+                                if (action == 'restore') await onRestore(point);
+                                if (action == 'delete') await onDelete(point);
+                              },
+                              itemBuilder: (_) => const [
+                                PopupMenuItem(value: 'restore', child: Text('이 시점으로 복원')),
+                                PopupMenuItem(value: 'delete', child: Text('영구 삭제')),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      );
 }
 
 class _CloudBackupOverviewSheet extends StatelessWidget {

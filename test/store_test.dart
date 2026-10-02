@@ -27,6 +27,20 @@ void main() {
         reloaded.books.map((book) => book.name), ['기본 단어장', 'Alpha', 'Zebra']);
   });
 
+  test('book library cache is isolated per signed-in account', () async {
+    final store = await VocaStore.load();
+    await store.activateAccount('account-a');
+    await store.addBook('Account A', []);
+
+    await store.activateAccount('account-b');
+    expect(store.books.any((book) => book.name == 'Account A'), isFalse);
+    await store.addBook('Account B', []);
+
+    await store.activateAccount('account-a');
+    expect(store.books.any((book) => book.name == 'Account A'), isTrue);
+    expect(store.books.any((book) => book.name == 'Account B'), isFalse);
+  });
+
   test('completed session state persists', () async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();
@@ -72,12 +86,14 @@ void main() {
 
   test('backup restore prunes cached study event logs', () async {
     final store = await VocaStore.load();
-    final now = DateTime(2026, 6, 29, 12);
+    // Keep the generated records inside the production 90-day retention
+    // window regardless of when the test suite is run.
+    final now = DateTime.now().toUtc();
     final events = List.generate(3010, (index) {
       final timestamp = now.subtract(Duration(minutes: index));
       return {
         'id': 'event-$index',
-        'date': '2026-06-29',
+        'date': timestamp.toIso8601String().substring(0, 10),
         'timestamp': timestamp.toIso8601String(),
         'bookId': 'default',
         'wordId': index,
@@ -433,5 +449,29 @@ void main() {
 
     await store.setLastMainTab(99);
     expect((await VocaStore.load()).lastMainTab, 3);
+  });
+
+  test('book restore payload is scoped to the selected book', () async {
+    final store = await VocaStore.load();
+    final first = await store.addBook('first', [
+      Word(id: 11, term: 'one', reading: 'one', meaning: 'one'),
+    ]);
+    final second = await store.addBook('second', [
+      Word(id: 22, term: 'two', reading: 'two', meaning: 'two'),
+    ]);
+    await store.completeSessions(first.id, const [0]);
+    await store.completeSessions(second.id, const [0]);
+
+    final payload = store.createBookRestorePayload(first.id);
+    final learning = Map<String, dynamic>.from(payload['learning'] as Map);
+    expect((payload['book'] as Map)['id'], first.id);
+    expect(learning['completed'], everyElement(startsWith('${first.id}:')));
+    expect((learning['wordStates'] as Map).keys, [first.id]);
+
+    await store.deleteBook(first.id);
+    await store.restoreBookFromPayload(payload);
+    expect(store.books.any((book) => book.id == first.id), isTrue);
+    expect(store.books.any((book) => book.id == second.id), isTrue);
+    expect(store.isSessionCompleted(second.id, 0), isTrue);
   });
 }

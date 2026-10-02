@@ -152,6 +152,34 @@ class WordRelationStore extends ChangeNotifier {
       .where((relation) => relation.involves(reference))
       .toList(growable: false);
 
+  List<Map<String, dynamic>> snapshotForBook(String bookId) => _relations.values
+      .where((relation) =>
+          relation.first.bookId == bookId || relation.second.bookId == bookId)
+      .map((relation) => relation.toJson())
+      .toList(growable: false);
+
+  /// Restores archived relation records with their original timestamps and
+  /// IDs. A newer relation change made after the archive wins instead.
+  Future<void> restoreArchived(Iterable<Map<String, dynamic>> rows) async {
+    await load();
+    final uploads = <WordRelation>[];
+    for (final row in rows) {
+      final archived = WordRelation.fromJson(row);
+      final current = _relations[archived.id];
+      final chosen = _newer(current, archived);
+      if (!identical(chosen, current) && chosen != null) {
+        _relations[archived.id] = chosen;
+        uploads.add(chosen);
+      }
+    }
+    if (uploads.isEmpty) return;
+    await _persist();
+    notifyListeners();
+    for (final relation in uploads) {
+      await _uploadOne(relation);
+    }
+  }
+
   bool isRelated(RelatedWordRef first, RelatedWordRef second) {
     if (first == second) return false;
     return _relations[relationIdFor(first, second)]?.deleted == false;

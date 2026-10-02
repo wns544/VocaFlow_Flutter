@@ -7,16 +7,22 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 
 import 'cloud_backup.dart';
+import 'book_archive_store.dart';
+import 'book_restore_archive.dart';
 import 'cloud_change_tracker.dart';
 import 'store.dart';
+import 'word_relations.dart';
 
 enum InitialSyncChoice { cloudReplace, merge }
 
-/// Synchronizes only the dedicated learningState collection. It deliberately
-/// never uploads vocabBooks/words, so existing Firebase card documents remain
-/// read-only from this app version.
+/// Learning progress follows the user's backup preference. Account-owned
+/// vocabulary books are different: while signed in, their add/edit/delete
+/// queue always syncs between that account's devices. Neither channel writes
+/// legacy vocabBooks/words documents.
 class AutoBackupCoordinator with WidgetsBindingObserver {
   static AutoBackupCoordinator? activeInstance;
+  static const recentRevisionLimitPerBook = 10;
+  static const maxArchiveBytes = CloudBackup.maxBookArchiveBytes;
 
   AutoBackupCoordinator({
     required this.store,
@@ -37,6 +43,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   final DateTime Function() _now;
   final Duration idleDelay;
   final Duration minimumInterval;
+  final BookArchiveStore _archiveStore = BookArchiveStore();
 
   Timer? _timer;
   int? _scheduledGeneration;
@@ -55,11 +62,13 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   bool get isDownloading => _downloading;
   User? get user => FirebaseAuth.instance.currentUser;
   bool get enabled => user != null && store.cloudChanges.isEnabled(user!.uid);
+  bool get accountBookSyncEnabled => user != null;
   bool get initialized =>
       user != null && store.cloudChanges.isInitialized(user!.uid);
   int get pendingCount =>
       (store.cloudChanges.learningStateDirty ? 1 : 0) +
-      (store.cloudChanges.managedBookContentDirty ? 1 : 0);
+      (store.cloudChanges.managedBookContentDirty ? 1 : 0) +
+      (store.cloudChanges.archiveContentDirty ? 1 : 0);
   DateTime? get lastSuccess =>
       user == null ? null : store.cloudChanges.lastSuccess(user!.uid);
   List<String> get logs => store.cloudChanges.logs;
@@ -76,12 +85,17 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     store.cloudChanges.onChanged = _handleTrackedChange;
     store.onSessionCompleted = requestImmediateBackup;
-    _authSubscription = FirebaseAuth.instance.authStateChanges().listen((_) {
+    store.onBeforeBookMutation = _archiveBeforeBookMutation;
+    _authSubscription = FirebaseAuth.instance.authStateChanges().listen((current) {
       _cancelScheduledUpload();
       _startWebInitialSyncIfNeeded();
-      if (enabled && initialized) {
-        unawaited(mergeFromCloud(uploadMerged: false, reason: '앱 복귀'));
-        unawaited(_seedLearningState());
+      if (current != null) {
+        unawaited(() async {
+          await store.activateAccount(current.uid);
+          await store.cloudChanges.activateAccount(current.uid);
+          await mergeFromCloud(uploadMerged: false, reason: '계정 연결');
+          if (enabled && initialized) await _seedLearningState();
+        }());
       }
       onChanged?.call();
     });
@@ -118,11 +132,109 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       store.cloudChanges.onChanged = null;
     }
     store.onSessionCompleted = null;
+    if (store.onBeforeBookMutation == _archiveBeforeBookMutation) {
+      store.onBeforeBookMutation = null;
+    }
     _cancelScheduledUpload();
     _authSubscription?.cancel();
   }
 
   Future<bool> hasCloudBackup() => cloud.hasLearningState();
+
+  Future<List<BookRestorePoint>> localRestorePoints() async {
+    final current = user;
+    if (current == null) return const [];
+    return _archiveStore.list(current.uid);
+  }
+
+  /// Reads account history from the server and keeps a local copy so a later
+  /// restore can still be selected while the device is offline.
+  Future<List<BookRestorePoint>> restorePoints({bool refresh = true}) async {
+    final current = user;
+    if (current == null) return const [];
+    final local = <String, BookRestorePoint>{
+      for (final point in await _archiveStore.list(current.uid)) point.id: point,
+    };
+    if (refresh) {
+      final remote = await cloud.listBookArchives();
+      for (final item in remote) {
+        if (local.containsKey(item.id)) continue;
+        final point = await cloud.downloadBookArchive(item.id);
+        if (point != null) {
+          local[point.id] = point;
+          await _archiveStore.save(current.uid, point);
+        }
+      }
+    }
+    final result = local.values.toList()
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return result;
+  }
+
+  Future<int> restoreArchiveBytes() async {
+    final current = user;
+    if (current == null) return 0;
+    try {
+      return await cloud.bookArchiveBytes();
+    } catch (_) {
+      return _archiveStore.totalBytes(current.uid);
+    }
+  }
+
+  Future<void> permanentlyDeleteRestorePoint(BookRestorePoint point) async {
+    final current = user;
+    if (current == null) throw StateError('Google login is required.');
+    // Server succeeds first: a flaky network must not make the sole account
+    // copy disappear while leaving a stale local cache that looks deleted.
+    await cloud.deleteBookArchive(point.id);
+    await _archiveStore.remove(current.uid, point.id);
+  }
+
+  /// Restoring is also a mutation: first preserve the current state as a new
+  /// recovery point, then apply the chosen point using its original IDs.
+  Future<void> restoreBookFromPoint(BookRestorePoint point) async {
+    final current = user;
+    if (current == null) throw StateError('Google login is required.');
+    await _archiveBeforeBookMutation(point.bookId, 'restore');
+    await store.restoreBookFromPayload(point.payload);
+    final relations = point.payload['relations'];
+    if (relations is List) {
+      await wordRelations.restoreArchived(
+        relations.whereType<Map>().map((row) => Map<String, dynamic>.from(row)),
+      );
+    }
+    requestImmediateBackup(ignoreMinimumInterval: true);
+  }
+
+  /// Saves locally first so an offline edit is recoverable immediately, then
+  /// queues its account upload. _uploadPending always drains this queue before
+  /// it sends a managedBooks edit/delete tombstone.
+  Future<void> _archiveBeforeBookMutation(String bookId, String reason) async {
+    final current = user;
+    if (current == null || bookId == 'default') return;
+    // A restore may bring back a book that is currently only in the account
+    // trash. There is no local state to snapshot in that case.
+    if (!store.books.any((book) => book.id == bookId)) return;
+    await wordRelations.load();
+    final point = BookRestorePoint.create(
+      bookId: bookId,
+      kind: 'before_$reason',
+      deviceId: await store.cloudChanges.deviceId(),
+      payload: store.createBookRestorePayload(
+        bookId,
+        relations: wordRelations.snapshotForBook(bookId),
+      ),
+      now: _now(),
+    );
+    await _archiveStore.save(current.uid, point);
+    await store.cloudChanges.markArchive(point.id);
+    await store.cloudChanges.recordDiagnostic('book_restore_point_created', data: {
+      'bookId': bookId,
+      'archiveId': point.id,
+      'kind': point.kind,
+      'bytes': point.utf8Bytes.length,
+    });
+  }
 
   Future<void> initialize(InitialSyncChoice? choice) async {
     final current = user;
@@ -175,7 +287,8 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     await store.cloudChanges.markLearningState();
     await _uploadPending(reason: '이 기기 데이터 내보내기');
     if (store.cloudChanges.learningStateDirty ||
-        store.cloudChanges.managedBookContentDirty) {
+        store.cloudChanges.managedBookContentDirty ||
+        store.cloudChanges.archiveContentDirty) {
       throw StateError('클라우드 업로드가 완료되지 않았습니다. 네트워크를 확인한 뒤 다시 시도해 주세요.');
     }
   }
@@ -190,14 +303,23 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     bool uploadMerged = true,
     String reason = '클라우드 확인',
   }) async {
-    if (!enabled || !initialized || _syncing) return;
+    if (!accountBookSyncEnabled || _syncing) return;
     _syncing = true;
     try {
+      final current = user;
+      if (current != null) await store.cloudChanges.activateAccount(current.uid);
+      // Always read first. A dirty local book is deliberately left untouched
+      // until its base revision is checked by the transactional upload.
+      await _pullManagedBooks(reason: reason);
+      await _sendPendingArchives(reason: '$reason · 복원본 보관');
       if (store.cloudChanges.managedBookContentDirty) {
         await _sendManagedBookContent(reason: '$reason · 로컬 단어장 반영');
       }
-      await _pullLearningState(reason: reason, ownsGate: true);
-      if (uploadMerged && store.cloudChanges.learningStateDirty) {
+      if (enabled && initialized) {
+        await _pullLearningState(
+            reason: reason, ownsGate: true, pullManagedBooks: false);
+      }
+      if (enabled && initialized && uploadMerged && store.cloudChanges.learningStateDirty) {
         await _sendLearningState(reason: '$reason · 병합 반영');
       }
     } catch (error) {
@@ -214,9 +336,10 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   Future<void> flushPendingBackup() async {
     if (_flushingForBackground ||
         _syncing ||
-        !enabled ||
+        !accountBookSyncEnabled ||
         (!store.cloudChanges.learningStateDirty &&
-            !store.cloudChanges.managedBookContentDirty)) return;
+            !store.cloudChanges.managedBookContentDirty &&
+            !store.cloudChanges.archiveContentDirty)) return;
     _flushingForBackground = true;
     _cancelScheduledUpload();
     try {
@@ -237,9 +360,10 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
 
   void _handleTrackedChange() {
     onChanged?.call();
-    if (enabled &&
-        (store.cloudChanges.learningStateDirty ||
-            store.cloudChanges.managedBookContentDirty) &&
+    if (accountBookSyncEnabled &&
+        ((enabled && store.cloudChanges.learningStateDirty) ||
+            store.cloudChanges.managedBookContentDirty ||
+            store.cloudChanges.archiveContentDirty) &&
         !_syncing) {
       _schedule(idleDelay, reason: '학습 변경 후 대기');
     }
@@ -252,9 +376,10 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     bool isRetry = false,
   }) {
     if ((!isRetry && _syncing) ||
-        !enabled ||
-        (!store.cloudChanges.learningStateDirty &&
-            !store.cloudChanges.managedBookContentDirty)) return;
+        !accountBookSyncEnabled ||
+        ((!enabled || !initialized || !store.cloudChanges.learningStateDirty) &&
+            !store.cloudChanges.managedBookContentDirty &&
+            !store.cloudChanges.archiveContentDirty)) return;
     final generation = store.cloudChanges.snapshot.learningStateGeneration;
     if (_timer != null &&
         _scheduledGeneration == generation &&
@@ -331,13 +456,18 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       if (!networkAllowed) {
         throw StateError('선택한 네트워크에 연결되어 있지 않습니다.');
       }
-      // Send local content before pulling, so a newly imported book cannot be
-      // replaced by an older remote copy during this cycle.
+      // First observe server revisions. A later transaction refuses to replace
+      // a book changed by another phone since this local edit began.
+      await _pullManagedBooks(reason: '$reason · 선행 단어장 확인');
+      await _sendPendingArchives(reason: '$reason · 복원본 보관');
       if (store.cloudChanges.managedBookContentDirty) {
         await _sendManagedBookContent(reason: reason);
       }
-      await _pullLearningState(reason: '$reason · 선행 병합', ownsGate: true);
-      if (store.cloudChanges.learningStateDirty) {
+      if (enabled && initialized) {
+        await _pullLearningState(
+            reason: '$reason · 선행 병합', ownsGate: true, pullManagedBooks: false);
+      }
+      if (enabled && initialized && store.cloudChanges.learningStateDirty) {
         await _sendLearningState(reason: reason);
       }
       _failureCount = 0;
@@ -352,7 +482,8 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       if (!failed &&
           enabled &&
           (store.cloudChanges.learningStateDirty ||
-              store.cloudChanges.managedBookContentDirty)) {
+              store.cloudChanges.managedBookContentDirty ||
+              store.cloudChanges.archiveContentDirty)) {
         _schedule(idleDelay, reason: '전송 중 새 학습 변경');
       } else if (failed && generationNow != generationAtStart) {
         // The failure retry remains authoritative. A subsequent user change,
@@ -371,6 +502,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   Future<void> _pullLearningState({
     required String reason,
     bool ownsGate = false,
+    bool pullManagedBooks = true,
   }) async {
     if (!ownsGate && _syncing) return;
     if (!ownsGate) _syncing = true;
@@ -380,7 +512,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       await store.cloudChanges.recordDiagnostic('sync_download_started', data: {
         'reason': reason,
       });
-      await _pullManagedBooks(reason: reason);
+      if (pullManagedBooks) await _pullManagedBooks(reason: reason);
       final snapshots = await cloud.downloadLearningStates();
       await store.applyLearningStateSnapshots(snapshots);
       final current = user;
@@ -420,6 +552,9 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       'generation': snapshot.generation,
     });
     await cloud.uploadManagedBooks(store, snapshot);
+    await store.cloudChanges.recordRemoteBookRevisions({
+      for (final id in bookIds) (id): (snapshot.bookBaseRevisions[id] ?? 0) + 1,
+    });
     await store.cloudChanges.acknowledgeManagedBookContent(snapshot);
     await store.cloudChanges.recordSuccess(current.uid, _now());
     _lastSuccessAt = _now();
@@ -431,9 +566,68 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     });
   }
 
+  Future<void> _sendPendingArchives({required String reason}) async {
+    final current = user;
+    if (current == null || !store.cloudChanges.archiveContentDirty) return;
+    final ids = store.cloudChanges.snapshot.archiveIds;
+    final uploaded = <String>[];
+    for (final id in ids) {
+      final point = await _archiveStore.load(current.uid, id);
+      if (point == null) {
+        throw StateError('복원본 $id을(를) 기기에서 찾을 수 없습니다. 삭제 동기화를 중단했습니다.');
+      }
+      await cloud.uploadBookArchive(point);
+      uploaded.add(id);
+      await store.cloudChanges.recordDiagnostic('book_restore_point_uploaded', data: {
+        'archiveId': id,
+        'bookId': point.bookId,
+        'kind': point.kind,
+        'bytes': point.utf8Bytes.length,
+      });
+    }
+    await store.cloudChanges.acknowledgeArchives(uploaded);
+    for (final point in await _archiveStore.list(current.uid)) {
+      if (uploaded.contains(point.id)) {
+        await _pruneOldRevisionPoints(point.bookId);
+      }
+    }
+    await store.cloudChanges.recordSuccess(current.uid, _now());
+    _lastSuccessAt = _now();
+  }
+
+  Future<void> _pruneOldRevisionPoints(String bookId) async {
+    final current = user;
+    if (current == null) return;
+    final all = await cloud.listBookArchives();
+    final revisions = all
+        .where((item) => item.bookId == bookId && item.kind != 'before_delete')
+        .toList()
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    for (final obsolete in revisions.skip(recentRevisionLimitPerBook)) {
+      await cloud.deleteBookArchive(obsolete.id);
+      await _archiveStore.remove(current.uid, obsolete.id);
+    }
+  }
+
   Future<void> _pullManagedBooks({required String reason}) async {
     final remote = await cloud.downloadManagedBooks();
-    final changed = await store.mergeManagedBooks(remote);
+    final revisions = <String, int>{
+      for (final document in remote)
+        if (document['id'] != null)
+          document['id'].toString(): (document['revision'] as num?)?.toInt() ?? 0,
+    };
+    await store.cloudChanges.recordRemoteBookRevisions(revisions);
+    final localSnapshot = store.cloudChanges.snapshot;
+    final dirty = <String>{
+      ...localSnapshot.bookIds,
+      ...localSnapshot.wordIdsByBook.keys,
+      ...localSnapshot.deletedWordIdsByBook.keys,
+      ...localSnapshot.deletedBookIds,
+    };
+    final changed = await store.mergeManagedBooks(
+      remote,
+      locallyDirtyBookIds: dirty,
+    );
     await store.cloudChanges
         .recordDiagnostic('managed_books_download_succeeded', data: {
       'reason': reason,
@@ -548,9 +742,11 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       Duration(minutes: 30),
     ];
     _failureCount++;
-    if (_failureCount <= delays.length &&
-        enabled &&
-        store.cloudChanges.learningStateDirty) {
+    final retryable = store.cloudChanges.learningStateDirty ||
+        store.cloudChanges.archiveContentDirty ||
+        (store.cloudChanges.managedBookContentDirty &&
+            error is! ManagedBookConflictException);
+    if (_failureCount <= delays.length && accountBookSyncEnabled && retryable) {
       _schedule(
         delays[_failureCount - 1],
         reason: '자동 재시도 $_failureCount/${delays.length}',

@@ -253,6 +253,7 @@ class VocaStore {
   VocaStore._(this._prefs);
 
   static const _booksKey = 'books';
+  static const _accountStatePrefix = 'accountState.v1.';
   static const _quickBookKey = 'quickBook';
   static const _sessionSizeKey = 'sessionSize';
   static const _completedKey = 'completed';
@@ -291,10 +292,14 @@ class VocaStore {
   static const studyEventLogMaxAge = Duration(days: 90);
 
   final SharedPreferences _prefs;
+  String? _activeAccountId;
   late List<WordBook> books;
   late CloudChangeTracker cloudChanges;
   late LocalWordSearchIndex wordSearch;
   void Function()? onSessionCompleted;
+  /// Installed by the account-sync coordinator. It records a restoration
+  /// point before a user edit or deletion changes this book locally.
+  Future<void> Function(String bookId, String reason)? onBeforeBookMutation;
   Map<String, DailyStudyStats>? _dailyStudyStatsCache;
   List<StudyEventLog>? _studyEventLogCache;
   Map<String, ActiveStudy>? _activeStudiesCache;
@@ -1252,9 +1257,105 @@ class VocaStore {
     return added;
   }
 
+  /// Keeps each signed-in account's book library in its own local cache. The
+  /// first account adopts the pre-account legacy library once; another account
+  /// never inherits it. Progress itself remains account-scoped in Firebase's
+  /// dedicated learningState documents.
+  Future<void> activateAccount(String uid) async {
+    if (_activeAccountId == uid) return;
+    // Persist everything that determines what a user can resume on this
+    // device before switching to a different account's local cache.
+    if (_activeAccountId != null) await _saveAccountState(_activeAccountId!);
+    final key = '$_accountStatePrefix$uid';
+    final saved = _prefs.getString(key);
+    if (saved != null) {
+      await _restoreAccountState(saved);
+    } else {
+      if (_activeAccountId != null) {
+        await _clearAccountScopedState();
+        books = [_defaultBook()];
+        _activeAccountId = uid;
+        await _saveBooks();
+      }
+      await _saveAccountState(uid);
+    }
+    _activeAccountId = uid;
+    wordSearch.invalidate();
+  }
+
+  static const _accountScopedKeys = <String>[
+    _booksKey,
+    _quickBookKey,
+    _sessionSizeKey,
+    _completedKey,
+    _completedAtKey,
+    _coursePassesKey,
+    _studyDaysKey,
+    _dailyStudyStatsKey,
+    _studyEventLogKey,
+    _activeStudyKey,
+    _activeStudiesKey,
+    _activeStudyTombstonesKey,
+    _resetMarkersKey,
+  ];
+
+  Future<void> _saveAccountState(String uid) async {
+    final state = <String, dynamic>{};
+    for (final key in _accountScopedKeys) {
+      final value = _prefs.get(key);
+      if (value != null) state[key] = value;
+    }
+    // The in-memory books can be newer than the last preference write when a
+    // caller is midway through a change.
+    state[_booksKey] = _encodeBooks();
+    await _prefs.setString('$_accountStatePrefix$uid', jsonEncode(state));
+  }
+
+  Future<void> _restoreAccountState(String encoded) async {
+    final raw = jsonDecode(encoded);
+    if (raw is! Map) return;
+    await _clearAccountScopedState();
+    for (final entry in raw.entries) {
+      final key = entry.key.toString();
+      if (!_accountScopedKeys.contains(key)) continue;
+      final value = entry.value;
+      if (value is String) {
+        await _prefs.setString(key, value);
+      } else if (value is bool) {
+        await _prefs.setBool(key, value);
+      } else if (value is int) {
+        await _prefs.setInt(key, value);
+      } else if (value is double) {
+        await _prefs.setDouble(key, value);
+      } else if (value is List) {
+        await _prefs.setStringList(key, value.map((item) => item.toString()).toList());
+      }
+    }
+    books = _loadBooks();
+    _dailyStudyStatsCache = null;
+    _studyEventLogCache = null;
+    _activeStudiesCache = null;
+    _activeStudyTombstonesCache = null;
+    _completedAtCache = null;
+    _resetMarkersCache = null;
+  }
+
+  Future<void> _clearAccountScopedState() async {
+    for (final key in _accountScopedKeys) {
+      await _prefs.remove(key);
+    }
+    _dailyStudyStatsCache = null;
+    _studyEventLogCache = null;
+    _activeStudiesCache = null;
+    _activeStudyTombstonesCache = null;
+    _completedAtCache = null;
+    _resetMarkersCache = null;
+  }
+
   Future<void> updateBook(WordBook updated) async {
     final index = books.indexWhere((book) => book.id == updated.id);
     if (index < 0) return;
+    await onBeforeBookMutation?.call(updated.id, 'edit');
     final previousWordIds = books[index].words.map((word) => word.id).toSet();
     final updatedWordIds = updated.words.map((word) => word.id).toSet();
     books[index] = updated;
@@ -1271,6 +1372,7 @@ class VocaStore {
     for (final book in books) {
       final index = book.words.indexWhere((word) => word.id == updated.id);
       if (index < 0) continue;
+      await onBeforeBookMutation?.call(book.id, 'edit');
       final previous = book.words[index];
       if (previous.isFavorite != updated.isFavorite &&
           previous.favoriteUpdatedAt == updated.favoriteUpdatedAt) {
@@ -1291,6 +1393,7 @@ class VocaStore {
       final index =
           book.words.indexWhere((candidate) => candidate.id == word.id);
       if (index < 0) continue;
+      await onBeforeBookMutation?.call(book.id, 'edit');
       final updated = book.words[index];
       updated.isFavorite = value;
       updated.favoriteUpdatedAt = now;
@@ -1360,6 +1463,9 @@ class VocaStore {
   }
 
   Future<void> deleteBook(String id) async {
+    if (id != 'default' && books.any((book) => book.id == id)) {
+      await onBeforeBookMutation?.call(id, 'delete');
+    }
     final wasSelected = quickBook.id == id;
     final deleted = books.where((book) => book.id == id).firstOrNull;
     final studiesToClear = activeStudies.entries
@@ -1376,6 +1482,138 @@ class VocaStore {
     if (deleted != null && id != 'default') {
       await cloudChanges.deleteBook(id, deleted.words.map((word) => word.id));
     }
+  }
+
+  /// Captures exactly the selected book's content and the learning-state keys
+  /// that belong to it. This is intentionally not a whole-account backup: a
+  /// later restore cannot reset another book's progress.
+  Map<String, dynamic> createBookRestorePayload(
+    String bookId, {
+    List<Map<String, dynamic>> relations = const [],
+  }) {
+    final book = books.where((item) => item.id == bookId).firstOrNull;
+    if (book == null) throw StateError('복원할 단어장을 찾을 수 없습니다.');
+    final state = toLearningStateJson();
+    bool keyForBook(String key) => key.contains(bookId);
+    // A multi-book study queue belongs to more than one library. Restoring it
+    // wholesale would reset another book, so only a dedicated single-book
+    // study is part of this book-scoped recovery payload.
+    final active = Map<String, dynamic>.from(state['activeStudies'] as Map? ?? const {})
+      ..removeWhere((_, value) =>
+          value is! Map || value['bookId']?.toString() != bookId);
+    return {
+      'schema': 1,
+      'book': book.toJson(),
+      'learning': {
+        'wordStates': {bookId: (state['wordStates'] as Map? ?? const {})[bookId]},
+        'completed': (state['completed'] as List? ?? const [])
+            .where((value) => value.toString().startsWith('$bookId:')).toList(),
+        'completedAt': _mapEntriesForBook(state['completedAt'], keyForBook),
+        'rangeCoursePasses': _mapEntriesForBook(state['rangeCoursePasses'], keyForBook),
+        'activeStudies': active,
+        'activeStudyTombstones': _mapEntriesForBook(
+            state['activeStudyTombstones'], keyForBook),
+        'resetMarkers': _mapEntriesForBook(state['resetMarkers'], keyForBook),
+        'studyEventLog': (state['studyEventLog'] as List? ?? const [])
+            .where((value) => value is Map && value['bookId'] == bookId)
+            .toList(),
+      },
+      'relations': relations,
+    };
+  }
+
+  Map<String, dynamic> _mapEntriesForBook(
+      dynamic raw, bool Function(String key) include) {
+    if (raw is! Map) return const {};
+    return raw.map((key, value) => MapEntry(key.toString(), value))
+      ..removeWhere((key, _) => !include(key));
+  }
+
+  bool _activeValueReferencesBook(dynamic raw, String bookId) {
+    if (raw is! Map) return false;
+    if (raw['bookId'] == bookId) return true;
+    final selections = raw['sessionSelections'];
+    return selections is Map && selections.containsKey(bookId);
+  }
+
+  /// Replaces only the archived book and its book-scoped learning state. The
+  /// original ID is retained, so sessions, favorites and relations still point
+  /// to the same cards after recovery.
+  Future<void> restoreBookFromPayload(Map<String, dynamic> payload) async {
+    final rawBook = payload['book'];
+    if (rawBook is! Map) throw StateError('복원 기록에 단어장 정보가 없습니다.');
+    final restored = WordBook.fromJson(Map<String, dynamic>.from(rawBook));
+    if (restored.id == 'default') throw StateError('기본 단어장은 복원할 수 없습니다.');
+    final index = books.indexWhere((book) => book.id == restored.id);
+    if (index < 0) {
+      books.add(restored);
+    } else {
+      books[index] = restored;
+    }
+    final learning = Map<String, dynamic>.from(payload['learning'] as Map? ?? const {});
+    final id = restored.id;
+    final completed = (_prefs.getStringList(_completedKey) ?? <String>[])
+        .where((key) => !key.startsWith('$id:')).toSet()
+      ..addAll((learning['completed'] as List? ?? const []).map((item) => item.toString()));
+    final completedTimes = Map<String, DateTime>.from(completedAt)
+      ..removeWhere((key, _) => key.contains(id));
+    completedTimes.addAll(_datesFromMap(learning['completedAt']));
+    final passes = Map<String, int>.from(coursePasses)
+      ..removeWhere((key, _) => key.contains(id));
+    passes.addAll(_intsFromMap(learning['rangeCoursePasses']));
+    final active = Map<String, ActiveStudy>.from(activeStudies)
+      ..removeWhere((_, value) => _activeValueReferencesBook(value.toJson(), id));
+    final archiveActive = learning['activeStudies'];
+    if (archiveActive is Map) {
+      archiveActive.forEach((key, value) {
+        if (value is Map) active[key.toString()] = ActiveStudy.fromJson(Map<String, dynamic>.from(value));
+      });
+    }
+    final tombstones = Map<String, DateTime>.from(activeStudyTombstones)
+      ..removeWhere((key, _) => key.contains(id));
+    tombstones.addAll(_datesFromMap(learning['activeStudyTombstones']));
+    final markers = Map<String, DateTime>.from(resetMarkers)
+      ..removeWhere((key, _) => key.contains(id));
+    markers.addAll(_datesFromMap(learning['resetMarkers']));
+    final events = studyEventLog.where((event) => event.bookId != id).toList();
+    final eventIds = events.map((event) => event.id).toSet();
+    for (final raw in learning['studyEventLog'] as List? ?? const []) {
+      if (raw is! Map) continue;
+      final event = StudyEventLog.fromJson(Map<String, dynamic>.from(raw));
+      if (eventIds.add(event.id)) events.add(event);
+    }
+    await _saveBooks();
+    wordSearch.invalidate();
+    await _prefs.setStringList(_completedKey, completed.toList());
+    await _saveCompletedAt(completedTimes);
+    await _prefs.setString(_coursePassesKey, jsonEncode(passes));
+    await _saveActiveStudies(active);
+    await _saveActiveStudyTombstones(tombstones);
+    await _saveResetMarkers(markers);
+    await _saveStudyEventLog(_prunedStudyEventLog(events));
+    await cloudChanges.markBook(id);
+    await cloudChanges.markWords(id, restored.words.map((word) => word.id));
+    await cloudChanges.markLearningState();
+    learningStateRevision.value++;
+  }
+
+  Map<String, DateTime> _datesFromMap(dynamic raw) {
+    if (raw is! Map) return const {};
+    final result = <String, DateTime>{};
+    raw.forEach((key, value) {
+      final date = value is String ? DateTime.tryParse(value) : null;
+      if (date != null) result[key.toString()] = date;
+    });
+    return result;
+  }
+
+  Map<String, int> _intsFromMap(dynamic raw) {
+    if (raw is! Map) return const {};
+    final result = <String, int>{};
+    raw.forEach((key, value) {
+      if (value is num) result[key.toString()] = value.toInt();
+    });
+    return result;
   }
 
   /// Content-only data for the managedBooks sync channel. Study state is
@@ -1405,9 +1643,21 @@ class VocaStore {
 
   /// Merges card content without replacing local study progress. The dedicated
   /// learningState merge restores authoritative progress immediately after this.
-  Future<int> mergeManagedBooks(Iterable<Map<String, dynamic>> remote) async {
+  Future<int> mergeManagedBooks(
+    Iterable<Map<String, dynamic>> remote, {
+    Set<String> locallyDirtyBookIds = const <String>{},
+  }) async {
     var changed = 0;
+    final remotelyDeleted = <String>[];
     for (final document in remote) {
+      final id = document['id']?.toString();
+      if (id == null || id == 'default' || locallyDirtyBookIds.contains(id)) {
+        continue;
+      }
+      if (document['deleted'] == true) {
+        remotelyDeleted.add(id);
+        continue;
+      }
       final content = document['content'];
       if (content is! Map) continue;
       final decoded = WordBook.fromJson(Map<String, dynamic>.from(content));
@@ -1432,11 +1682,37 @@ class VocaStore {
       books[index] = decoded;
       changed++;
     }
+    if (remotelyDeleted.isNotEmpty) {
+      changed += await _applyRemoteBookDeletions(remotelyDeleted);
+    }
     if (changed > 0) {
       await _saveBooks();
       wordSearch.invalidate();
     }
     return changed;
+  }
+
+  /// Applies an account-level tombstone without putting a competing write back
+  /// into the book-content queue. The active study is tombstoned as well, so a
+  /// deleted book cannot reopen from an old local queue.
+  Future<int> _applyRemoteBookDeletions(Iterable<String> ids) async {
+    var removed = 0;
+    for (final id in ids.toSet()) {
+      if (id == 'default' || !books.any((book) => book.id == id)) continue;
+      final wasSelected = quickBook.id == id;
+      final studyKeys = activeStudies.entries
+          .where((entry) => entry.value.bookId == id)
+          .map((entry) => entry.key)
+          .toList();
+      for (final key in studyKeys) {
+        await clearActiveStudyFor(key, markCloudChange: false);
+      }
+      books.removeWhere((book) => book.id == id);
+      if (wasSelected) await selectQuickBook('default');
+      removed++;
+    }
+    if (removed > 0) await cloudChanges.markLearningState();
+    return removed;
   }
 
   Future<void> mark(
@@ -1943,6 +2219,10 @@ class VocaStore {
 
   List<WordBook> _loadBooks() {
     final saved = _prefs.getString(_booksKey);
+    return _decodeBooks(saved);
+  }
+
+  List<WordBook> _decodeBooks(String? saved) {
     if (saved == null) return [_defaultBook()];
     try {
       final decoded = jsonDecode(saved) as List<dynamic>;
@@ -1955,10 +2235,14 @@ class VocaStore {
     }
   }
 
-  Future<void> _saveBooks() => _prefs.setString(
-        _booksKey,
-        jsonEncode(books.map((book) => book.toJson()).toList()),
-      );
+  String _encodeBooks() => jsonEncode(books.map((book) => book.toJson()).toList());
+
+  Future<void> _saveBooks() async {
+    final encoded = _encodeBooks();
+    await _prefs.setString(_booksKey, encoded);
+    final account = _activeAccountId;
+    if (account != null) await _saveAccountState(account);
+  }
 
   String _newBookId() {
     var id = DateTime.now().microsecondsSinceEpoch.toString();

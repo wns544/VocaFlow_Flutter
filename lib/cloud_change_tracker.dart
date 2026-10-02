@@ -18,6 +18,8 @@ class CloudChangeSnapshot {
     required this.deletedBookIds,
     required this.learningStateDirty,
     required this.learningStateGeneration,
+    required this.bookBaseRevisions,
+    required this.archiveIds,
   });
 
   final int generation;
@@ -29,6 +31,10 @@ class CloudChangeSnapshot {
   final Set<String> deletedBookIds;
   final bool learningStateDirty;
   final int learningStateGeneration;
+  /// Server revision observed before the local edit. A managed-book write may
+  /// only replace the exact revision it was based on.
+  final Map<String, int> bookBaseRevisions;
+  final Set<String> archiveIds;
 
   bool get isEmpty => pendingCount == 0;
   int get pendingCount =>
@@ -38,6 +44,7 @@ class CloudChangeSnapshot {
       wordIdsByBook.values.fold<int>(0, (sum, ids) => sum + ids.length) +
       deletedWordIdsByBook.values.fold<int>(0, (sum, ids) => sum + ids.length) +
       deletedBookIds.length +
+      archiveIds.length +
       (learningStateDirty ? 1 : 0);
 }
 
@@ -48,6 +55,7 @@ class CloudChangeTracker {
   }
 
   static const _stateKey = 'cloudChangeTracker.v1';
+  static const _accountStatePrefix = 'cloudChangeTracker.v2.';
   static const _enabledPrefix = 'autoBackup.enabled.';
   static const _initializedPrefix = 'autoBackup.initialized.';
   static const _networkPrefix = 'autoBackup.network.';
@@ -64,12 +72,16 @@ class CloudChangeTracker {
   int _diagnosticSequence = 0;
 
   int _generation = 0;
+  String? _activeAccountId;
   bool _profileDirty = false;
   bool _dictionaryOpenSettingDirty = false;
   final Set<String> _bookIds = {};
   final Map<String, Set<int>> _wordIdsByBook = {};
   final Map<String, Set<int>> _deletedWordIdsByBook = {};
   final Set<String> _deletedBookIds = {};
+  final Map<String, int> _remoteBookRevisions = {};
+  final Map<String, int> _bookBaseRevisions = {};
+  final Set<String> _archiveIds = {};
   bool _learningStateDirty = false;
   int _learningStateGeneration = 0;
 
@@ -86,7 +98,30 @@ class CloudChangeTracker {
         deletedBookIds: Set.of(_deletedBookIds),
         learningStateDirty: _learningStateDirty,
         learningStateGeneration: _learningStateGeneration,
+        bookBaseRevisions: Map.of(_bookBaseRevisions),
+        archiveIds: Set.of(_archiveIds),
       );
+
+  /// Switches the durable upload queue to the signed-in account. Old builds
+  /// had one unscoped queue; its pending work is adopted once by the first
+  /// account that signs in, never shared with a later account.
+  Future<void> activateAccount(String uid) async {
+    if (_activeAccountId == uid) return;
+    final accountKey = '$_accountStatePrefix$uid';
+    final scoped = _prefs.getString(accountKey);
+    if (scoped != null) {
+      _clearInMemory();
+      _restoreEncoded(scoped);
+    } else {
+      // Only the first signed-in account may adopt old unscoped work. A
+      // second account starts with an empty queue, never a copy of account A.
+      if (_activeAccountId != null) _clearInMemory();
+      await _prefs.setString(accountKey, _encodeState());
+    }
+    _activeAccountId = uid;
+    await _persist();
+    onChanged?.call();
+  }
 
   int get pendingCount => snapshot.pendingCount;
   bool get learningStateDirty => _learningStateDirty;
@@ -95,6 +130,7 @@ class CloudChangeTracker {
       _wordIdsByBook.isNotEmpty ||
       _deletedWordIdsByBook.isNotEmpty ||
       _deletedBookIds.isNotEmpty;
+  bool get archiveContentDirty => _archiveIds.isNotEmpty;
 
   /// Clears only book content after it reaches the dedicated managedBooks
   /// collection. Profile and learning-state work remain queued separately.
@@ -105,6 +141,7 @@ class CloudChangeTracker {
     _wordIdsByBook.clear();
     _deletedWordIdsByBook.clear();
     _deletedBookIds.clear();
+    _bookBaseRevisions.clear();
     _generation++;
     await _persist();
     onChanged?.call();
@@ -113,11 +150,14 @@ class CloudChangeTracker {
   /// Stable per-installation identity: each phone owns a separate remote
   /// learning-state document, so a stale phone cannot overwrite another.
   Future<String> deviceId() async {
-    final saved = _prefs.getString(_deviceIdKey);
+    final key = _activeAccountId == null
+        ? _deviceIdKey
+        : '$_deviceIdKey.$_activeAccountId';
+    final saved = _prefs.getString(key);
     if (saved != null && saved.isNotEmpty) return saved;
     final value =
         'device-${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}-${Random.secure().nextInt(1 << 32).toRadixString(36)}';
-    await _prefs.setString(_deviceIdKey, value);
+    await _prefs.setString(key, value);
     return value;
   }
 
@@ -149,6 +189,18 @@ class CloudChangeTracker {
         return true;
       });
 
+  Future<void> markArchive(String archiveId) =>
+      _mutate(() => _archiveIds.add(archiveId));
+
+  Future<void> acknowledgeArchives(Iterable<String> archiveIds) =>
+      _mutate(() {
+        var changed = false;
+        for (final archiveId in archiveIds) {
+          changed = _archiveIds.remove(archiveId) || changed;
+        }
+        return changed;
+      });
+
   Future<void> acknowledgeLearningState(CloudChangeSnapshot uploaded) async {
     if (!_learningStateDirty ||
         _learningStateGeneration != uploaded.learningStateGeneration) return;
@@ -171,21 +223,14 @@ class CloudChangeTracker {
       });
 
   Future<void> markBook(String bookId) => _mutate(() {
-        if (!_deletedBookIds.contains(bookId) && _bookIds.contains(bookId)) {
-          return false;
-        }
+        _captureBookBaseRevision(bookId);
         _deletedBookIds.remove(bookId);
         _bookIds.add(bookId);
         return true;
       });
 
   Future<void> markWord(String bookId, int wordId) => _mutate(() {
-        final existingDirty = _wordIdsByBook[bookId];
-        final wasDeleted = _deletedBookIds.contains(bookId) ||
-            (_deletedWordIdsByBook[bookId]?.contains(wordId) ?? false);
-        if ((existingDirty?.contains(wordId) ?? false) && !wasDeleted) {
-          return false;
-        }
+        _captureBookBaseRevision(bookId);
         _deletedBookIds.remove(bookId);
         _deletedWordIdsByBook[bookId]?.remove(wordId);
         final dirty = _wordIdsByBook.putIfAbsent(bookId, () => {});
@@ -195,13 +240,7 @@ class CloudChangeTracker {
 
   Future<void> markWords(String bookId, Iterable<int> wordIds) => _mutate(() {
         final ids = wordIds.toSet();
-        final existingDirty = _wordIdsByBook[bookId] ?? const <int>{};
-        final deleted = _deletedWordIdsByBook[bookId] ?? const <int>{};
-        if (!_deletedBookIds.contains(bookId) &&
-            ids.every(existingDirty.contains) &&
-            ids.every((id) => !deleted.contains(id))) {
-          return false;
-        }
+        _captureBookBaseRevision(bookId);
         _deletedBookIds.remove(bookId);
         final dirty = _wordIdsByBook.putIfAbsent(bookId, () => {});
         for (final wordId in ids) {
@@ -212,6 +251,7 @@ class CloudChangeTracker {
       });
 
   Future<void> deleteWord(String bookId, int wordId) => _mutate(() {
+        _captureBookBaseRevision(bookId);
         final wasPendingDelete =
             _deletedWordIdsByBook[bookId]?.contains(wordId) ?? false;
         final wasPendingWrite =
@@ -224,7 +264,7 @@ class CloudChangeTracker {
       });
 
   Future<void> deleteBook(String bookId, Iterable<int> wordIds) => _mutate(() {
-        if (_deletedBookIds.contains(bookId)) return false;
+        _captureBookBaseRevision(bookId);
         _bookIds.remove(bookId);
         _wordIdsByBook.remove(bookId);
         _deletedBookIds.add(bookId);
@@ -237,6 +277,7 @@ class CloudChangeTracker {
         var changed = !_profileDirty;
         _profileDirty = true;
         for (final entry in wordsByBook.entries) {
+          _captureBookBaseRevision(entry.key);
           _deletedBookIds.remove(entry.key);
           changed = _bookIds.add(entry.key) || changed;
           final dirty = _wordIdsByBook.putIfAbsent(entry.key, () => {});
@@ -260,6 +301,7 @@ class CloudChangeTracker {
     _wordIdsByBook.clear();
     _deletedWordIdsByBook.clear();
     _deletedBookIds.clear();
+    _archiveIds.clear();
     _learningStateDirty = false;
     await _persist();
     onChanged?.call();
@@ -338,6 +380,14 @@ class CloudChangeTracker {
     final encoded = _prefs.getString(_stateKey);
     if (encoded == null) return;
     try {
+      _restoreEncoded(encoded);
+    } catch (_) {
+      // A corrupt journal must not prevent the local app from opening.
+    }
+  }
+
+  void _restoreEncoded(String encoded) {
+    try {
       final json = jsonDecode(encoded) as Map<String, dynamic>;
       _generation = json['generation'] as int? ?? 0;
       _profileDirty = json['profileDirty'] as bool? ?? false;
@@ -348,17 +398,30 @@ class CloudChangeTracker {
       _restoreMap(json['deletedWordIdsByBook'], _deletedWordIdsByBook);
       _deletedBookIds.addAll(
           (json['deletedBookIds'] as List<dynamic>? ?? []).cast<String>());
+      _archiveIds.addAll(
+          (json['archiveIds'] as List<dynamic>? ?? []).cast<String>());
       _learningStateDirty = json['learningStateDirty'] as bool? ?? false;
       _learningStateGeneration =
           (json['learningStateGeneration'] as num?)?.toInt() ?? 0;
+      final revisions = json['remoteBookRevisions'] as Map<String, dynamic>?;
+      revisions?.forEach((key, value) {
+        if (value is num) _remoteBookRevisions[key] = value.toInt();
+      });
+      final bases = json['bookBaseRevisions'] as Map<String, dynamic>?;
+      bases?.forEach((key, value) {
+        if (value is num) _bookBaseRevisions[key] = value.toInt();
+      });
     } catch (_) {
       // A corrupt journal must not prevent the local app from opening.
     }
   }
 
   Future<void> _persist() => _prefs.setString(
-        _stateKey,
-        jsonEncode({
+        _activeAccountId == null ? _stateKey : '$_accountStatePrefix$_activeAccountId',
+        _encodeState(),
+      );
+
+  String _encodeState() => jsonEncode({
           'generation': _generation,
           'profileDirty': _profileDirty,
           'dictionaryOpenSettingDirty': _dictionaryOpenSettingDirty,
@@ -366,10 +429,39 @@ class CloudChangeTracker {
           'wordIdsByBook': _encodeMap(_wordIdsByBook),
           'deletedWordIdsByBook': _encodeMap(_deletedWordIdsByBook),
           'deletedBookIds': _deletedBookIds.toList(),
+          'archiveIds': _archiveIds.toList(),
           'learningStateDirty': _learningStateDirty,
           'learningStateGeneration': _learningStateGeneration,
-        }),
-      );
+          'remoteBookRevisions': _remoteBookRevisions,
+          'bookBaseRevisions': _bookBaseRevisions,
+        });
+
+  /// A downloaded revision is bookkeeping only: it must not schedule an
+  /// upload. It is nevertheless durable so a restarted phone cannot write an
+  /// edit against an unknown server version.
+  Future<void> recordRemoteBookRevisions(Map<String, int> revisions) async {
+    _remoteBookRevisions.addAll(revisions);
+    await _persist();
+  }
+
+  void _captureBookBaseRevision(String bookId) {
+    _bookBaseRevisions.putIfAbsent(bookId, () => _remoteBookRevisions[bookId] ?? 0);
+  }
+
+  void _clearInMemory() {
+    _generation = 0;
+    _profileDirty = false;
+    _dictionaryOpenSettingDirty = false;
+    _bookIds.clear();
+    _wordIdsByBook.clear();
+    _deletedWordIdsByBook.clear();
+    _deletedBookIds.clear();
+    _archiveIds.clear();
+    _remoteBookRevisions.clear();
+    _bookBaseRevisions.clear();
+    _learningStateDirty = false;
+    _learningStateGeneration = 0;
+  }
 
   void _removeEmptySets() {
     _wordIdsByBook.removeWhere((_, ids) => ids.isEmpty);

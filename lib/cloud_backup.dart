@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -6,6 +7,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 
 import 'cloud_change_tracker.dart';
+import 'book_restore_archive.dart';
 import 'models.dart';
 import 'store.dart';
 
@@ -21,6 +23,21 @@ class CloudSyncTimeoutException implements Exception {
 
   @override
   String toString() => 'CloudSyncTimeoutException';
+}
+
+/// The book changed on another device after this phone began its edit. The
+/// caller must keep the local edit intact and show it as a conflict rather
+/// than silently replacing either copy.
+class ManagedBookConflictException implements Exception {
+  const ManagedBookConflictException(this.bookId, this.expected, this.actual);
+
+  final String bookId;
+  final int expected;
+  final int actual;
+
+  @override
+  String toString() =>
+      'ManagedBookConflictException(book: $bookId, expected: $expected, actual: $actual)';
 }
 
 class CloudBookOverview {
@@ -53,6 +70,22 @@ class CloudActiveStudyOverview {
   final DateTime? updatedAt;
 
   double get progress => total <= 0 ? 0 : memorized / total;
+}
+
+class CloudBookArchiveOverview {
+  const CloudBookArchiveOverview({
+    required this.id,
+    required this.bookId,
+    required this.kind,
+    required this.createdAt,
+    required this.byteSize,
+  });
+
+  final String id;
+  final String bookId;
+  final String kind;
+  final DateTime createdAt;
+  final int byteSize;
 }
 
 class CloudBackupOverview {
@@ -95,6 +128,7 @@ class CloudBackup {
   static const _operationTimeout = Duration(seconds: 90);
   // A stalled learning-state stream must not keep the coordinator locked.
   static const _learningStateOperationTimeout = Duration(seconds: 25);
+  static const maxBookArchiveBytes = 100 * 1024 * 1024;
 
   Future<T> _runCloudOperation<T>(Future<T> Function() operation,
       {Duration? timeout}) async {
@@ -137,6 +171,134 @@ class CloudBackup {
   CollectionReference<Map<String, dynamic>> get _managedBooksRef =>
       firestore.collection('users').doc(_user.uid).collection('managedBooks');
 
+  CollectionReference<Map<String, dynamic>> get _bookArchivesRef => firestore
+      .collection('users')
+      .doc(_user.uid)
+      .collection('bookArchives');
+
+  /// Stores a recovery point in small chunks, avoiding Firestore's per-document
+  /// size limit even for a large imported book. Existing card documents are
+  /// never read or changed here.
+  Future<void> uploadBookArchive(BookRestorePoint point) =>
+      _runCloudOperation(() async {
+        const chunkBytes = 350 * 1024;
+        final bytes = point.utf8Bytes;
+        final chunks = <String>[];
+        for (var offset = 0; offset < bytes.length; offset += chunkBytes) {
+          final end = offset + chunkBytes < bytes.length
+              ? offset + chunkBytes
+              : bytes.length;
+          chunks.add(base64Encode(bytes.sublist(offset, end)));
+        }
+        final ref = _bookArchivesRef.doc(point.id);
+        final existing = await ref.get();
+        if (!existing.exists) {
+          final current = await _bookArchivesRef.get();
+          final used = current.docs.fold<int>(
+            0,
+            (sum, document) =>
+                sum + ((document.data()['byteSize'] as num?)?.toInt() ?? 0),
+          );
+          if (used + bytes.length > maxBookArchiveBytes) {
+            throw StateError('복원 보관함 100MB 한도가 가득 찼습니다. 오래된 기록을 지운 뒤 다시 시도해 주세요.');
+          }
+        }
+        await ref.set({
+          'schema': 1,
+          'id': point.id,
+          'bookId': point.bookId,
+          'kind': point.kind,
+          'createdAt': point.createdAt.toUtc().toIso8601String(),
+          'deviceId': point.deviceId,
+          'byteSize': bytes.length,
+          'chunkCount': chunks.length,
+          'updatedAt': FieldValue.serverTimestamp(),
+        });
+        var batch = firestore.batch();
+        var count = 0;
+        Future<void> commit() async {
+          if (count == 0) return;
+          await batch.commit();
+          batch = firestore.batch();
+          count = 0;
+        }
+        for (var index = 0; index < chunks.length; index++) {
+          batch.set(ref.collection('chunks').doc(index.toString().padLeft(6, '0')),
+              {'index': index, 'data': chunks[index]});
+          count++;
+          if (count >= 400) await commit();
+        }
+        await commit();
+      });
+
+  Future<List<Map<String, dynamic>>> downloadBookArchiveMetadata() =>
+      _runCloudOperation(() async {
+        final snapshot = await _bookArchivesRef.get();
+        return snapshot.docs.map((doc) => Map<String, dynamic>.from(doc.data()))
+            .toList(growable: false);
+      });
+
+  Future<List<CloudBookArchiveOverview>> listBookArchives() async {
+    final rows = await downloadBookArchiveMetadata();
+    final result = <CloudBookArchiveOverview>[];
+    for (final row in rows) {
+      final id = row['id']?.toString() ?? '';
+      if (id.isEmpty) continue;
+      result.add(CloudBookArchiveOverview(
+        id: id,
+        bookId: row['bookId']?.toString() ?? '',
+        kind: row['kind']?.toString() ?? 'revision',
+        createdAt: DateTime.tryParse(row['createdAt']?.toString() ?? '') ??
+            DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
+        byteSize: (row['byteSize'] as num?)?.toInt() ?? 0,
+      ));
+    }
+    result.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return result;
+  }
+
+  Future<int> bookArchiveBytes() async => (await listBookArchives())
+      .fold<int>(0, (sum, archive) => sum + archive.byteSize);
+
+  Future<BookRestorePoint?> downloadBookArchive(String id) =>
+      _runCloudOperation(() async {
+        final ref = _bookArchivesRef.doc(id);
+        final metadata = await ref.get();
+        if (!metadata.exists) return null;
+        final chunks = await ref.collection('chunks').get();
+        final rows = chunks.docs.map((doc) => doc.data()).toList()
+          ..sort((a, b) => ((a['index'] as num?)?.toInt() ?? 0)
+              .compareTo((b['index'] as num?)?.toInt() ?? 0));
+        final bytes = <int>[];
+        for (final row in rows) {
+          final data = row['data'];
+          if (data is String) bytes.addAll(base64Decode(data));
+        }
+        if (bytes.isEmpty) return null;
+        return BookRestorePoint.fromJson(
+            Map<String, dynamic>.from(jsonDecode(utf8.decode(bytes)) as Map));
+      });
+
+  Future<void> deleteBookArchive(String id) => _runCloudOperation(() async {
+        final ref = _bookArchivesRef.doc(id);
+        final chunks = await ref.collection('chunks').get();
+        var batch = firestore.batch();
+        var count = 0;
+        Future<void> commit() async {
+          if (count == 0) return;
+          await batch.commit();
+          batch = firestore.batch();
+          count = 0;
+        }
+        for (final chunk in chunks.docs) {
+          batch.delete(chunk.reference);
+          count++;
+          if (count >= 400) await commit();
+        }
+        batch.delete(ref);
+        await commit();
+      });
+
   Future<void> uploadManagedBooks(
           VocaStore store, CloudChangeSnapshot changes) =>
       _runCloudOperation(() async {
@@ -148,52 +310,39 @@ class CloudBackup {
         }..remove('default');
         if (touched.isEmpty) return;
         final byId = {for (final book in store.books) book.id: book};
-        var batch = firestore.batch();
-        var count = 0;
-        Future<void> commit() async {
-          if (count == 0) return;
-          await batch.commit();
-          batch = firestore.batch();
-          count = 0;
-        }
-
         for (final id in touched) {
           final book = byId[id];
           final ref = _managedBooksRef.doc(id);
-          if (book == null) {
-            batch.set(
-                ref,
-                {
-                  'schema': 1,
-                  'id': id,
-                  'deleted': true,
-                  'clientUpdatedAt': DateTime.now().toUtc().toIso8601String(),
-                  'updatedAt': FieldValue.serverTimestamp(),
-                },
-                SetOptions(merge: true));
-          } else {
-            batch.set(
-                ref,
-                {
-                  'schema': 1,
-                  'id': id,
-                  'deleted': false,
-                  'content': store.toManagedBookJson(book),
-                  'clientUpdatedAt': DateTime.now().toUtc().toIso8601String(),
-                  'updatedAt': FieldValue.serverTimestamp(),
-                },
-                SetOptions(merge: true));
-          }
-          count++;
-          if (count >= 400) await commit();
+          final expected = changes.bookBaseRevisions[id] ?? 0;
+          await firestore.runTransaction((transaction) async {
+            final current = await transaction.get(ref);
+            final rawRevision = current.data()?['revision'];
+            final actual = rawRevision is num ? rawRevision.toInt() : 0;
+            if (actual != expected) {
+              throw ManagedBookConflictException(id, expected, actual);
+            }
+            transaction.set(
+              ref,
+              {
+                'schema': 2,
+                'id': id,
+                'revision': actual + 1,
+                'deleted': book == null,
+                if (book != null) 'content': store.toManagedBookJson(book),
+                'clientUpdatedAt': DateTime.now().toUtc().toIso8601String(),
+                'updatedAt': FieldValue.serverTimestamp(),
+              },
+              SetOptions(merge: true),
+            );
+          });
         }
-        await commit();
       });
 
   Future<List<Map<String, dynamic>>> downloadManagedBooks() =>
       _runCloudOperation(() async {
-        final snapshot =
-            await _managedBooksRef.where('deleted', isEqualTo: false).get();
+        // Tombstones are data too. Filtering them out was the reason a book
+        // deleted on one phone could remain visible on another phone.
+        final snapshot = await _managedBooksRef.get();
         return snapshot.docs
             .map((doc) => Map<String, dynamic>.from(doc.data()))
             .toList(growable: false);
