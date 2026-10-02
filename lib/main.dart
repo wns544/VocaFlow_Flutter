@@ -216,6 +216,7 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
   final navigatorKey = GlobalKey<NavigatorState>();
   ActiveStudy? initialStudy;
   var restorationNotified = false;
+  var startupSyncReady = false;
 
   @override
   void initState() {
@@ -250,15 +251,13 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
       store = value;
       initialStudy = active;
     });
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || restorationNotified) return;
-      restorationNotified = true;
-      unawaited(_completeInitialRestoration());
-    });
-
     final ready = await (widget.firebaseInitialization ??
         Future<bool>.value(firebaseReady));
-    if (!mounted || !ready) return;
+    if (!mounted) return;
+    if (!ready) {
+      await _finishStartupSync();
+      return;
+    }
     final coordinator = AutoBackupCoordinator(
       store: value,
       onChanged: () {
@@ -268,27 +267,36 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
     coordinator.start();
     autoBackup = coordinator;
     autoBackupNotifier.value = coordinator;
-    unawaited(_mergeCloudBackup(coordinator));
+    await _mergeCloudBackup(coordinator);
   }
 
   Future<void> _mergeCloudBackup(AutoBackupCoordinator coordinator) async {
-    if (!coordinator.enabled || !coordinator.initialized) return;
-    final hadInitialStudy = initialStudy != null || store?.activeStudy != null;
-    try {
-      await coordinator.mergeFromCloud(uploadMerged: false);
-      final restored = store?.activeStudy;
-      if (!mounted) return;
-      setState(() => initialStudy = restored ?? initialStudy);
-      if (!hadInitialStudy && restored != null) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          final navigator = navigatorKey.currentState;
-          if (!mounted || navigator == null) return;
-          navigator.pushNamed('/study');
-        });
-      }
-    } catch (_) {
-      // Cloud merge is opportunistic; local startup must stay instant.
+    if (!coordinator.enabled || !coordinator.initialized) {
+      await _finishStartupSync();
+      return;
     }
+    try {
+      await store?.cloudChanges.recordDiagnostic('startup_sync_started');
+      await coordinator.mergeFromCloud(uploadMerged: false);
+      await store?.cloudChanges.recordDiagnostic('startup_sync_succeeded');
+    } catch (error) {
+      await store?.cloudChanges.recordDiagnostic('startup_sync_failed', data: {
+        'error': error.toString(),
+      });
+    } finally {
+      await _finishStartupSync();
+    }
+  }
+
+  Future<void> _finishStartupSync() async {
+    if (!mounted || startupSyncReady) return;
+    setState(() {
+      initialStudy = store?.activeStudy;
+      startupSyncReady = true;
+    });
+    if (restorationNotified) return;
+    restorationNotified = true;
+    await _completeInitialRestoration();
   }
 
   Future<void> _completeInitialRestoration() async {
@@ -348,12 +356,12 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
   @override
   Widget build(BuildContext context) {
     final loadedStore = store;
-    if (loadedStore == null) {
+    if (loadedStore == null || !startupSyncReady) {
       return MaterialApp(
-        key: const ValueKey('loading-app'),
+        key: const ValueKey('startup-sync-app'),
         debugShowCheckedModeBanner: false,
         theme: theme,
-        home: const _FlutterSplashScreen(),
+        home: const _StartupSyncScreen(),
       );
     }
     return MaterialApp(
@@ -454,19 +462,18 @@ class _MouseBackForwardScopeState extends State<_MouseBackForwardScope> {
       );
 }
 
-class _FlutterSplashScreen extends StatelessWidget {
-  const _FlutterSplashScreen();
+class _StartupSyncScreen extends StatelessWidget {
+  const _StartupSyncScreen();
 
   @override
   Widget build(BuildContext context) {
-    return const ColoredBox(
-      color: Color(0xFFF1F2F5),
-      child: SizedBox.expand(
-        child: Image(
-          image: AssetImage('assets/splash_design.png'),
-          fit: BoxFit.contain,
-          filterQuality: FilterQuality.high,
-        ),
+    return const Scaffold(
+      body: Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          CircularProgressIndicator(color: sea),
+          SizedBox(height: 18),
+          Text('학습 기록 확인 중…', style: TextStyle(fontWeight: FontWeight.w700)),
+        ]),
       ),
     );
   }
@@ -1759,6 +1766,7 @@ class _CardStudyPageState extends State<CardStudyPage>
   var memorized = 0;
   var revealed = false;
   var showingExplanation = false;
+  late bool _autoPlayPronunciation;
   var _relatedCurrentScopeOnly = false;
   var exiting = false;
   var finishingStudy = false;
@@ -1768,6 +1776,7 @@ class _CardStudyPageState extends State<CardStudyPage>
   StudyState? lastState;
   final undoHistory = <StudyDecision>[];
   ModalRoute<dynamic>? _route;
+  DateTime? _activeStudyUpdatedAt;
 
   bool get horizontalSwipe => widget.store.horizontalSwipe;
   String? get activeBookId => widget.resume?.bookId ?? widget.bookId;
@@ -1871,6 +1880,7 @@ class _CardStudyPageState extends State<CardStudyPage>
     // short duplicate-back reservation.
     navigationBackGate.reset('study_page_initialized');
     WidgetsBinding.instance.addObserver(this);
+    _autoPlayPronunciation = widget.store.autoPlayPronunciation;
     _bookIdsByWord = {
       for (final book in widget.store.books)
         for (final word in book.words) word: book.id,
@@ -1902,6 +1912,7 @@ class _CardStudyPageState extends State<CardStudyPage>
           : List<Word>.of(words);
       total = queue.length;
     } else {
+      _activeStudyUpdatedAt = resume.updatedAt;
       queue = widget.store.resolveActiveWords(resume);
       if (resume.isRangeCourse) {
         total = resume.total;
@@ -1936,8 +1947,11 @@ class _CardStudyPageState extends State<CardStudyPage>
             .firstOrNull;
       }
     }
+    widget.store.learningStateRevision.addListener(_onLearningStateMerged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      persistStudy();
+      // A resumed route already has a stored snapshot. Re-saving it here used
+      // to race a just-finished cloud merge and could put an older queue back.
+      if (resume == null) unawaited(persistStudy());
       if (mounted) unawaited(captureResumeSnapshot('study'));
     });
   }
@@ -1959,6 +1973,7 @@ class _CardStudyPageState extends State<CardStudyPage>
 
   @override
   void dispose() {
+    widget.store.learningStateRevision.removeListener(_onLearningStateMerged);
     _keyboardFocusNode.dispose();
     WidgetsBinding.instance.removeObserver(this);
     resumeRouteObserver.unsubscribe(this);
@@ -1976,16 +1991,72 @@ class _CardStudyPageState extends State<CardStudyPage>
     }
   }
 
+  String get _activeStudyStorageKey => isRangeCourse
+      ? widget.store.currentCourseKey(activeBookId!)
+      : widget.store.activeStudyKeyFor(
+          bookId: activeBookId,
+          sessionIndexes: activeSessionIndexes,
+          sessionSelections: activeSessionSelections,
+        );
+
+  void _onLearningStateMerged() {
+    _persistenceChain = _persistenceChain.then((_) async {
+      if (!mounted || exiting) return;
+      final latest = widget.store.getActiveStudyFor(_activeStudyStorageKey);
+      final latestAt = latest?.updatedAt;
+      if (latest == null ||
+          latestAt == null ||
+          (_activeStudyUpdatedAt != null &&
+              !latestAt.isAfter(_activeStudyUpdatedAt!))) return;
+      _applyMergedActiveStudy(latest);
+      unawaited(widget.store.cloudChanges
+          .recordDiagnostic('active_study_screen_refreshed_after_merge', data: {
+        'studyKey': _activeStudyStorageKey,
+        'updatedAt': latestAt.toIso8601String(),
+        'memorized': latest.memorized,
+        'queueCount': latest.queueIds.length,
+      }));
+    });
+  }
+
+  void _applyMergedActiveStudy(ActiveStudy latest) {
+    final latestQueue = widget.store.resolveActiveWords(latest);
+    if (latestQueue.isEmpty || !mounted) return;
+    setState(() {
+      queue
+        ..clear()
+        ..addAll(latestQueue);
+      memorized = latest.memorized.clamp(0, total);
+      reviewed
+        ..clear()
+        ..addAll(latest.reviewed);
+      seenWordIds
+        ..clear()
+        ..addAll(latest.seenWordIds);
+      revealed = latest.revealed;
+      lastState = latest.lastState;
+      lastWord = null;
+      if (latest.lastWordId != null) {
+        final sourceBooks = latest.lastWordBookId == null
+            ? widget.store.books
+            : widget.store.books
+                .where((book) => book.id == latest.lastWordBookId);
+        lastWord = sourceBooks
+            .expand((book) => book.words)
+            .where((word) => word.id == latest.lastWordId)
+            .firstOrNull;
+      }
+      undoHistory
+        ..clear()
+        ..addAll(latest.undoHistory);
+      _activeStudyUpdatedAt = latest.updatedAt;
+    });
+  }
+
   Future<void> persistStudy() async {
     if (queue.isEmpty || exiting) return;
-    final key = isRangeCourse
-        ? widget.store.currentCourseKey(activeBookId!)
-        : widget.store.activeStudyKeyFor(
-            bookId: activeBookId,
-            sessionIndexes: activeSessionIndexes,
-            sessionSelections: activeSessionSelections,
-          );
-    await widget.store.saveActiveStudyFor(
+    final key = _activeStudyStorageKey;
+    final saved = await widget.store.saveActiveStudyFor(
         key,
         ActiveStudy(
           queueIds: queue.map((word) => word.id).toList(),
@@ -2005,7 +2076,13 @@ class _CardStudyPageState extends State<CardStudyPage>
           rangeStart: activeRangeStart,
           rangeEnd: activeRangeEnd,
           sourceMode: activeSourceMode,
-        ));
+        ),
+        expectedUpdatedAt: _activeStudyUpdatedAt);
+    if (saved == null) {
+      _onLearningStateMerged();
+    } else {
+      _activeStudyUpdatedAt = saved.updatedAt;
+    }
   }
 
   String? _bookIdForWord(Word word) => _bookIdsByWord[word];
@@ -2309,12 +2386,18 @@ class _CardStudyPageState extends State<CardStudyPage>
     setState(() => revealed = shouldReveal);
     persistStudy();
     scheduleResumeSnapshotCapture('study');
-    if (shouldReveal) {
+    if (shouldReveal && _autoPlayPronunciation) {
       speakStudySpeechRequest(studySpeechRequestForWord(
         term: word.term,
         reading: word.reading,
       ));
     }
+  }
+
+  void _setAutoPlayPronunciation(bool value) {
+    if (_autoPlayPronunciation == value) return;
+    setState(() => _autoPlayPronunciation = value);
+    unawaited(widget.store.setAutoPlayPronunciation(value));
   }
 
   void showExplanation(Word word) {
@@ -2832,6 +2915,47 @@ class _CardStudyPageState extends State<CardStudyPage>
                           color: Color(0xFF8E8E93), fontSize: 11),
                     ),
                   ],
+                  const SizedBox(height: 4),
+                  Semantics(
+                    label: '발음 자동 재생',
+                    toggled: _autoPlayPronunciation,
+                    child: Container(
+                      padding: const EdgeInsets.only(left: 11, right: 4),
+                      decoration: BoxDecoration(
+                        color: _autoPlayPronunciation
+                            ? sea.withValues(alpha: .10)
+                            : const Color(0xFFF2F2F7),
+                        borderRadius: BorderRadius.circular(99),
+                      ),
+                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                        Icon(
+                          _autoPlayPronunciation
+                              ? Icons.volume_up_outlined
+                              : Icons.volume_off_outlined,
+                          size: 17,
+                          color: _autoPlayPronunciation
+                              ? sea
+                              : const Color(0xFF8E8E93),
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          '발음 자동 재생',
+                          style: TextStyle(
+                            color: _autoPlayPronunciation
+                                ? sea
+                                : const Color(0xFF6E6E73),
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        Switch.adaptive(
+                          key: const ValueKey('auto-pronunciation-toggle'),
+                          value: _autoPlayPronunciation,
+                          onChanged: _setAutoPlayPronunciation,
+                        ),
+                      ]),
+                    ),
+                  ),
                   const SizedBox(height: 8),
                   Row(children: [
                     if (!horizontalSwipe)
@@ -5839,10 +5963,12 @@ class _SettingsPageState extends State<SettingsPage> {
   var signingIn = false;
   var syncing = false;
   var exportingDiagnostics = false;
+  Map<String, String> _appInfo = const {};
 
   @override
   void initState() {
     super.initState();
+    unawaited(_loadAppInfo());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted &&
           firebaseReady &&
@@ -5851,6 +5977,11 @@ class _SettingsPageState extends State<SettingsPage> {
         _setupAutoBackupAfterLogin();
       }
     });
+  }
+
+  Future<void> _loadAppInfo() async {
+    final info = await _diagnosticAppInfo();
+    if (mounted) setState(() => _appInfo = info);
   }
 
   Future<void> signInWithGoogle() async {
@@ -6814,6 +6945,20 @@ class _SettingsPageState extends State<SettingsPage> {
                   style: TextStyle(
                       color: sea, fontSize: 12, fontWeight: FontWeight.w700)),
               onTap: editTarget,
+            ),
+            const Divider(height: 1),
+            ListTile(
+              key: const ValueKey('app-version-setting'),
+              dense: true,
+              leading: const Icon(Icons.info_outline, color: sea, size: 18),
+              title: const Text('앱 버전',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+              subtitle: Text(
+                _appInfo.isEmpty
+                    ? '확인 중…'
+                    : '${_appInfo['versionName'] ?? '알 수 없음'} (${_appInfo['versionCode'] ?? '?'})',
+                style: const TextStyle(color: Color(0xFF8E8E93), fontSize: 12),
+              ),
             ),
           ]),
         ),

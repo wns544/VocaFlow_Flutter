@@ -117,11 +117,13 @@ void main() {
     await store.setReadingAboveTerm(true);
     await store.setShowExamples(false);
     await store.setFlipCard(true);
+    await store.setAutoPlayPronunciation(false);
 
     final reloaded = await VocaStore.load();
     expect(reloaded.readingAboveTerm, isTrue);
     expect(reloaded.showExamples, isFalse);
     expect(reloaded.flipCard, isTrue);
+    expect(reloaded.autoPlayPronunciation, isFalse);
   });
 
   test('active study position persists', () async {

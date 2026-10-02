@@ -57,7 +57,9 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   bool get enabled => user != null && store.cloudChanges.isEnabled(user!.uid);
   bool get initialized =>
       user != null && store.cloudChanges.isInitialized(user!.uid);
-  int get pendingCount => store.cloudChanges.learningStateDirty ? 1 : 0;
+  int get pendingCount =>
+      (store.cloudChanges.learningStateDirty ? 1 : 0) +
+      (store.cloudChanges.managedBookContentDirty ? 1 : 0);
   DateTime? get lastSuccess =>
       user == null ? null : store.cloudChanges.lastSuccess(user!.uid);
   List<String> get logs => store.cloudChanges.logs;
@@ -128,6 +130,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     final hasCloud = await cloud.hasLearningState();
     if (hasCloud && choice == null) return;
     if (hasCloud) {
+      await _pullManagedBooks(reason: '초기 단어장 본문 가져오기');
       await store
           .applyLearningStateSnapshots(await cloud.downloadLearningStates());
     }
@@ -162,8 +165,19 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   Future<void> manualFullUpload() async {
     final current = user;
     if (current == null) throw StateError('Google login is required.');
+    if (_syncing) {
+      throw StateError('다른 동기화가 진행 중입니다. 잠시 후 다시 시도해 주세요.');
+    }
+    await store.cloudChanges.markAll({
+      for (final book in store.books.where((book) => book.id != 'default'))
+        book.id: book.words.map((word) => word.id),
+    });
     await store.cloudChanges.markLearningState();
     await _uploadPending(reason: '이 기기 데이터 내보내기');
+    if (store.cloudChanges.learningStateDirty ||
+        store.cloudChanges.managedBookContentDirty) {
+      throw StateError('클라우드 업로드가 완료되지 않았습니다. 네트워크를 확인한 뒤 다시 시도해 주세요.');
+    }
   }
 
   Future<void> manualRestore() async {
@@ -179,6 +193,9 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     if (!enabled || !initialized || _syncing) return;
     _syncing = true;
     try {
+      if (store.cloudChanges.managedBookContentDirty) {
+        await _sendManagedBookContent(reason: '$reason · 로컬 단어장 반영');
+      }
       await _pullLearningState(reason: reason, ownsGate: true);
       if (uploadMerged && store.cloudChanges.learningStateDirty) {
         await _sendLearningState(reason: '$reason · 병합 반영');
@@ -198,7 +215,8 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     if (_flushingForBackground ||
         _syncing ||
         !enabled ||
-        !store.cloudChanges.learningStateDirty) return;
+        (!store.cloudChanges.learningStateDirty &&
+            !store.cloudChanges.managedBookContentDirty)) return;
     _flushingForBackground = true;
     _cancelScheduledUpload();
     try {
@@ -219,7 +237,10 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
 
   void _handleTrackedChange() {
     onChanged?.call();
-    if (enabled && store.cloudChanges.learningStateDirty && !_syncing) {
+    if (enabled &&
+        (store.cloudChanges.learningStateDirty ||
+            store.cloudChanges.managedBookContentDirty) &&
+        !_syncing) {
       _schedule(idleDelay, reason: '학습 변경 후 대기');
     }
   }
@@ -232,7 +253,8 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   }) {
     if ((!isRetry && _syncing) ||
         !enabled ||
-        !store.cloudChanges.learningStateDirty) return;
+        (!store.cloudChanges.learningStateDirty &&
+            !store.cloudChanges.managedBookContentDirty)) return;
     final generation = store.cloudChanges.snapshot.learningStateGeneration;
     if (_timer != null &&
         _scheduledGeneration == generation &&
@@ -285,7 +307,10 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   }
 
   Future<void> _uploadPending({String reason = '자동 업로드'}) async {
-    if (_syncing || !enabled || !store.cloudChanges.learningStateDirty) return;
+    if (_syncing ||
+        !enabled ||
+        (!store.cloudChanges.learningStateDirty &&
+            !store.cloudChanges.managedBookContentDirty)) return;
     // This lock is intentionally set before checkConnectivity awaits.
     _syncing = true;
     final generationAtStart =
@@ -306,10 +331,15 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       if (!networkAllowed) {
         throw StateError('선택한 네트워크에 연결되어 있지 않습니다.');
       }
-      // Pull first. Each phone later writes only its own document, never a
-      // shared profile or another phone's snapshot.
+      // Send local content before pulling, so a newly imported book cannot be
+      // replaced by an older remote copy during this cycle.
+      if (store.cloudChanges.managedBookContentDirty) {
+        await _sendManagedBookContent(reason: reason);
+      }
       await _pullLearningState(reason: '$reason · 선행 병합', ownsGate: true);
-      await _sendLearningState(reason: reason);
+      if (store.cloudChanges.learningStateDirty) {
+        await _sendLearningState(reason: reason);
+      }
       _failureCount = 0;
       _failedGeneration = null;
       _retryBudgetExhausted = false;
@@ -319,7 +349,10 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     } finally {
       _syncing = false;
       final generationNow = store.cloudChanges.snapshot.learningStateGeneration;
-      if (!failed && enabled && store.cloudChanges.learningStateDirty) {
+      if (!failed &&
+          enabled &&
+          (store.cloudChanges.learningStateDirty ||
+              store.cloudChanges.managedBookContentDirty)) {
         _schedule(idleDelay, reason: '전송 중 새 학습 변경');
       } else if (failed && generationNow != generationAtStart) {
         // The failure retry remains authoritative. A subsequent user change,
@@ -347,6 +380,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       await store.cloudChanges.recordDiagnostic('sync_download_started', data: {
         'reason': reason,
       });
+      await _pullManagedBooks(reason: reason);
       final snapshots = await cloud.downloadLearningStates();
       await store.applyLearningStateSnapshots(snapshots);
       final current = user;
@@ -363,6 +397,49 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       _downloading = false;
       if (!ownsGate) _syncing = false;
     }
+  }
+
+  Future<void> _sendManagedBookContent({required String reason}) async {
+    if (!store.cloudChanges.managedBookContentDirty) return;
+    final current = user;
+    if (current == null) return;
+    final snapshot = store.cloudChanges.snapshot;
+    final bookIds = <String>{
+      ...snapshot.bookIds,
+      ...snapshot.wordIdsByBook.keys,
+      ...snapshot.deletedWordIdsByBook.keys,
+      ...snapshot.deletedBookIds,
+    }..remove('default');
+    await store.cloudChanges.recordLog(
+      '$reason · 단어장 본문 전송 시작 · ${bookIds.length}개 단어장',
+    );
+    await store.cloudChanges
+        .recordDiagnostic('managed_books_upload_started', data: {
+      'reason': reason,
+      'bookIds': bookIds.toList(),
+      'generation': snapshot.generation,
+    });
+    await cloud.uploadManagedBooks(store, snapshot);
+    await store.cloudChanges.acknowledgeManagedBookContent(snapshot);
+    await store.cloudChanges.recordSuccess(current.uid, _now());
+    _lastSuccessAt = _now();
+    await store.cloudChanges.recordLog('$reason · 단어장 본문 전송 완료');
+    await store.cloudChanges
+        .recordDiagnostic('managed_books_upload_succeeded', data: {
+      'reason': reason,
+      'bookIds': bookIds.toList(),
+    });
+  }
+
+  Future<void> _pullManagedBooks({required String reason}) async {
+    final remote = await cloud.downloadManagedBooks();
+    final changed = await store.mergeManagedBooks(remote);
+    await store.cloudChanges
+        .recordDiagnostic('managed_books_download_succeeded', data: {
+      'reason': reason,
+      'remoteBookCount': remote.length,
+      'mergedBookCount': changed,
+    });
   }
 
   Map<String, Object?> _learningStateMetrics() {

@@ -1,0 +1,26 @@
+{
+  "indexes": [],
+  "fieldOverrides": [
+    {
+      "collectionGroup": "words",
+      "fieldPath": "term",
+      "ttl": false,
+      "indexes": [
+        { "order": "ASCENDING", "queryScope": "COLLECTION" },
+        { "order": "DESCENDING", "queryScope": "COLLECTION" },
+        { "arrayConfig": "CONTAINS", "queryScope": "COLLECTION" },
+        { "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" }
+      ]
+    },
+    {
+      "collectionGroup": "learningState",
+      "fieldPath": "payload",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "managedBooks",
+      "fieldPath": "content",
+      "indexes": []
+    }
+  ]
+}

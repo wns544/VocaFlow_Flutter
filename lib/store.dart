@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'cloud_change_tracker.dart';
@@ -267,6 +268,7 @@ class VocaStore {
   static const _readingAboveTermKey = 'readingAboveTerm';
   static const _showExamplesKey = 'showExamples';
   static const _flipCardKey = 'flipCard';
+  static const _autoPlayPronunciationKey = 'autoPlayPronunciation';
   static const _activeStudyKey = 'activeStudy';
   static const _lastMainTabKey = 'lastMainTab';
   static const _mainTabMigrationKey = 'mainTabMigrationV2';
@@ -299,6 +301,10 @@ class VocaStore {
   Map<String, DateTime>? _activeStudyTombstonesCache;
   Map<String, DateTime>? _completedAtCache;
   Map<String, DateTime>? _resetMarkersCache;
+
+  /// Increments only after a complete dedicated learning-state merge.
+  /// Study routes listen to it so they never keep showing a stale queue.
+  final ValueNotifier<int> learningStateRevision = ValueNotifier<int>(0);
 
   static Future<VocaStore> load() async {
     final store = VocaStore._(await SharedPreferences.getInstance());
@@ -353,6 +359,8 @@ class VocaStore {
   bool get readingAboveTerm => _prefs.getBool(_readingAboveTermKey) ?? false;
   bool get showExamples => _prefs.getBool(_showExamplesKey) ?? true;
   bool get flipCard => _prefs.getBool(_flipCardKey) ?? false;
+  bool get autoPlayPronunciation =>
+      _prefs.getBool(_autoPlayPronunciationKey) ?? true;
   String get japaneseFont => _prefs.getString(_japaneseFontKey) ?? 'system';
   double get termFontSize => _prefs.getDouble(_termFontSizeKey) ?? 32;
   double get readingFontSize => _prefs.getDouble(_readingFontSizeKey) ?? 14;
@@ -785,8 +793,8 @@ class VocaStore {
     return latest;
   }
 
-  Future<void> saveActiveStudyFor(String key, ActiveStudy active,
-      {bool markCloudChange = true}) async {
+  Future<ActiveStudy?> saveActiveStudyFor(String key, ActiveStudy active,
+      {bool markCloudChange = true, DateTime? expectedUpdatedAt}) async {
     final studies = Map<String, ActiveStudy>.from(activeStudies);
     final resolvedKey = active.isRangeCourse && active.bookId != null
         ? currentCourseKey(active.bookId!)
@@ -796,6 +804,19 @@ class VocaStore {
           study.bookId == active.bookId && study.isRangeCourse);
     }
     final previousActive = activeStudies[resolvedKey];
+    if (expectedUpdatedAt != null &&
+        previousActive?.updatedAt != null &&
+        previousActive!.updatedAt!.isAfter(expectedUpdatedAt)) {
+      unawaited(cloudChanges
+          .recordDiagnostic('active_study_save_rejected_stale', data: {
+        'studyKey': resolvedKey,
+        'expectedUpdatedAt': expectedUpdatedAt.toIso8601String(),
+        'storedUpdatedAt': previousActive.updatedAt!.toIso8601String(),
+        'memorizedAttempted': active.memorized,
+        'memorizedStored': previousActive.memorized,
+      }));
+      return null;
+    }
     final startedAt = active.startedAt ??
         previousActive?.startedAt ??
         previousActive?.updatedAt ??
@@ -855,6 +876,7 @@ class VocaStore {
       'lastWordId': updatedActive.lastWordId,
       'lastState': updatedActive.lastState?.name,
     }));
+    return updatedActive;
   }
 
   Future<void> _saveActiveStudies(Map<String, ActiveStudy> studies) {
@@ -1106,6 +1128,11 @@ class VocaStore {
     await cloudChanges.markProfile();
   }
 
+  Future<void> setAutoPlayPronunciation(bool value) async {
+    await _prefs.setBool(_autoPlayPronunciationKey, value);
+    await cloudChanges.markProfile();
+  }
+
   Future<void> setJapaneseFont(String value) async {
     const allowed = {'system', 'notoSerifJP', 'sourceHanSerifJP'};
     await _prefs.setString(
@@ -1349,6 +1376,67 @@ class VocaStore {
     if (deleted != null && id != 'default') {
       await cloudChanges.deleteBook(id, deleted.words.map((word) => word.id));
     }
+  }
+
+  /// Content-only data for the managedBooks sync channel. Study state is
+  /// deliberately excluded and continues to live in learningState.
+  Map<String, dynamic> toManagedBookJson(WordBook book) => {
+        'id': book.id,
+        'name': book.name,
+        'isFavorite': book.isFavorite,
+        'sessionOverrides': book.sessionOverrides.map(
+          (key, value) => MapEntry(key.toString(), value.toJson()),
+        ),
+        'words': book.words
+            .map((word) => {
+                  'id': word.id,
+                  'term': word.term,
+                  'meaning': word.meaning,
+                  'reading': word.reading,
+                  'example': word.example,
+                  'exampleMeaning': word.exampleMeaning,
+                  'explanation': word.explanation,
+                  'isFavorite': word.isFavorite,
+                  'favoriteUpdatedAt':
+                      word.favoriteUpdatedAt?.toIso8601String(),
+                })
+            .toList(),
+      };
+
+  /// Merges card content without replacing local study progress. The dedicated
+  /// learningState merge restores authoritative progress immediately after this.
+  Future<int> mergeManagedBooks(Iterable<Map<String, dynamic>> remote) async {
+    var changed = 0;
+    for (final document in remote) {
+      final content = document['content'];
+      if (content is! Map) continue;
+      final decoded = WordBook.fromJson(Map<String, dynamic>.from(content));
+      if (decoded.id == 'default') continue;
+      final index = books.indexWhere((book) => book.id == decoded.id);
+      if (index < 0) {
+        books.add(decoded);
+        changed++;
+        continue;
+      }
+      final local = books[index];
+      final states = <int, Word>{for (final word in local.words) word.id: word};
+      for (final word in decoded.words) {
+        final old = states[word.id];
+        if (old == null) continue;
+        word.state = old.state;
+        word.correctCount = old.correctCount;
+        word.wrongCount = old.wrongCount;
+        word.lastStudiedAt = old.lastStudiedAt;
+        word.lastWrongAt = old.lastWrongAt;
+      }
+      books[index] = decoded;
+      changed++;
+    }
+    if (changed > 0) {
+      await _saveBooks();
+      wordSearch.invalidate();
+    }
+    return changed;
   }
 
   Future<void> mark(
@@ -1648,6 +1736,7 @@ class VocaStore {
     await _saveActiveStudies(chosenStudies);
     await _saveActiveStudyTombstones(tombstones);
     await _saveResetMarkers(reset);
+    learningStateRevision.value++;
     unawaited(cloudChanges.recordDiagnostic('learning_state_merged', data: {
       'remoteSnapshotCount': remoteSnapshotCount,
       'completedSessionCount': completed.length,
@@ -1688,6 +1777,7 @@ class VocaStore {
         'readingAboveTerm': readingAboveTerm,
         'showExamples': showExamples,
         'flipCard': flipCard,
+        'autoPlayPronunciation': autoPlayPronunciation,
         'japaneseFont': japaneseFont,
         'cardFontSizes': {
           'term': termFontSize,
@@ -1782,6 +1872,8 @@ class VocaStore {
     await _prefs.setBool(
         _showExamplesKey, json['showExamples'] as bool? ?? true);
     await _prefs.setBool(_flipCardKey, json['flipCard'] as bool? ?? false);
+    await _prefs.setBool(_autoPlayPronunciationKey,
+        json['autoPlayPronunciation'] as bool? ?? true);
     await setJapaneseFont(json['japaneseFont'] as String? ?? 'system');
     final fontSizes =
         json['cardFontSizes'] as Map<String, dynamic>? ?? const {};

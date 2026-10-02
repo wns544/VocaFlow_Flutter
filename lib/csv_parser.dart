@@ -22,34 +22,48 @@ WordImportResult parseWordImportRows(List<List<String>> rows) {
   final dataRows = headerIndex < 0 ? rows : rows.skip(headerIndex + 1);
   final words = <Word>[];
   final relations = <ImportedWordRelation>[];
+  final cardIndexes = <(String, String, String, String, String, String), int>{};
+  final relationKeys = <(int, String)>{};
   for (final columns in dataRows) {
     if (columns.length < 3) continue;
     final term = _valueAt(columns, mapping?.term ?? 0);
     if ({'term', 'word', '단어'}.contains(term.toLowerCase())) continue;
-    var meaning = _valueAt(columns, mapping?.meaning ?? 1);
-    var reading = _valueAt(columns, mapping?.reading ?? 2);
-    if (mapping == null &&
-        _looksLikeReading(meaning) &&
-        !_looksLikeReading(reading)) {
-      final oldMeaning = meaning;
-      meaning = reading;
-      reading = oldMeaning;
-    }
-    if (term.isEmpty || meaning.isEmpty || reading.isEmpty) continue;
-    words.add(Word(
+    // Headerless imports have a deliberate, fixed column order:
+    // term / reading / meaning. Never remove blank cells or infer a column
+    // swap from the text itself; doing either can turn a Korean meaning into a
+    // pronunciation when the reading cell is blank.
+    final meaning = _valueAt(columns, mapping?.meaning ?? 2);
+    final rawReading = _valueAt(columns, mapping?.reading ?? 1);
+    final reading = _readingOrTerm(rawReading, term);
+    if (term.isEmpty || meaning.isEmpty) continue;
+    final word = Word(
       term: term,
       meaning: meaning,
       reading: reading,
       example: _valueAt(columns, mapping?.example ?? 3),
       exampleMeaning: _valueAt(columns, mapping?.exampleMeaning ?? 4),
       explanation: _valueAt(columns, mapping?.explanation ?? 5),
-    ));
+    );
+    // Preserve first occurrence order and distinct examples/explanations.
+    final key = (
+      term,
+      reading,
+      meaning,
+      word.example,
+      word.exampleMeaning,
+      word.explanation
+    );
+    final sourceIndex = cardIndexes.putIfAbsent(key, () {
+      words.add(word);
+      return words.length - 1;
+    });
     final relatedIndex = mapping?.relatedWords;
     if (relatedIndex != null) {
       for (final relatedTerm
           in _splitRelatedWords(_valueAt(columns, relatedIndex))) {
+        if (!relationKeys.add((sourceIndex, relatedTerm))) continue;
         relations.add(ImportedWordRelation(
-          sourceWordIndex: words.length - 1,
+          sourceWordIndex: sourceIndex,
           targetTerm: relatedTerm,
         ));
       }
@@ -61,10 +75,9 @@ WordImportResult parseWordImportRows(List<List<String>> rows) {
 String _valueAt(List<String> columns, int index) =>
     index >= 0 && index < columns.length ? columns[index].trim() : '';
 
-bool _looksLikeReading(String value) {
-  final trimmed = value.trim();
-  if (RegExp(r'[\u3040-\u30ff]').hasMatch(trimmed)) return true;
-  return RegExp(r'(^[/\[].*[/\]]$)|[ˈˌɐ-ʯ]').hasMatch(trimmed);
+String _readingOrTerm(String rawReading, String term) {
+  final reading = rawReading.trim();
+  return reading.isEmpty || reading == 'ㆍ' ? term : reading;
 }
 
 class _ColumnMapping {

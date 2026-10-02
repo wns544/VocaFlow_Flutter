@@ -90,6 +90,25 @@ class CloudChangeTracker {
 
   int get pendingCount => snapshot.pendingCount;
   bool get learningStateDirty => _learningStateDirty;
+  bool get managedBookContentDirty =>
+      _bookIds.isNotEmpty ||
+      _wordIdsByBook.isNotEmpty ||
+      _deletedWordIdsByBook.isNotEmpty ||
+      _deletedBookIds.isNotEmpty;
+
+  /// Clears only book content after it reaches the dedicated managedBooks
+  /// collection. Profile and learning-state work remain queued separately.
+  Future<void> acknowledgeManagedBookContent(
+      CloudChangeSnapshot uploaded) async {
+    if (_generation != uploaded.generation) return;
+    _bookIds.clear();
+    _wordIdsByBook.clear();
+    _deletedWordIdsByBook.clear();
+    _deletedBookIds.clear();
+    _generation++;
+    await _persist();
+    onChanged?.call();
+  }
 
   /// Stable per-installation identity: each phone owns a separate remote
   /// learning-state document, so a stale phone cannot overwrite another.

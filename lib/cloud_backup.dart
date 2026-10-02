@@ -93,10 +93,13 @@ class CloudBackup {
   final FirebaseStorage storage;
 
   static const _operationTimeout = Duration(seconds: 90);
+  // A stalled learning-state stream must not keep the coordinator locked.
+  static const _learningStateOperationTimeout = Duration(seconds: 25);
 
-  Future<T> _runCloudOperation<T>(Future<T> Function() operation) async {
+  Future<T> _runCloudOperation<T>(Future<T> Function() operation,
+      {Duration? timeout}) async {
     try {
-      return await operation().timeout(_operationTimeout);
+      return await operation().timeout(timeout ?? _operationTimeout);
     } on FirebaseException catch (error) {
       if (error.code == 'resource-exhausted') {
         throw const CloudQuotaExceededException();
@@ -129,13 +132,81 @@ class CloudBackup {
   CollectionReference<Map<String, dynamic>> get _learningStatesRef =>
       firestore.collection('users').doc(_user.uid).collection('learningState');
 
+  /// Imported/user-authored card content. This deliberately never writes the
+  /// legacy vocabBooks/*/words documents.
+  CollectionReference<Map<String, dynamic>> get _managedBooksRef =>
+      firestore.collection('users').doc(_user.uid).collection('managedBooks');
+
+  Future<void> uploadManagedBooks(
+          VocaStore store, CloudChangeSnapshot changes) =>
+      _runCloudOperation(() async {
+        final touched = <String>{
+          ...changes.bookIds,
+          ...changes.wordIdsByBook.keys,
+          ...changes.deletedWordIdsByBook.keys,
+          ...changes.deletedBookIds,
+        }..remove('default');
+        if (touched.isEmpty) return;
+        final byId = {for (final book in store.books) book.id: book};
+        var batch = firestore.batch();
+        var count = 0;
+        Future<void> commit() async {
+          if (count == 0) return;
+          await batch.commit();
+          batch = firestore.batch();
+          count = 0;
+        }
+
+        for (final id in touched) {
+          final book = byId[id];
+          final ref = _managedBooksRef.doc(id);
+          if (book == null) {
+            batch.set(
+                ref,
+                {
+                  'schema': 1,
+                  'id': id,
+                  'deleted': true,
+                  'clientUpdatedAt': DateTime.now().toUtc().toIso8601String(),
+                  'updatedAt': FieldValue.serverTimestamp(),
+                },
+                SetOptions(merge: true));
+          } else {
+            batch.set(
+                ref,
+                {
+                  'schema': 1,
+                  'id': id,
+                  'deleted': false,
+                  'content': store.toManagedBookJson(book),
+                  'clientUpdatedAt': DateTime.now().toUtc().toIso8601String(),
+                  'updatedAt': FieldValue.serverTimestamp(),
+                },
+                SetOptions(merge: true));
+          }
+          count++;
+          if (count >= 400) await commit();
+        }
+        await commit();
+      });
+
+  Future<List<Map<String, dynamic>>> downloadManagedBooks() =>
+      _runCloudOperation(() async {
+        final snapshot =
+            await _managedBooksRef.where('deleted', isEqualTo: false).get();
+        return snapshot.docs
+            .map((doc) => Map<String, dynamic>.from(doc.data()))
+            .toList(growable: false);
+      });
+
   /// User-authored card relations live beside learningState, never inside
   /// vocabBooks/*/words. Existing card documents stay read-only.
   CollectionReference<Map<String, dynamic>> get _relationsRef =>
       firestore.collection('users').doc(_user.uid).collection('relations');
 
   Future<bool> hasLearningState() => _runCloudOperation(
-      () async => !(await _learningStatesRef.limit(1).get()).docs.isEmpty);
+      () async => !(await _learningStatesRef.limit(1).get()).docs.isEmpty,
+      timeout: _learningStateOperationTimeout);
 
   Future<void> uploadLearningState(
     VocaStore store,
@@ -151,7 +222,7 @@ class CloudBackup {
           'updatedAt': FieldValue.serverTimestamp(),
           'payload': store.toLearningStateJson(),
         }, SetOptions(merge: true));
-      });
+      }, timeout: _learningStateOperationTimeout);
 
   Future<List<Map<String, dynamic>>> downloadLearningStates() =>
       _runCloudOperation(() async {
@@ -161,12 +232,13 @@ class CloudBackup {
             .whereType<Map>()
             .map((payload) => Map<String, dynamic>.from(payload))
             .toList();
-      });
+      }, timeout: _learningStateOperationTimeout);
 
   Future<void> uploadRelation(Map<String, dynamic> relation) =>
       _runCloudOperation(() async {
         final id = relation['id'] as String?;
-        if (id == null || id.isEmpty) throw ArgumentError('Missing relation id');
+        if (id == null || id.isEmpty)
+          throw ArgumentError('Missing relation id');
         await _relationsRef.doc(id).set({
           ...relation,
           'serverUpdatedAt': FieldValue.serverTimestamp(),
@@ -180,6 +252,7 @@ class CloudBackup {
             .map((document) => Map<String, dynamic>.from(document.data()))
             .toList(growable: false);
       });
+
   /// Uploads an explicitly user-requested local diagnostic archive. It never
   /// reads or writes profile or vocabBooks/words documents.
   Future<String> uploadDiagnosticArchive(Uint8List archive,
@@ -402,6 +475,8 @@ class CloudBackup {
       'readingAboveTerm': profileData['readingAboveTerm'] as bool? ?? false,
       'showExamples': profileData['showExamples'] as bool? ?? true,
       'flipCard': profileData['flipCard'] as bool? ?? false,
+      'autoPlayPronunciation':
+          profileData['autoPlayPronunciation'] as bool? ?? true,
       'japaneseFont': profileData['japaneseFont'] as String? ?? 'system',
       'cardFontSizes': profileData['cardFontSizes'] as Map<String, dynamic>? ??
           <String, dynamic>{},
@@ -616,6 +691,7 @@ class CloudBackup {
         'readingAboveTerm': backup['readingAboveTerm'],
         'showExamples': backup['showExamples'],
         'flipCard': backup['flipCard'],
+        'autoPlayPronunciation': backup['autoPlayPronunciation'],
         'japaneseFont': backup['japaneseFont'],
         'cardFontSizes': backup['cardFontSizes'],
         'cardMeaningStyle': backup['cardMeaningStyle'],

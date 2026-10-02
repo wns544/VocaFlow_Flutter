@@ -82,21 +82,23 @@ void main() {
     expect(find.textContaining('즐겨찾기한 단어장이 없습니다.'), findsOneWidget);
   });
 
-  testWidgets('local UI does not wait for Firebase initialization',
+  testWidgets('startup waits for Firebase initialization before opening study',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({});
     final firebase = Completer<bool>();
 
     await tester
         .pumpWidget(VocaFlowApp(firebaseInitialization: firebase.future));
-    await tester.pumpAndSettle();
+    await tester.pump(const Duration(seconds: 1));
 
-    expect(find.text('오늘'), findsOneWidget);
+    expect(find.text('학습 기록 확인 중…'), findsOneWidget);
     expect(firebase.isCompleted, isFalse);
     firebase.complete(false);
+    await tester.pump(const Duration(milliseconds: 100));
     await tester.pump();
-  });
 
+    expect(find.text('오늘'), findsOneWidget);
+  });
   testWidgets('cold start restores the last main tab',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({'lastMainTab': 2});
