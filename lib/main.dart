@@ -124,6 +124,22 @@ bool shuffleNewStudyQueues = true;
 List<T> shuffledStudyQueue<T>(Iterable<T> items, {Random? random}) =>
     List<T>.of(items)..shuffle(random);
 
+List<T> shuffledNextRound<T>(Iterable<T> items, T? previousLast,
+    {Random? random}) {
+  final shuffled = shuffledStudyQueue(items, random: random);
+  if (shuffled.length <= 1 ||
+      previousLast == null ||
+      shuffled.first != previousLast) {
+    return shuffled;
+  }
+  final source = random ?? Random();
+  final replacement = 1 + source.nextInt(shuffled.length - 1);
+  final first = shuffled.first;
+  shuffled[0] = shuffled[replacement];
+  shuffled[replacement] = first;
+  return shuffled;
+}
+
 double _lerpDouble(num start, num end, double progress) =>
     start + (end - start) * progress.clamp(0.0, 1.0);
 
@@ -1798,6 +1814,7 @@ class _CardStudyPageState extends State<CardStudyPage>
   late final int total;
   late final Map<Word, String> _bookIdsByWord;
   final reviewed = <String>{};
+  final roundUnknown = <Word>[];
   final seenWordIds = <int>{};
   final _primaryDrag = ValueNotifier<double>(0);
   final _keyboardFocusNode = FocusNode(debugLabel: 'study-keyboard');
@@ -2304,14 +2321,7 @@ class _CardStudyPageState extends State<CardStudyPage>
       memorized++;
     } else {
       reviewed.add(word.term);
-      if (queue.isNotEmpty) {
-        final freshCards = queue
-            .where((candidate) => !seenWordIds.contains(candidate.id))
-            .length;
-        final insertAt =
-            reviewReinsertIndex(queue.length, freshCards: freshCards);
-        queue.insert(insertAt, word);
-      }
+      roundUnknown.add(word);
     }
     word.state = state;
     revealed = false;
@@ -2326,33 +2336,70 @@ class _CardStudyPageState extends State<CardStudyPage>
               bookId: _bookIdForWord(word),
               sessionIndexes: _sessionIndexesForWord(word),
             ));
-        if (isRangeCourse) {
-          await widget.store.completeRangeCourse(
-              activeBookId!, activeRangeStart!, activeRangeEnd!);
-        } else if (activeSessionSelections.isNotEmpty) {
-          for (final selection in activeSessionSelections.entries) {
-            await widget.store.completeSessions(selection.key, selection.value);
-          }
-        } else {
-          await widget.store.completeCurrentSession();
-        }
-        final key = widget.store.activeStudyKeyFor(
-          bookId: activeBookId,
-          sessionIndexes: activeSessionIndexes,
-          sessionSelections: activeSessionSelections,
-        );
-        await widget.store.clearActiveStudyFor(key);
-        completionValidated = true;
-        if (mounted) setState(() {});
-        unawaited(deleteResumeSnapshot());
-        AutoBackupCoordinator.activeInstance
-            ?.requestImmediateBackup(ignoreMinimumInterval: true);
+        await _finishRound();
       });
     } else {
       _scheduleDecisionPersistence(word, state);
     }
     if (mounted) setState(() {});
     scheduleResumeSnapshotCapture('study');
+  }
+
+  Future<void> _finishRound() async {
+    if (roundUnknown.isNotEmpty) {
+      final remaining = List<Word>.of(roundUnknown);
+      queue.addAll(shuffledNextRound(remaining, lastWord));
+      roundUnknown.clear();
+      seenWordIds.clear();
+      undoHistory.clear();
+      lastWord = null;
+      lastState = null;
+      revealed = false;
+      await persistStudy();
+      finishingStudy = false;
+      if (mounted) setState(() {});
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => AlertDialog(
+          icon: const Icon(Icons.refresh_rounded, color: sea, size: 32),
+          title: const Text('한 바퀴를 끝냈어요'),
+          content: Text(
+            '${remaining.length}개 단어가 남았습니다.\n순서를 섞어 다시 확인해 볼까요?',
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('다시 테스트'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+
+    if (isRangeCourse) {
+      await widget.store.completeRangeCourse(
+          activeBookId!, activeRangeStart!, activeRangeEnd!);
+    } else if (activeSessionSelections.isNotEmpty) {
+      for (final selection in activeSessionSelections.entries) {
+        await widget.store.completeSessions(selection.key, selection.value);
+      }
+    } else {
+      await widget.store.completeCurrentSession();
+    }
+    final key = widget.store.activeStudyKeyFor(
+      bookId: activeBookId,
+      sessionIndexes: activeSessionIndexes,
+      sessionSelections: activeSessionSelections,
+    );
+    await widget.store.clearActiveStudyFor(key);
+    completionValidated = true;
+    if (mounted) setState(() {});
+    unawaited(deleteResumeSnapshot());
+    AutoBackupCoordinator.activeInstance
+        ?.requestImmediateBackup(ignoreMinimumInterval: true);
   }
 
   Future<void> toggleFavorite(Word word) async {

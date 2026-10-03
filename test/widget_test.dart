@@ -107,6 +107,16 @@ void main() {
     expect(shuffled, isNot(orderedEquals(original)));
   });
 
+  test('next round does not reopen with its previous final card', () {
+    final cards = [1, 2, 3, 4];
+    for (var seed = 0; seed < 100; seed++) {
+      final shuffled = shuffledNextRound(cards, 1, random: Random(seed));
+      expect(shuffled.toSet(), cards.toSet());
+      expect(shuffled.first, isNot(1));
+    }
+    expect(shuffledNextRound([1], 1, random: Random(1)), [1]);
+  });
+
   testWidgets('home screen loads', (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({});
     await tester.pumpWidget(const VocaFlowApp());
@@ -345,7 +355,7 @@ void main() {
     expect(decisions, [StudyState.memorized]);
   });
 
-  testWidgets('the final review card finishes instead of reinserting forever',
+  testWidgets('a completed round shuffles unknown cards into the next round',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();
@@ -367,8 +377,12 @@ void main() {
     await gesture.up();
     await tester.pumpAndSettle();
 
-    expect(find.text('카드 학습 완료'), findsOneWidget);
-    expect(find.text('final'), findsNothing);
+    expect(find.text('한 바퀴를 끝냈어요'), findsOneWidget);
+    expect(find.textContaining('1개 단어가 남았습니다'), findsOneWidget);
+    expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
+    await tester.tap(find.text('다시 테스트'));
+    await tester.pumpAndSettle();
+    expect(find.text('final'), findsOneWidget);
     expect(decisions, [StudyState.review]);
   });
 
