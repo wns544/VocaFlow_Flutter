@@ -1816,6 +1816,9 @@ class _CardStudyPageState extends State<CardStudyPage>
   final reviewed = <String>{};
   final roundUnknown = <Word>[];
   final seenWordIds = <int>{};
+  late int roundTotal;
+  var roundNumber = 1;
+  var roundCompleted = 0;
   final _primaryDrag = ValueNotifier<double>(0);
   final _keyboardFocusNode = FocusNode(debugLabel: 'study-keyboard');
   Future<void> _persistenceChain = Future<void>.value();
@@ -1967,6 +1970,7 @@ class _CardStudyPageState extends State<CardStudyPage>
           ? shuffledStudyQueue(words)
           : List<Word>.of(words);
       total = queue.length;
+      roundTotal = queue.length;
     } else {
       _activeStudyUpdatedAt = resume.updatedAt;
       queue = widget.store.resolveActiveWords(resume);
@@ -1979,6 +1983,11 @@ class _CardStudyPageState extends State<CardStudyPage>
       }
       reviewed.addAll(resume.reviewed);
       seenWordIds.addAll(resume.seenWordIds);
+      roundNumber = max(1, resume.roundNumber);
+      roundTotal = resume.roundTotal > 0 ? resume.roundTotal : queue.length;
+      roundCompleted = resume.roundCompleted.clamp(0, roundTotal);
+      roundUnknown.addAll(_resolveStoredWords(
+          resume.roundUnknownIds, resume.roundUnknownBookIds));
       revealed = resume.revealed;
       lastState = resume.lastState;
       undoHistory.addAll(resume.undoHistory);
@@ -2083,9 +2092,16 @@ class _CardStudyPageState extends State<CardStudyPage>
         ..clear()
         ..addAll(latestQueue);
       memorized = latest.memorized.clamp(0, total);
+      roundNumber = max(1, latest.roundNumber);
+      roundTotal = latest.roundTotal > 0 ? latest.roundTotal : queue.length;
+      roundCompleted = latest.roundCompleted.clamp(0, roundTotal);
       reviewed
         ..clear()
         ..addAll(latest.reviewed);
+      roundUnknown
+        ..clear()
+        ..addAll(_resolveStoredWords(
+            latest.roundUnknownIds, latest.roundUnknownBookIds));
       seenWordIds
         ..clear()
         ..addAll(latest.seenWordIds);
@@ -2127,6 +2143,12 @@ class _CardStudyPageState extends State<CardStudyPage>
           lastState: lastState,
           undoHistory: undoHistory,
           seenWordIds: seenWordIds.toList(),
+          roundNumber: roundNumber,
+          roundTotal: roundTotal,
+          roundCompleted: roundCompleted,
+          roundUnknownIds: roundUnknown.map((word) => word.id).toList(),
+          roundUnknownBookIds:
+              roundUnknown.map(_bookIdForWord).whereType<String>().toList(),
           sessionSelections: activeSessionSelections,
           lastWordBookId: lastWord == null ? null : _bookIdForWord(lastWord!),
           rangeStart: activeRangeStart,
@@ -2142,6 +2164,22 @@ class _CardStudyPageState extends State<CardStudyPage>
   }
 
   String? _bookIdForWord(Word word) => _bookIdsByWord[word];
+
+  List<Word> _resolveStoredWords(List<int> ids, List<String> bookIds) {
+    final resolved = <Word>[];
+    for (var index = 0; index < ids.length; index++) {
+      final bookId = index < bookIds.length ? bookIds[index] : null;
+      final sourceBooks = bookId == null
+          ? widget.store.books
+          : widget.store.books.where((book) => book.id == bookId);
+      final word = sourceBooks
+          .expand((book) => book.words)
+          .where((item) => item.id == ids[index])
+          .firstOrNull;
+      if (word != null) resolved.add(word);
+    }
+    return resolved;
+  }
 
   List<int> _sessionIndexesForWord(Word word) {
     final bookId = _bookIdForWord(word);
@@ -2308,6 +2346,7 @@ class _CardStudyPageState extends State<CardStudyPage>
     if (queue.isEmpty) return;
     final word = queue.removeAt(0);
     seenWordIds.add(word.id);
+    roundCompleted = min(roundCompleted + 1, roundTotal);
     final previousState = word.state;
     lastWord = word;
     lastState = state;
@@ -2348,8 +2387,12 @@ class _CardStudyPageState extends State<CardStudyPage>
   Future<void> _finishRound() async {
     if (roundUnknown.isNotEmpty) {
       final remaining = List<Word>.of(roundUnknown);
+      final finishedRound = roundNumber;
       queue.addAll(shuffledNextRound(remaining, lastWord));
       roundUnknown.clear();
+      roundNumber++;
+      roundTotal = queue.length;
+      roundCompleted = 0;
       seenWordIds.clear();
       undoHistory.clear();
       lastWord = null;
@@ -2364,14 +2407,14 @@ class _CardStudyPageState extends State<CardStudyPage>
         barrierDismissible: false,
         builder: (context) => AlertDialog(
           icon: const Icon(Icons.refresh_rounded, color: sea, size: 32),
-          title: const Text('한 바퀴를 끝냈어요'),
+          title: Text('$finishedRound바퀴 완료'),
           content: Text(
-            '${remaining.length}개 단어가 남았습니다.\n순서를 섞어 다시 확인해 볼까요?',
+            '보류 ${remaining.length}개를 순서를 섞어\n${roundNumber}바퀴로 이어갑니다.',
           ),
           actions: [
             FilledButton(
               onPressed: () => Navigator.pop(context),
-              child: const Text('다시 테스트'),
+              child: Text('${roundNumber}바퀴 시작'),
             ),
           ],
         ),
@@ -2717,10 +2760,15 @@ class _CardStudyPageState extends State<CardStudyPage>
       seenWordIds.remove(word.id);
     }
     if (undone.decision == StudyState.memorized) memorized--;
+    if (roundCompleted > 0) roundCompleted--;
     if (undone.decision == StudyState.review &&
         !undoHistory.any((item) =>
             item.wordId == word.id && item.decision == StudyState.review)) {
       reviewed.remove(word.term);
+    }
+    if (undone.decision == StudyState.review) {
+      roundUnknown.removeWhere((item) =>
+          item.id == word.id && _bookIdForWord(item) == undone.bookId);
     }
     await widget.store.mark(word, undone.previousState, recordAttempt: false);
     final previous = undoHistory.lastOrNull;
@@ -2827,7 +2875,7 @@ class _CardStudyPageState extends State<CardStudyPage>
                               overflow: TextOverflow.ellipsis,
                               style: const TextStyle(
                                   color: Color(0xFF8E8E93), fontSize: 12)),
-                          Text('${queue.length}개 남음',
+                          Text('$roundNumber바퀴 · $roundCompleted / $roundTotal',
                               style: const TextStyle(
                                   color: ink,
                                   fontSize: 14,
@@ -2851,7 +2899,8 @@ class _CardStudyPageState extends State<CardStudyPage>
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 14),
                     child: LinearProgressIndicator(
-                        value: total == 0 ? 0 : memorized / total,
+                        value:
+                            roundTotal == 0 ? 0 : roundCompleted / roundTotal,
                         minHeight: 9,
                         borderRadius: BorderRadius.circular(99),
                         backgroundColor: const Color(0xFFE5E5EA)),
@@ -2860,10 +2909,14 @@ class _CardStudyPageState extends State<CardStudyPage>
                   Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        Text('$memorized 외움',
-                            style: const TextStyle(
-                                color: Color(0xFF8E8E93), fontSize: 11)),
-                        Text('$total 전체',
+                        Text('보류 ${roundUnknown.length}개',
+                            style: TextStyle(
+                                color: roundUnknown.isEmpty
+                                    ? const Color(0xFF8E8E93)
+                                    : coral,
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700)),
+                        Text('이번 바퀴',
                             style: const TextStyle(
                                 color: Color(0xFF8E8E93), fontSize: 11)),
                       ]),

@@ -377,12 +377,13 @@ void main() {
     await gesture.up();
     await tester.pumpAndSettle();
 
-    expect(find.text('한 바퀴를 끝냈어요'), findsOneWidget);
-    expect(find.textContaining('1개 단어가 남았습니다'), findsOneWidget);
+    expect(find.text('1바퀴 완료'), findsOneWidget);
+    expect(find.textContaining('보류 1개'), findsOneWidget);
     expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
-    await tester.tap(find.text('다시 테스트'));
+    await tester.tap(find.text('2바퀴 시작'));
     await tester.pumpAndSettle();
     expect(find.text('final'), findsOneWidget);
+    expect(find.text('2바퀴 · 0 / 1'), findsOneWidget);
     expect(decisions, [StudyState.review]);
   });
 
@@ -503,7 +504,7 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('start-multi-session-study')));
     await tester.pumpAndSettle();
 
-    expect(find.textContaining('개 남음'), findsOneWidget);
+    expect(find.textContaining('1바퀴 · 0 /'), findsOneWidget);
     expect(find.textContaining('단어 1~10 + 단어 11~'), findsOneWidget);
   });
 

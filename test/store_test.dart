@@ -49,6 +49,31 @@ void main() {
     SharedPreferences.setMockInitialValues({});
   });
 
+  test('active study persists current round progress and held cards', () {
+    final active = ActiveStudy(
+      queueIds: const [3, 4],
+      queueBookIds: const ['book-a', 'book-a'],
+      total: 10,
+      memorized: 4,
+      reviewed: const ['보류'],
+      revealed: false,
+      sessionIndexes: const [],
+      roundNumber: 2,
+      roundTotal: 6,
+      roundCompleted: 4,
+      roundUnknownIds: const [8, 9],
+      roundUnknownBookIds: const ['book-a', 'book-b'],
+    );
+
+    final restored = ActiveStudy.fromJson(active.toJson());
+
+    expect(restored.roundNumber, 2);
+    expect(restored.roundTotal, 6);
+    expect(restored.roundCompleted, 4);
+    expect(restored.roundUnknownIds, [8, 9]);
+    expect(restored.roundUnknownBookIds, ['book-a', 'book-b']);
+  });
+
   test('book sorting and custom order persist', () async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();

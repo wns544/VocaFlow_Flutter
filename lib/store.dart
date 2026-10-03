@@ -23,6 +23,11 @@ class ActiveStudy {
     this.lastState,
     this.undoHistory = const [],
     this.seenWordIds = const [],
+    this.roundNumber = 1,
+    this.roundTotal = 0,
+    this.roundCompleted = 0,
+    this.roundUnknownIds = const [],
+    this.roundUnknownBookIds = const [],
     this.sessionSelections = const {},
     this.lastWordBookId,
     this.startedAt,
@@ -45,6 +50,11 @@ class ActiveStudy {
   final StudyState? lastState;
   final List<StudyDecision> undoHistory;
   final List<int> seenWordIds;
+  final int roundNumber;
+  final int roundTotal;
+  final int roundCompleted;
+  final List<int> roundUnknownIds;
+  final List<String> roundUnknownBookIds;
   final Map<String, List<int>> sessionSelections;
   final String? lastWordBookId;
   final DateTime? startedAt;
@@ -70,6 +80,11 @@ class ActiveStudy {
         'lastState': lastState?.name,
         'undoHistory': undoHistory.map((item) => item.toJson()).toList(),
         'seenWordIds': seenWordIds,
+        'roundNumber': roundNumber,
+        'roundTotal': roundTotal,
+        'roundCompleted': roundCompleted,
+        'roundUnknownIds': roundUnknownIds,
+        'roundUnknownBookIds': roundUnknownBookIds,
         'sessionSelections': sessionSelections,
         'lastWordBookId': lastWordBookId,
         'startedAt':
@@ -102,6 +117,15 @@ class ActiveStudy {
         seenWordIds: (json['seenWordIds'] as List<dynamic>? ?? [])
             .map((item) => (item as num).toInt())
             .toList(),
+        roundNumber: (json['roundNumber'] as num?)?.toInt() ?? 1,
+        roundTotal: (json['roundTotal'] as num?)?.toInt() ?? 0,
+        roundCompleted: (json['roundCompleted'] as num?)?.toInt() ?? 0,
+        roundUnknownIds: (json['roundUnknownIds'] as List<dynamic>? ?? [])
+            .map((item) => (item as num).toInt())
+            .toList(),
+        roundUnknownBookIds:
+            (json['roundUnknownBookIds'] as List<dynamic>? ?? [])
+                .cast<String>(),
         sessionSelections:
             (json['sessionSelections'] as Map<String, dynamic>? ?? {}).map(
           (key, value) => MapEntry(
