@@ -30,7 +30,8 @@ void main() {
     expect(snapshot.wordIdsByBook['book-a'], isNot(contains(1)));
   });
 
-  test('later edits keep the pending journal newer than an in-flight upload', () async {
+  test('later edits keep the pending journal newer than an in-flight upload',
+      () async {
     final tracker = await CloudChangeTracker.load();
 
     await tracker.markProfile();
@@ -169,7 +170,7 @@ void main() {
         containsPair('session:same:0', '2026-06-28T10:00:00.000'));
   });
 
-  test('merge keeps the more advanced active study for the same session', () {
+  test('merge keeps the most recent active study for the same session', () {
     final cloud = _backup(
       [
         _book('same', 'JLPT', [_word(1, 'cloud')])
@@ -208,8 +209,8 @@ void main() {
     final merged = mergeBackupJson(cloud: cloud, local: local);
     final active = (merged['activeStudies'] as Map)['same:[0]'] as Map;
 
-    expect(active['memorized'], 4);
-    expect(active['queueIds'], [5]);
+    expect(active['memorized'], 2);
+    expect(active['queueIds'], [3, 4, 5]);
   });
 
   test('merge drops an active study deleted after it started', () {

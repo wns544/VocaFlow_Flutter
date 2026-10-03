@@ -35,6 +35,7 @@ const ink = Color(0xFF1C1C1E);
 const sea = Color(0xFF34C759);
 const mist = Color(0xFFF2F2F7);
 const coral = Color(0xFFFF3B30);
+const favoriteYellow = Color(0xFFFFB800);
 const flutterSplashMinimumDuration = Duration(milliseconds: 900);
 const resumeSnapshotChannel = MethodChannel('com.vocaflow.app/resume_snapshot');
 const navigationDiagnosticChannel =
@@ -43,6 +44,30 @@ final defaultKanjiLookupService = KanjiLookupService();
 final resumeSnapshotNavigatorObserver = _ResumeSnapshotNavigatorObserver();
 final resumeRouteObserver = RouteObserver<ModalRoute<dynamic>>();
 final navigationRouteObserver = _NavigationRouteObserver();
+
+class FavoriteStarIcon extends StatelessWidget {
+  const FavoriteStarIcon({super.key, required this.selected, this.size = 22});
+
+  final bool selected;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) => AnimatedSwitcher(
+        duration: const Duration(milliseconds: 180),
+        switchInCurve: Curves.easeOutBack,
+        switchOutCurve: Curves.easeIn,
+        transitionBuilder: (child, animation) => ScaleTransition(
+          scale: Tween<double>(begin: .72, end: 1).animate(animation),
+          child: child,
+        ),
+        child: Icon(
+          selected ? Icons.star : Icons.star_border,
+          key: ValueKey(selected),
+          size: size,
+          color: selected ? favoriteYellow : const Color(0xFF8E8E93),
+        ),
+      );
+}
 
 void vocaBackLog(String message) {
   debugPrint('VOCABACK $message');
@@ -868,6 +893,11 @@ class _ReferenceHomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
+    final activeNext = widget.store.activeStudy;
+    final resumeBook = widget.store.books
+        .where((item) => item.id == activeNext?.bookId)
+        .firstOrNull;
+    final book = resumeBook ?? this.book;
     final memorized =
         book.words.where((word) => word.state == StudyState.memorized).length;
     final reviewWords =
@@ -883,7 +913,6 @@ class _ReferenceHomePageState extends State<HomePage> {
     final favoriteBooks =
         widget.store.books.where((item) => item.isFavorite).toList();
 
-    final activeNext = widget.store.activeCourseForBook(book.id);
     final cumulativeCourses = cumulativeStudyCourses(book.words.length);
     StudyCourse? suggestedCourse;
     for (final course in cumulativeCourses) {
@@ -895,11 +924,14 @@ class _ReferenceHomePageState extends State<HomePage> {
     }
     suggestedCourse ??=
         cumulativeCourses.isEmpty ? null : cumulativeCourses.last;
-    final progress = book.words.isEmpty ? 0.0 : memorized / book.words.length;
-    final progressPercent = book.words.isEmpty ? 0 : (progress * 100).round();
+    final progressTotal = activeNext?.total ?? book.words.length;
+    final progressCount = activeNext?.memorized ?? memorized;
+    final progress = progressTotal == 0
+        ? 0.0
+        : (progressCount / progressTotal).clamp(0.0, 1.0);
+    final progressPercent = (progress * 100).round();
     final canStudy = book.words.isNotEmpty;
     Future<void> openNextStudy() async {
-      if (!canStudy) return;
       if (activeNext != null) {
         await Navigator.of(context).push(MaterialPageRoute(
           builder: (_) =>
@@ -994,10 +1026,12 @@ class _ReferenceHomePageState extends State<HomePage> {
                   _MorphingStudySummary(
                     key: const ValueKey('home-study-summary-morph'),
                     collapseProgress: collapseProgress,
-                    bookName: book.name,
+                    bookName: activeNext != null && resumeBook == null
+                        ? '여러 단어장'
+                        : book.name,
                     progress: progress,
                     progressPercent: progressPercent,
-                    progressLabel: '$memorized/${book.words.length} 외움',
+                    progressLabel: '$progressCount/$progressTotal 외움',
                   ),
                   SizedBox(height: _lerpDouble(8, 6, collapseProgress)),
                   _HomeActionSegmentBar(
@@ -1019,11 +1053,15 @@ class _ReferenceHomePageState extends State<HomePage> {
                         key: const ValueKey('home-action-study'),
                         icon: Icons.play_circle_outline,
                         iconColor: sea,
-                        label: activeNext != null ? '이어서' : '학습',
+                        label: activeNext != null ? '이어서 하기' : '학습',
                         value: activeNext != null
-                            ? '${activeNext.memorized}/${activeNext.total}'
+                            ? (activeNext.isRangeCourse
+                                ? 'No.${activeNext.rangeStart}~${activeNext.rangeEnd}'
+                                : '진행 중')
                             : suggestedCourse?.rangeLabel ?? 'No.-',
-                        onTap: canStudy ? openNextStudy : null,
+                        onTap: activeNext != null || canStudy
+                            ? openNextStudy
+                            : null,
                       ),
                       _HomeActionItem(
                         key: const ValueKey('home-action-wrong'),
@@ -2457,11 +2495,7 @@ class _CardStudyPageState extends State<CardStudyPage>
                 tooltip: '즐겨찾기',
                 visualDensity: VisualDensity.compact,
                 onPressed: () => toggleFavorite(word),
-                icon: Icon(
-                  word.isFavorite ? Icons.star : Icons.star_border,
-                  size: 22,
-                  color: word.isFavorite ? coral : const Color(0xFF8E8E93),
-                ),
+                icon: FavoriteStarIcon(selected: word.isFavorite),
               ),
             ),
           if (!back && word.explanation.trim().isNotEmpty) ...[
@@ -2518,6 +2552,7 @@ class _CardStudyPageState extends State<CardStudyPage>
                             fontWeight: FontWeight.w800),
                         onCharacterTap: (character) =>
                             showKanjiDetails(character, word),
+                        onTermTap: () => showKanjiDetails(word.term, word),
                         onCharacterDoubleTap: copyText,
                         onCharacterLongPress: copyText,
                       ),
@@ -3348,6 +3383,7 @@ class _TappableHanTerm extends StatelessWidget {
     required this.term,
     required this.style,
     required this.onCharacterTap,
+    required this.onTermTap,
     required this.onCharacterDoubleTap,
     required this.onCharacterLongPress,
   });
@@ -3355,12 +3391,29 @@ class _TappableHanTerm extends StatelessWidget {
   final String term;
   final TextStyle style;
   final ValueChanged<String> onCharacterTap;
+  final VoidCallback onTermTap;
   final ValueChanged<String> onCharacterDoubleTap;
   final ValueChanged<String> onCharacterLongPress;
 
   @override
   Widget build(BuildContext context) {
     final characters = term.runes.map(String.fromCharCode).toList();
+    final containsHan = characters.any(isHanCharacter);
+    if (!containsHan) {
+      return GestureDetector(
+        key: const ValueKey('open-kana-word-detail'),
+        behavior: HitTestBehavior.opaque,
+        onTap: onTermTap,
+        child: Text(
+          term,
+          key: const ValueKey('tappable-study-term'),
+          style: style,
+          textAlign: TextAlign.center,
+          maxLines: 1,
+          softWrap: false,
+        ),
+      );
+    }
     return Text.rich(
       key: const ValueKey('tappable-study-term'),
       TextSpan(
@@ -3409,10 +3462,14 @@ class _KanjiDetailSheet extends StatefulWidget {
 }
 
 class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
-  late final Future<KoreanHanjaEntry?> korean =
-      widget.service.lookupKorean(widget.character);
-  late final Future<JapaneseKanjiEntry?> japanese =
-      widget.service.lookupJapanese(widget.character);
+  bool get isKanjiDetail =>
+      widget.character.runes.map(String.fromCharCode).any(isHanCharacter);
+  late final Future<KoreanHanjaEntry?> korean = isKanjiDetail
+      ? widget.service.lookupKorean(widget.character)
+      : Future<KoreanHanjaEntry?>.value(null);
+  late final Future<JapaneseKanjiEntry?> japanese = isKanjiDetail
+      ? widget.service.lookupJapanese(widget.character)
+      : Future<JapaneseKanjiEntry?>.value(null);
 
   void showMessage(String message) {
     if (!mounted) return;
@@ -3531,7 +3588,9 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
             children: [
               Text(
                 widget.character,
-                key: const ValueKey('kanji-detail-character'),
+                key: ValueKey(isKanjiDetail
+                    ? 'kanji-detail-character'
+                    : 'kana-word-detail-term'),
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   color: ink,
@@ -3541,72 +3600,98 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
                 ),
               ),
               const SizedBox(height: 14),
-              FutureBuilder<KoreanHanjaEntry?>(
-                future: korean,
-                builder: (context, snapshot) => _KanjiInfoCard(
-                  title: '한국식 훈음',
-                  key: const ValueKey('korean-hanja-info'),
-                  child: snapshot.connectionState != ConnectionState.done
-                      ? const _InlineLoading()
-                      : snapshot.hasError
-                          ? const Text('한국 훈음 사전을 불러오지 못했습니다.')
-                          : Text(
-                              snapshot.data?.hunEum ?? '등록된 훈음이 없습니다.',
-                              style: const TextStyle(
-                                fontSize: 20,
-                                fontWeight: FontWeight.w700,
+              if (isKanjiDetail)
+                FutureBuilder<KoreanHanjaEntry?>(
+                  future: korean,
+                  builder: (context, snapshot) => _KanjiInfoCard(
+                    title: '한국식 훈음',
+                    key: const ValueKey('korean-hanja-info'),
+                    child: snapshot.connectionState != ConnectionState.done
+                        ? const _InlineLoading()
+                        : snapshot.hasError
+                            ? const Text('한국 훈음 사전을 불러오지 못했습니다.')
+                            : Text(
+                                snapshot.data?.hunEum ?? '등록된 훈음이 없습니다.',
+                                style: const TextStyle(
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.w700,
+                                ),
                               ),
-                            ),
+                  ),
                 ),
-              ),
-              const SizedBox(height: 10),
-              FutureBuilder<JapaneseKanjiEntry?>(
-                future: japanese,
-                builder: (context, snapshot) => _KanjiInfoCard(
-                  title: '일본어 정보',
-                  key: const ValueKey('japanese-kanji-info'),
-                  child: snapshot.connectionState != ConnectionState.done
-                      ? const _InlineLoading()
-                      : snapshot.hasError
-                          ? const Text('일본어 정보를 가져오지 못했습니다. 네트워크를 확인해 주세요.')
-                          : _JapaneseKanjiDetails(entry: snapshot.data),
+              if (isKanjiDetail) const SizedBox(height: 10),
+              if (isKanjiDetail)
+                FutureBuilder<JapaneseKanjiEntry?>(
+                  future: japanese,
+                  builder: (context, snapshot) => _KanjiInfoCard(
+                    title: '일본어 정보',
+                    key: const ValueKey('japanese-kanji-info'),
+                    child: snapshot.connectionState != ConnectionState.done
+                        ? const _InlineLoading()
+                        : snapshot.hasError
+                            ? const Text('일본어 정보를 가져오지 못했습니다. 네트워크를 확인해 주세요.')
+                            : _JapaneseKanjiDetails(entry: snapshot.data),
+                  ),
                 ),
-              ),
+              if (!isKanjiDetail) ...[
+                _KanjiInfoCard(
+                  title: '발음',
+                  child: Text(widget.word.reading,
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontFamily: japaneseFontFamily(widget.store),
+                        fontWeight: FontWeight.w700,
+                      )),
+                ),
+                const SizedBox(height: 10),
+                _KanjiInfoCard(
+                  title: '뜻',
+                  child: Text(widget.word.meaning,
+                      style: const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.w700,
+                      )),
+                ),
+              ],
               const SizedBox(height: 14),
               OutlinedButton.icon(
                 key: const ValueKey('copy-kanji-detail'),
                 onPressed: copyCharacter,
                 icon: const Icon(Icons.copy_outlined, size: 18),
-                label: const Text('한자 복사'),
+                label: Text(isKanjiDetail ? '한자 복사' : '단어 복사'),
               ),
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
-                key: const ValueKey('open-tonghanja'),
-                onPressed: openTongHanja,
-                icon: const Icon(Icons.travel_explore_outlined, size: 19),
-                label: const Text('통용한자에서 바로 검색'),
-              ),
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
-                key: const ValueKey('open-nihongokanji'),
-                onPressed: openNihongoKanji,
-                icon: const Icon(Icons.menu_book_outlined, size: 19),
-                label: const Text('일본어 한자 공부방에서 검색'),
-              ),
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
-                key: const ValueKey('open-naver-hanja'),
-                onPressed: openNaver,
-                icon: const Icon(Icons.search, size: 19),
-                label: const Text('네이버 한자사전에서 보기'),
-              ),
-              const SizedBox(height: 8),
-              FilledButton.icon(
-                key: const ValueKey('open-chatgpt-kanji'),
-                onPressed: openChatGpt,
-                icon: const Icon(Icons.forum_outlined, size: 18),
-                label: const Text('이 한자 ChatGPT에 질문'),
-              ),
+              if (isKanjiDetail) const SizedBox(height: 8),
+              if (isKanjiDetail)
+                OutlinedButton.icon(
+                  key: const ValueKey('open-tonghanja'),
+                  onPressed: openTongHanja,
+                  icon: const Icon(Icons.travel_explore_outlined, size: 19),
+                  label: const Text('통용한자에서 바로 검색'),
+                ),
+              if (isKanjiDetail) const SizedBox(height: 8),
+              if (isKanjiDetail)
+                OutlinedButton.icon(
+                  key: const ValueKey('open-nihongokanji'),
+                  onPressed: openNihongoKanji,
+                  icon: const Icon(Icons.menu_book_outlined, size: 19),
+                  label: const Text('일본어 한자 공부방에서 검색'),
+                ),
+              if (isKanjiDetail) const SizedBox(height: 8),
+              if (isKanjiDetail)
+                OutlinedButton.icon(
+                  key: const ValueKey('open-naver-hanja'),
+                  onPressed: openNaver,
+                  icon: const Icon(Icons.search, size: 19),
+                  label: const Text('네이버 한자사전에서 보기'),
+                ),
+              if (isKanjiDetail) const SizedBox(height: 8),
+              if (isKanjiDetail)
+                FilledButton.icon(
+                  key: const ValueKey('open-chatgpt-kanji'),
+                  onPressed: openChatGpt,
+                  icon: const Icon(Icons.forum_outlined, size: 18),
+                  label: const Text('이 한자 ChatGPT에 질문'),
+                ),
               const SizedBox(height: 8),
               FilledButton.icon(
                 key: const ValueKey('open-chatgpt-word'),
@@ -4050,12 +4135,15 @@ class LegacyBooksPage extends StatelessWidget {
                                       '“${book.name}”과(와) 해당 학습 기록이 모든 기기에서 삭제됩니다.\n\n삭제 전 상태는 계정의 단어장 복원 보관함에서 복원할 수 있습니다.'),
                                   actions: [
                                     TextButton(
-                                      onPressed: () => Navigator.pop(dialogContext, false),
+                                      onPressed: () =>
+                                          Navigator.pop(dialogContext, false),
                                       child: const Text('취소'),
                                     ),
                                     FilledButton(
-                                      style: FilledButton.styleFrom(backgroundColor: coral),
-                                      onPressed: () => Navigator.pop(dialogContext, true),
+                                      style: FilledButton.styleFrom(
+                                          backgroundColor: coral),
+                                      onPressed: () =>
+                                          Navigator.pop(dialogContext, true),
                                       child: const Text('삭제'),
                                     ),
                                   ],
@@ -4222,10 +4310,7 @@ class _DictionaryPageState extends State<DictionaryPage> {
                           ),
                           trailing: IconButton(
                             tooltip: word.isFavorite ? '즐겨찾기 해제' : '즐겨찾기',
-                            icon: Icon(
-                              word.isFavorite ? Icons.star : Icons.star_border,
-                              color: word.isFavorite ? coral : Colors.grey,
-                            ),
+                            icon: FavoriteStarIcon(selected: word.isFavorite),
                             onPressed: () => _toggle(word, book.id),
                           ),
                         ),
@@ -4319,8 +4404,7 @@ class _WordDetailSheetState extends State<_WordDetailSheet> {
               ),
               IconButton(
                 tooltip: word.isFavorite ? '즐겨찾기 해제' : '즐겨찾기',
-                icon: Icon(word.isFavorite ? Icons.star : Icons.star_border,
-                    color: word.isFavorite ? coral : Colors.grey),
+                icon: FavoriteStarIcon(selected: word.isFavorite),
                 onPressed: _toggleFavorite,
               ),
               IconButton(
@@ -4894,12 +4978,9 @@ class _BooksPageState extends State<BooksPage> {
                           constraints: const BoxConstraints.tightFor(
                               width: 38, height: 40),
                           onPressed: () => toggleFavorite(book),
-                          icon: Icon(
-                            book.isFavorite ? Icons.star : Icons.star_border,
+                          icon: FavoriteStarIcon(
+                            selected: book.isFavorite,
                             size: 21,
-                            color: book.isFavorite
-                                ? const Color(0xFFFFB800)
-                                : const Color(0xFF8E8E93),
                           ),
                         ),
                         AnimatedRotation(
@@ -6790,7 +6871,8 @@ class _SettingsPageState extends State<SettingsPage> {
                   height: 44,
                   child: OutlinedButton.icon(
                     key: const ValueKey('book-restore-archive'),
-                    onPressed: syncing || user == null ? null : _openRestoreArchive,
+                    onPressed:
+                        syncing || user == null ? null : _openRestoreArchive,
                     icon: const Icon(Icons.history_outlined, size: 18),
                     label: const Text('단어장 복원 보관함'),
                     style: OutlinedButton.styleFrom(
@@ -7344,16 +7426,20 @@ class _RestoreArchiveSheet extends StatelessWidget {
                               point.payload['book'] as Map? ?? const {});
                           final name = book['name']?.toString() ?? '이름 없는 단어장';
                           return ListTile(
-                            contentPadding: const EdgeInsets.symmetric(vertical: 5),
+                            contentPadding:
+                                const EdgeInsets.symmetric(vertical: 5),
                             leading: Icon(
                               point.kind == 'before_delete'
                                   ? Icons.delete_outline
                                   : Icons.history,
-                              color: point.kind == 'before_delete' ? coral : sea,
+                              color:
+                                  point.kind == 'before_delete' ? coral : sea,
                             ),
                             title: Text(name,
-                                maxLines: 1, overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(fontWeight: FontWeight.w700)),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.w700)),
                             subtitle: Text(
                               '${_kind(point.kind)} · ${point.createdAt.toLocal().toString().substring(0, 16)} · ${_size(point.utf8Bytes.length)}',
                               maxLines: 2,
@@ -7365,8 +7451,10 @@ class _RestoreArchiveSheet extends StatelessWidget {
                                 if (action == 'delete') await onDelete(point);
                               },
                               itemBuilder: (_) => const [
-                                PopupMenuItem(value: 'restore', child: Text('이 시점으로 복원')),
-                                PopupMenuItem(value: 'delete', child: Text('영구 삭제')),
+                                PopupMenuItem(
+                                    value: 'restore', child: Text('이 시점으로 복원')),
+                                PopupMenuItem(
+                                    value: 'delete', child: Text('영구 삭제')),
                               ],
                             ),
                           );

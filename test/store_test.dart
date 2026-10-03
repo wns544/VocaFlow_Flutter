@@ -6,6 +6,45 @@ import 'package:vocaflow/models.dart';
 import 'package:vocaflow/store.dart';
 
 void main() {
+  test('resume merge keeps newest queue even with lower memorized count',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final book = store.books.first;
+    final old = ActiveStudy(
+      queueIds: [book.words.last.id],
+      total: book.words.length,
+      memorized: book.words.length - 1,
+      reviewed: const [],
+      revealed: false,
+      sessionIndexes: const [],
+      bookId: book.id,
+      updatedAt: DateTime.utc(2026, 10, 1),
+    );
+    final recent = ActiveStudy(
+      queueIds: book.words.map((word) => word.id).toList(),
+      total: book.words.length,
+      memorized: 0,
+      reviewed: const [],
+      revealed: true,
+      sessionIndexes: const [],
+      bookId: book.id,
+      updatedAt: DateTime.utc(2026, 10, 2),
+    );
+    final key = store.activeStudyKey(old);
+    for (final snapshots in [
+      [old, recent],
+      [recent, old],
+    ]) {
+      await store.applyLearningStateSnapshots(snapshots.map((active) => {
+            'activeStudies': {key: active.toJson()},
+          }));
+      expect(store.activeStudy!.memorized, 0);
+      expect(store.activeStudy!.queueIds, recent.queueIds);
+      expect(store.activeStudy!.revealed, isTrue);
+    }
+  });
+
   setUp(() {
     SharedPreferences.setMockInitialValues({});
   });

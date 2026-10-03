@@ -297,6 +297,7 @@ class VocaStore {
   late CloudChangeTracker cloudChanges;
   late LocalWordSearchIndex wordSearch;
   void Function()? onSessionCompleted;
+
   /// Installed by the account-sync coordinator. It records a restoration
   /// point before a user edit or deletion changes this book locally.
   Future<void> Function(String bookId, String reason)? onBeforeBookMutation;
@@ -927,6 +928,10 @@ class VocaStore {
     ActiveStudy? latest;
     for (final active in studies.values) {
       if (isActiveStudyCompleted(active)) continue;
+      if (active.queueIds.isEmpty ||
+          resolveActiveWords(active).length != active.queueIds.length ||
+          (active.isRangeCourse &&
+              active.rangeCourseSchema < rangeCourseSchemaVersion)) continue;
       if (latest == null ||
           (active.updatedAt != null &&
               (latest.updatedAt == null ||
@@ -1328,7 +1333,8 @@ class VocaStore {
       } else if (value is double) {
         await _prefs.setDouble(key, value);
       } else if (value is List) {
-        await _prefs.setStringList(key, value.map((item) => item.toString()).toList());
+        await _prefs.setStringList(
+            key, value.map((item) => item.toString()).toList());
       }
     }
     books = _loadBooks();
@@ -1498,21 +1504,26 @@ class VocaStore {
     // A multi-book study queue belongs to more than one library. Restoring it
     // wholesale would reset another book, so only a dedicated single-book
     // study is part of this book-scoped recovery payload.
-    final active = Map<String, dynamic>.from(state['activeStudies'] as Map? ?? const {})
-      ..removeWhere((_, value) =>
-          value is! Map || value['bookId']?.toString() != bookId);
+    final active = Map<String, dynamic>.from(
+        state['activeStudies'] as Map? ?? const {})
+      ..removeWhere(
+          (_, value) => value is! Map || value['bookId']?.toString() != bookId);
     return {
       'schema': 1,
       'book': book.toJson(),
       'learning': {
-        'wordStates': {bookId: (state['wordStates'] as Map? ?? const {})[bookId]},
+        'wordStates': {
+          bookId: (state['wordStates'] as Map? ?? const {})[bookId]
+        },
         'completed': (state['completed'] as List? ?? const [])
-            .where((value) => value.toString().startsWith('$bookId:')).toList(),
+            .where((value) => value.toString().startsWith('$bookId:'))
+            .toList(),
         'completedAt': _mapEntriesForBook(state['completedAt'], keyForBook),
-        'rangeCoursePasses': _mapEntriesForBook(state['rangeCoursePasses'], keyForBook),
+        'rangeCoursePasses':
+            _mapEntriesForBook(state['rangeCoursePasses'], keyForBook),
         'activeStudies': active,
-        'activeStudyTombstones': _mapEntriesForBook(
-            state['activeStudyTombstones'], keyForBook),
+        'activeStudyTombstones':
+            _mapEntriesForBook(state['activeStudyTombstones'], keyForBook),
         'resetMarkers': _mapEntriesForBook(state['resetMarkers'], keyForBook),
         'studyEventLog': (state['studyEventLog'] as List? ?? const [])
             .where((value) => value is Map && value['bookId'] == bookId)
@@ -1550,11 +1561,14 @@ class VocaStore {
     } else {
       books[index] = restored;
     }
-    final learning = Map<String, dynamic>.from(payload['learning'] as Map? ?? const {});
+    final learning =
+        Map<String, dynamic>.from(payload['learning'] as Map? ?? const {});
     final id = restored.id;
     final completed = (_prefs.getStringList(_completedKey) ?? <String>[])
-        .where((key) => !key.startsWith('$id:')).toSet()
-      ..addAll((learning['completed'] as List? ?? const []).map((item) => item.toString()));
+        .where((key) => !key.startsWith('$id:'))
+        .toSet()
+      ..addAll((learning['completed'] as List? ?? const [])
+          .map((item) => item.toString()));
     final completedTimes = Map<String, DateTime>.from(completedAt)
       ..removeWhere((key, _) => key.contains(id));
     completedTimes.addAll(_datesFromMap(learning['completedAt']));
@@ -1562,11 +1576,14 @@ class VocaStore {
       ..removeWhere((key, _) => key.contains(id));
     passes.addAll(_intsFromMap(learning['rangeCoursePasses']));
     final active = Map<String, ActiveStudy>.from(activeStudies)
-      ..removeWhere((_, value) => _activeValueReferencesBook(value.toJson(), id));
+      ..removeWhere(
+          (_, value) => _activeValueReferencesBook(value.toJson(), id));
     final archiveActive = learning['activeStudies'];
     if (archiveActive is Map) {
       archiveActive.forEach((key, value) {
-        if (value is Map) active[key.toString()] = ActiveStudy.fromJson(Map<String, dynamic>.from(value));
+        if (value is Map)
+          active[key.toString()] =
+              ActiveStudy.fromJson(Map<String, dynamic>.from(value));
       });
     }
     final tombstones = Map<String, DateTime>.from(activeStudyTombstones)
@@ -1979,17 +1996,20 @@ class VocaStore {
     final chosenStudies = <String, ActiveStudy>{};
     activeCandidates.forEach((key, values) {
       values.sort((a, b) {
+        // A newer session or undo must not lose to older, higher progress.
+        final at =
+            asDate(a['updatedAt']) ?? DateTime.fromMillisecondsSinceEpoch(0);
+        final bt =
+            asDate(b['updatedAt']) ?? DateTime.fromMillisecondsSinceEpoch(0);
+        final recency = bt.compareTo(at);
+        if (recency != 0) return recency;
         final memorized = ((b['memorized'] as num?)?.toInt() ?? 0)
             .compareTo((a['memorized'] as num?)?.toInt() ?? 0);
         if (memorized != 0) return memorized;
         final queue = ((a['queueIds'] as List?)?.length ?? 999999)
             .compareTo((b['queueIds'] as List?)?.length ?? 999999);
         if (queue != 0) return queue;
-        final at =
-            asDate(a['updatedAt']) ?? DateTime.fromMillisecondsSinceEpoch(0);
-        final bt =
-            asDate(b['updatedAt']) ?? DateTime.fromMillisecondsSinceEpoch(0);
-        return bt.compareTo(at);
+        return jsonEncode(a).compareTo(jsonEncode(b));
       });
       final chosen = ActiveStudy.fromJson(values.first);
       final deletedAt = tombstones[key];
@@ -2235,7 +2255,8 @@ class VocaStore {
     }
   }
 
-  String _encodeBooks() => jsonEncode(books.map((book) => book.toJson()).toList());
+  String _encodeBooks() =>
+      jsonEncode(books.map((book) => book.toJson()).toList());
 
   Future<void> _saveBooks() async {
     final encoded = _encodeBooks();

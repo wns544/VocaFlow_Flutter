@@ -53,6 +53,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   StreamSubscription<User?>? _authSubscription;
   bool _syncing = false;
   bool _downloading = false;
+  bool learningStateVerified = false;
   bool _flushingForBackground = false;
   DateTime? _lastSuccessAt;
   int _failureCount = 0;
@@ -87,6 +88,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     store.onSessionCompleted = requestImmediateBackup;
     store.onBeforeBookMutation = _archiveBeforeBookMutation;
     _authSubscription = FirebaseAuth.instance.authStateChanges().listen((current) {
+      learningStateVerified = false;
       _cancelScheduledUpload();
       _startWebInitialSyncIfNeeded();
       if (current != null) {
@@ -304,6 +306,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     String reason = '클라우드 확인',
   }) async {
     if (!accountBookSyncEnabled || _syncing) return;
+    learningStateVerified = false;
     _syncing = true;
     try {
       final current = user;
@@ -505,6 +508,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     bool pullManagedBooks = true,
   }) async {
     if (!ownsGate && _syncing) return;
+    learningStateVerified = false;
     if (!ownsGate) _syncing = true;
     _downloading = true;
     try {
@@ -520,6 +524,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         await store.cloudChanges.recordDownload(current.uid, _now());
       }
       await store.cloudChanges.recordLog('$reason · learningState 병합 완료');
+      learningStateVerified = true;
       await store.cloudChanges
           .recordDiagnostic('sync_download_succeeded', data: {
         'reason': reason,

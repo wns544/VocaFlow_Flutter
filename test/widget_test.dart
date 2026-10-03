@@ -21,6 +21,42 @@ import 'package:vocaflow/store.dart';
 import 'package:vocaflow/study_speech.dart';
 
 void main() {
+  testWidgets('account resume ignores selected book and opens saved card',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final selected = store.quickBook;
+    final recent = await store.addBook('최근 단어장', [
+      Word(id: 99001, term: '最近', reading: 'さいきん', meaning: '최근'),
+    ]);
+    await store.saveActiveStudy(ActiveStudy(
+      queueIds: [99001],
+      total: 1,
+      memorized: 0,
+      reviewed: const [],
+      revealed: true,
+      sessionIndexes: const [],
+      bookId: recent.id,
+    ));
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+      body: HomePage(store: store, refresh: () {}),
+    )));
+    await tester.pumpAndSettle();
+    expect(store.quickBook.id, selected.id);
+    expect(find.text('최근 단어장'), findsOneWidget);
+    expect(find.text('이어서 하기'), findsOneWidget);
+    expect(find.byKey(const ValueKey('home-account-resume')), findsNothing);
+    expect(find.byKey(const ValueKey('home-action-study')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('home-action-study')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
+    final opened = tester.widget<CardStudyPage>(find.byType(CardStudyPage));
+    expect(opened.resume!.bookId, recent.id);
+    expect(opened.resume!.queueIds, [99001]);
+    expect(opened.resume!.revealed, isTrue);
+  });
+
   setUp(() => shuffleNewStudyQueues = false);
 
   test('study speech selects a language from the word text', () {
@@ -526,6 +562,10 @@ void main() {
         find.byKey(const ValueKey('home-change-study-course')), findsNothing);
     await tester.tap(find.byKey(ValueKey('favorite-sessions-${book.id}')));
     await tester.pumpAndSettle();
+    await tester.ensureVisible(
+      find.byKey(ValueKey('favorite-${book.id}-course-0-100')),
+    );
+    await tester.pumpAndSettle();
     await tester.tap(
       find.byKey(ValueKey('favorite-${book.id}-course-0-100')),
     );
@@ -980,6 +1020,30 @@ void main() {
     await tester.longPress(firstKanji);
     await tester.pump(const Duration(milliseconds: 100));
     expect(copiedTexts.sublist(copiedTexts.length - 2), ['遺', '遺']);
+  });
+
+  testWidgets('kana-only term opens the same word detail sheet',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final word = Word(
+      term: 'いやらしい',
+      reading: 'いやらしい',
+      meaning: '불쾌하다',
+    );
+    await tester.pumpWidget(MaterialApp(
+      home: CardStudyPage(store: store, words: [word]),
+    ));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('open-kana-word-detail')));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('kana-word-detail-term')), findsOneWidget);
+    expect(find.text('いやらしい'), findsWidgets);
+    expect(find.text('불쾌하다'), findsOneWidget);
+    expect(find.byKey(const ValueKey('open-chatgpt-word')), findsOneWidget);
+    expect(find.byKey(const ValueKey('open-naver-hanja')), findsNothing);
   });
 
   testWidgets('study card fades details in term-reading-meaning order',

@@ -311,7 +311,6 @@ Word _mergeWord(
   return merged;
 }
 
-
 (bool, DateTime?) _mergeFavorite(Word cloud, Word local) {
   final ct = cloud.favoriteUpdatedAt;
   final lt = local.favoriteUpdatedAt;
@@ -323,7 +322,9 @@ Word _mergeWord(
   if (ct.isAfter(lt)) return (cloud.isFavorite, ct);
   if (lt.isAfter(ct)) return (local.isFavorite, lt);
   return (cloud.isFavorite && local.isFavorite, ct);
-}StudyState _higherState(StudyState left, StudyState right) =>
+}
+
+StudyState _higherState(StudyState left, StudyState right) =>
     _stateRank(left) >= _stateRank(right) ? left : right;
 
 int _stateRank(StudyState state) => switch (state) {
@@ -360,6 +361,14 @@ Map<String, dynamic>? _chooseActiveStudy(
       .toList();
   if (candidates.isEmpty) return null;
   candidates.sort((a, b) {
+    final aTime = _activeUpdatedAt(a);
+    final bTime = _activeUpdatedAt(b);
+    if (aTime == null && bTime != null) return 1;
+    if (bTime == null && aTime != null) return -1;
+    if (aTime != null && bTime != null) {
+      final recency = bTime.compareTo(aTime);
+      if (recency != 0) return recency;
+    }
     final memorizedCompare = ((b['memorized'] as num?)?.toInt() ?? 0)
         .compareTo((a['memorized'] as num?)?.toInt() ?? 0);
     if (memorizedCompare != 0) return memorizedCompare;
@@ -367,8 +376,6 @@ Map<String, dynamic>? _chooseActiveStudy(
     final bQueue = (b['queueIds'] as List?)?.length ?? 999999;
     final queueCompare = aQueue.compareTo(bQueue);
     if (queueCompare != 0) return queueCompare;
-    final aTime = _activeUpdatedAt(a);
-    final bTime = _activeUpdatedAt(b);
     if (aTime == null && bTime == null) return 0;
     if (aTime == null) return 1;
     if (bTime == null) return -1;
