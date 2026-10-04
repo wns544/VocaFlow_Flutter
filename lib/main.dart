@@ -2784,6 +2784,9 @@ class _CardStudyPageState extends State<CardStudyPage>
     await persistStudy();
     if (mounted) {
       setState(() => _undoTransitionRevision++);
+      if (widget.store.undoHaptics) {
+        unawaited(HapticFeedback.lightImpact());
+      }
     }
     scheduleResumeSnapshotCapture('study');
   }
@@ -7017,6 +7020,20 @@ class _SettingsPageState extends State<SettingsPage> {
               value: widget.store.reverseSwipe,
               onChanged: (value) async {
                 await widget.store.setReverseSwipe(value);
+                widget.refresh();
+                if (mounted) setState(() {});
+              },
+            ),
+            const Divider(height: 1),
+            SwitchListTile.adaptive(
+              key: const ValueKey('undo-haptics-setting'),
+              secondary: const Icon(Icons.vibration, color: sea),
+              title: const Text('이전 카드로 되돌릴 때 진동',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+              subtitle: const Text('되돌리기가 완료되면 짧게 진동합니다.'),
+              value: widget.store.undoHaptics,
+              onChanged: (value) async {
+                await widget.store.setUndoHaptics(value);
                 widget.refresh();
                 if (mounted) setState(() {});
               },

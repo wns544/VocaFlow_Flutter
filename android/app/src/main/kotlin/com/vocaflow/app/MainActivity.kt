@@ -55,6 +55,7 @@ class MainActivity : FlutterActivity() {
     private var lastAcceptedSystemBackUpAt = 0L
     private var suppressCurrentSystemBack = false
     private var hasAcceptedSystemBackDown = false
+    private val forwardedBackEvents = RedispatchedKeyEvents()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -138,6 +139,14 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // Flutter KeyboardManager sends unhandled events back through this
+        // Activity. Debouncing that SAME event again consumes its DOWN/UP
+        // before Android can invoke onBackPressed (notably with WebView focus).
+        if (event.keyCode == KeyEvent.KEYCODE_BACK &&
+            forwardedBackEvents.isRedispatch(event)) {
+            Log.d(backLogTag, "android key system back redispatch passthrough action=${event.action}")
+            return super.dispatchKeyEvent(event)
+        }
         if (event.keyCode == KeyEvent.KEYCODE_BACK) {
             recordNavigationInput("key", mapOf(
                 "action" to event.action,
@@ -184,6 +193,9 @@ class MainActivity : FlutterActivity() {
                 hasAcceptedSystemBackDown = false
                 lastAcceptedSystemBackUpAt = now
             }
+        }
+        if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+            forwardedBackEvents.remember(event)
         }
         return super.dispatchKeyEvent(event)
     }

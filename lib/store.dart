@@ -294,6 +294,7 @@ class VocaStore {
   static const _showExamplesKey = 'showExamples';
   static const _flipCardKey = 'flipCard';
   static const _autoPlayPronunciationKey = 'autoPlayPronunciation';
+  static const _undoHapticsKey = 'undoHaptics';
   static const _activeStudyKey = 'activeStudy';
   static const _lastMainTabKey = 'lastMainTab';
   static const _mainTabMigrationKey = 'mainTabMigrationV2';
@@ -386,6 +387,7 @@ class VocaStore {
 
   bool get horizontalSwipe => _prefs.getBool(_horizontalSwipeKey) ?? false;
   bool get reverseSwipe => _prefs.getBool(_reverseSwipeKey) ?? false;
+  bool get undoHaptics => _prefs.getBool(_undoHapticsKey) ?? false;
   bool get readingAboveTerm => _prefs.getBool(_readingAboveTermKey) ?? false;
   bool get showExamples => _prefs.getBool(_showExamplesKey) ?? true;
   bool get flipCard => _prefs.getBool(_flipCardKey) ?? false;
@@ -1164,6 +1166,11 @@ class VocaStore {
 
   Future<void> setAutoPlayPronunciation(bool value) async {
     await _prefs.setBool(_autoPlayPronunciationKey, value);
+    await cloudChanges.markProfile();
+  }
+
+  Future<void> setUndoHaptics(bool value) async {
+    await _prefs.setBool(_undoHapticsKey, value);
     await cloudChanges.markProfile();
   }
 
@@ -2098,6 +2105,7 @@ class VocaStore {
         'showExamples': showExamples,
         'flipCard': flipCard,
         'autoPlayPronunciation': autoPlayPronunciation,
+        'undoHaptics': undoHaptics,
         'japaneseFont': japaneseFont,
         'cardFontSizes': {
           'term': termFontSize,
@@ -2194,6 +2202,8 @@ class VocaStore {
     await _prefs.setBool(_flipCardKey, json['flipCard'] as bool? ?? false);
     await _prefs.setBool(_autoPlayPronunciationKey,
         json['autoPlayPronunciation'] as bool? ?? true);
+    await _prefs.setBool(
+        _undoHapticsKey, json['undoHaptics'] as bool? ?? false);
     await setJapaneseFont(json['japaneseFont'] as String? ?? 'system');
     final fontSizes =
         json['cardFontSizes'] as Map<String, dynamic>? ?? const {};
