@@ -22,6 +22,88 @@ import 'package:vocaflow/store.dart';
 import 'package:vocaflow/study_speech.dart';
 
 void main() {
+  testWidgets('resumed round retains seventy unknown cards in next round',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final words = List.generate(
+        100,
+        (i) => Word(
+            id: 88000 + i, term: 'card$i', reading: '', meaning: 'meaning$i'));
+    final book = await store.addBook('resume regression', words);
+    await store.saveActiveStudy(
+        ActiveStudy(
+          queueIds: words.skip(96).map((w) => w.id).toList(),
+          queueBookIds: List.filled(4, book.id),
+          total: 100,
+          memorized: 26,
+          reviewed: const [],
+          revealed: false,
+          sessionIndexes: const [],
+          bookId: book.id,
+          roundNumber: 1,
+          roundTotal: 100,
+          roundCompleted: 96,
+          seenWordIds: words.take(96).map((w) => w.id).toList(),
+          roundUnknownIds: words.take(70).map((w) => w.id).toList(),
+          roundUnknownBookIds: List.filled(70, book.id),
+        ),
+        markCloudChange: false);
+    final reloaded = await VocaStore.load();
+    final resume = reloaded.activeStudy!;
+    expect(resume.roundUnknownIds, hasLength(70));
+    expect(resume.seenWordIds, hasLength(96));
+    await tester.pumpWidget(MaterialApp(
+        home: CardStudyPage(
+      store: reloaded,
+      resume: resume,
+      decisionWriter: (_, __) async {},
+    )));
+    await tester.pumpAndSettle();
+    expect(find.text('1바퀴 · 96 / 100'), findsOneWidget);
+    for (var i = 0; i < 4; i++) {
+      final gesture = await tester.startGesture(
+          tester.getCenter(find.byKey(const ValueKey('study-card'))));
+      await gesture.moveBy(const Offset(0, 120));
+      await gesture.moveBy(const Offset(0, 120));
+      await gesture.up();
+      await tester.pumpAndSettle();
+    }
+    expect(find.textContaining('보류 74개'), findsOneWidget);
+    await tester.tap(find.text('2바퀴 시작'));
+    await tester.pumpAndSettle();
+    expect(find.text('2바퀴 · 0 / 74'), findsOneWidget);
+    expect((await VocaStore.load()).activeStudy!.roundNumber, 2);
+  });
+
+  testWidgets('unrevealed study card searches other books by meaning for links',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final source = await store.addBook('source', [
+      Word(id: 89101, term: 'sourceword', reading: '', meaning: '시작'),
+    ]);
+    await store.addBook('other book', [
+      Word(id: 89102, term: 'targetword', reading: '', meaning: '검색단서'),
+    ]);
+    await tester.pumpWidget(MaterialApp(
+        home: CardStudyPage(
+      store: store,
+      words: source.words,
+      bookId: source.id,
+    )));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('card-related-words')));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), '검색단서');
+    await tester.pumpAndSettle();
+    expect(find.text('targetword'), findsOneWidget);
+    await tester.tap(find.text('targetword'));
+    await tester.pumpAndSettle();
+    expect(find.byIcon(Icons.link), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('account resume ignores selected book and opens saved card',
       (tester) async {
     SharedPreferences.setMockInitialValues({});

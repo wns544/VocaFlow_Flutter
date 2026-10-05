@@ -28,13 +28,12 @@ import 'models.dart';
 import 'navigation_trace.dart';
 import 'pronunciation/pronunciation_pack_manager.dart';
 import 'pronunciation/pronunciation_pack_store.dart';
-import 'pronunciation/pronunciation_match.dart';
 import 'pronunciation/pronunciation_resolver.dart';
 import 'pronunciation/pronunciation_store.dart';
 import 'pronunciation/bundled_pitch_dictionary.dart';
-import 'pronunciation/kanjium_pitch_dictionary.dart';
 import 'pronunciation/pitch_accent.dart';
 import 'pronunciation/pitch_accent_line.dart';
+import 'pronunciation/pitch_accent_resolution.dart';
 import 'store.dart';
 import 'study_course.dart';
 import 'study_speech.dart';
@@ -55,13 +54,6 @@ final defaultKanjiLookupService = KanjiLookupService();
 final resumeSnapshotNavigatorObserver = _ResumeSnapshotNavigatorObserver();
 final resumeRouteObserver = RouteObserver<ModalRoute<dynamic>>();
 final navigationRouteObserver = _NavigationRouteObserver();
-
-class _ResolvedPitchAccent {
-  const _ResolvedPitchAccent(this.pattern, {required this.fromDictionary});
-
-  final PitchAccentPattern pattern;
-  final bool fromDictionary;
-}
 
 class FavoriteStarIcon extends StatelessWidget {
   const FavoriteStarIcon({super.key, required this.selected, this.size = 22});
@@ -2221,43 +2213,25 @@ class _CardStudyPageState extends State<CardStudyPage>
     }
   }
 
-  Future<PronunciationMatch> _pronunciationMatch(Word word) =>
-      resolvePronunciationMatch(
-        resolver: _pronunciationResolver,
+  Future<PitchAccentResolution> _pitchAccentResolutionFor(Word word) =>
+      resolvePitchAccent(
         term: word.term,
         reading: word.reading,
+        resolver: _pronunciationResolver,
         selections: _pronunciationSelections,
         reference: _pronunciationReferenceFor(word),
       );
 
-  Future<_ResolvedPitchAccent?> _pitchAccentFor(Word word) async {
-    final match = await _pronunciationMatch(word);
-    final installed = match.active?.entry.pattern;
-    if (installed != null) {
-      return _ResolvedPitchAccent(installed, fromDictionary: false);
-    }
-    if (word.reading.trim().isEmpty) return null;
-    final candidates = await BundledPitchDictionary.lookup(
-      term: word.term,
-      reading: word.reading,
+  Future<void> _showPitchAccentDetails(Word word) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      useSafeArea: true,
+      builder: (_) => _PitchAccentDetailSheet(
+        word: word,
+        reference: _pronunciationReferenceFor(word),
+      ),
     );
-    if (candidates.length != 1) return null;
-    final pattern = candidates.single.toPattern();
-    return pattern == null
-        ? null
-        : _ResolvedPitchAccent(pattern, fromDictionary: true);
-  }
-
-  _ResolvedPitchAccent? _cachedDictionaryPitchAccentFor(Word word) {
-    final dictionary = BundledPitchDictionary.cached;
-    if (dictionary == null || word.reading.trim().isEmpty) return null;
-    final candidates =
-        dictionary.lookup(term: word.term, reading: word.reading);
-    if (candidates.length != 1) return null;
-    final pattern = candidates.single.toPattern();
-    return pattern == null
-        ? null
-        : _ResolvedPitchAccent(pattern, fromDictionary: true);
   }
 
   List<Word> _resolveStoredWords(List<int> ids, List<String> bookIds) {
@@ -2636,24 +2610,17 @@ class _CardStudyPageState extends State<CardStudyPage>
 
   Future<void> _speakPronunciation(Word word) async {
     try {
-      final match = await _pronunciationMatch(word).timeout(
-          const Duration(milliseconds: 150),
-          onTimeout: PronunciationMatch.empty);
-      if (match.active != null &&
-          await playInstalledStudySpeechFile(match.active!.audioPath)) {
+      final active = cachedPitchAccent(
+        term: word.term,
+        reading: word.reading,
+      );
+      if (active != null &&
+          await playJapanesePitchAccent(
+            reading: active.pattern.reading,
+            accentPosition: active.pattern.accentPosition,
+            moraCount: active.pattern.morae.length,
+          )) {
         return;
-      }
-      final pitch = _cachedDictionaryPitchAccentFor(word);
-      if (pitch != null) {
-        final generated = await synthesizeOnDeviceJapanesePitch(
-          reading: pitch.pattern.reading,
-          accentPosition: pitch.pattern.accentPosition,
-          moraCount: pitch.pattern.morae.length,
-        );
-        if (generated != null &&
-            await playInstalledStudySpeechFile(generated)) {
-          return;
-        }
       }
     } catch (_) {
       // A missing or malformed optional pronunciation pack must never prevent
@@ -2665,46 +2632,66 @@ class _CardStudyPageState extends State<CardStudyPage>
     ));
   }
 
-  Widget _pitchAccentForWord(Word word) => FutureBuilder<_ResolvedPitchAccent?>(
-        future: _pitchAccentFor(word),
+  Widget _pitchAccentForWord(Word word) => FutureBuilder<PitchAccentResolution>(
+        future: _pitchAccentResolutionFor(word),
         builder: (context, snapshot) {
-          final resolved = snapshot.data;
-          if (resolved == null) {
+          final resolution = snapshot.data;
+          if (resolution == null) {
             return const SizedBox.shrink();
+          }
+          if (resolution.options.isEmpty) {
+            return const Padding(
+              padding: EdgeInsets.only(top: 9),
+              child: Text(
+                '고저 정보 없음',
+                style: TextStyle(color: Color(0xFF8E8E93), fontSize: 11),
+              ),
+            );
           }
           return Padding(
             padding: const EdgeInsets.only(top: 9),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                PitchAccentLine(pattern: resolved.pattern),
-                if (resolved.fromDictionary)
-                  const Padding(
-                    padding: EdgeInsets.only(top: 3),
-                    child: Text('사전 고저',
-                        style:
-                            TextStyle(color: Color(0xFF8E8E93), fontSize: 11)),
+            child: TextButton(
+              key: const ValueKey('open-pitch-accent-detail'),
+              onPressed: () => _showPitchAccentDetails(word),
+              style: TextButton.styleFrom(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                minimumSize: Size.zero,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (resolution.active case final active?)
+                    PitchAccentLine(pattern: active.pattern),
+                  const SizedBox(height: 3),
+                  Text(
+                    resolution.options.length == 1
+                        ? '일본어 높낮이 보기'
+                        : '고저 후보 ${resolution.options.length}개 보기',
+                    style:
+                        const TextStyle(color: Color(0xFF8E8E93), fontSize: 11),
                   ),
-              ],
+                ],
+              ),
             ),
           );
         },
       );
 
   Widget _pronunciationChoiceForWord(Word word) =>
-      FutureBuilder<PronunciationMatch>(
-        future: _pronunciationMatch(word),
+      FutureBuilder<PitchAccentResolution>(
+        future: _pitchAccentResolutionFor(word),
         builder: (context, snapshot) {
-          final match = snapshot.data;
-          if (match == null || match.candidates.length < 2) {
+          final resolution = snapshot.data;
+          if (resolution == null || resolution.options.length < 2) {
             return const SizedBox.shrink();
           }
           return Padding(
             padding: const EdgeInsets.only(top: 7),
             child: TextButton.icon(
-              onPressed: () => showKanjiDetails(word.term, word),
+              onPressed: () => _showPitchAccentDetails(word),
               icon: const Icon(Icons.tune_outlined, size: 17),
-              label: Text(match.requiresSelection ? '발음 선택 필요' : '발음 설정'),
+              label: Text(resolution.requiresSelection ? '고저 선택 필요' : '고저 설정'),
             ),
           );
         },
@@ -2744,13 +2731,13 @@ class _CardStudyPageState extends State<CardStudyPage>
                 onLongPress: () => showExplanation(word),
               ),
             ),
-          if (back)
+          if (_relationReferenceFor(word) != null)
             Positioned(
               top: 8,
               left: 8,
               child: IconButton(
                 key: const ValueKey('card-related-words'),
-                tooltip: '관련 단어 연결',
+                tooltip: '전체 단어장에서 검색·연결',
                 visualDensity: VisualDensity.compact,
                 onPressed: () => _editRelatedWords(word),
                 icon: const Icon(Icons.hub_outlined,
@@ -3729,6 +3716,181 @@ class _TappableHanTerm extends StatelessWidget {
   }
 }
 
+class _PitchAccentDetailSheet extends StatefulWidget {
+  const _PitchAccentDetailSheet({required this.word, required this.reference});
+
+  final Word word;
+  final PronunciationCardRef? reference;
+
+  @override
+  State<_PitchAccentDetailSheet> createState() =>
+      _PitchAccentDetailSheetState();
+}
+
+class _PitchAccentDetailSheetState extends State<_PitchAccentDetailSheet> {
+  final _resolver = PronunciationResolver(PronunciationPackStore());
+  final _selections = PronunciationSelectionStore();
+  late Future<PitchAccentResolution> _resolution;
+
+  @override
+  void initState() {
+    super.initState();
+    _resolution = _loadResolution();
+  }
+
+  Future<PitchAccentResolution> _loadResolution() async {
+    await _selections.load();
+    return resolvePitchAccent(
+      term: widget.word.term,
+      reading: widget.word.reading,
+      resolver: _resolver,
+      selections: _selections,
+      reference: widget.reference,
+    );
+  }
+
+  Future<void> _play(PitchAccentOption option) async {
+    final played = await playJapanesePitchAccent(
+      reading: option.pattern.reading,
+      accentPosition: option.pattern.accentPosition,
+      moraCount: option.pattern.morae.length,
+      prerecordedPath: option.audioPath,
+    );
+    if (!played) {
+      await speakStudySpeechRequest(studySpeechRequestForWord(
+        term: widget.word.term,
+        reading: widget.word.reading,
+      ));
+    }
+  }
+
+  String _explanation(PitchAccentPattern pattern) {
+    if (pattern.isUnaccented) return '단어 안에서는 내려가지 않아요.';
+    if (pattern.hasParticleOnlyDrop) return '단어 뒤 조사가 붙으면 내려가요.';
+    return '${pattern.accentPosition}번째 박 뒤에 낮아져요.';
+  }
+
+  Future<void> _select(PitchAccentOption option) async {
+    final reference = widget.reference;
+    if (reference == null) return;
+    await _selections.select(reference, option.candidateId);
+    if (mounted) setState(() => _resolution = _loadResolution());
+  }
+
+  Future<void> _clearSelection() async {
+    final reference = widget.reference;
+    if (reference == null) return;
+    await _selections.clear(reference);
+    if (mounted) setState(() => _resolution = _loadResolution());
+  }
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+        child: FutureBuilder<PitchAccentResolution>(
+          future: _resolution,
+          builder: (context, snapshot) {
+            final resolution = snapshot.data;
+            if (resolution == null) {
+              return const SizedBox(
+                height: 180,
+                child: Center(child: CircularProgressIndicator()),
+              );
+            }
+            return ListView(
+              shrinkWrap: true,
+              children: [
+                Text(widget.word.term,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                        fontSize: 34, fontWeight: FontWeight.w900)),
+                const SizedBox(height: 3),
+                Text(widget.word.reading,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Color(0xFF6E6E73))),
+                const SizedBox(height: 3),
+                Text(widget.word.meaning,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Color(0xFF6E6E73))),
+                const SizedBox(height: 20),
+                if (resolution.options.isEmpty)
+                  const Card(
+                    child: Padding(
+                      padding: EdgeInsets.all(16),
+                      child: Text('이 단어의 고저 정보를 찾지 못했어요.\n기본 발음은 계속 들을 수 있어요.',
+                          textAlign: TextAlign.center),
+                    ),
+                  )
+                else
+                  for (final option in resolution.options)
+                    Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(14),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(children: [
+                              Expanded(
+                                child: Text(
+                                  '${option.pattern.accentPosition}형 · ${_explanation(option.pattern)}',
+                                  style: const TextStyle(
+                                      fontWeight: FontWeight.w800),
+                                ),
+                              ),
+                              IconButton(
+                                tooltip: '이 고저로 듣기',
+                                onPressed: () => _play(option),
+                                icon: const Icon(Icons.volume_up_outlined),
+                              ),
+                            ]),
+                            const SizedBox(height: 8),
+                            Center(
+                              child: PitchAccentLine(
+                                pattern: option.pattern,
+                                showParticleDropHint: true,
+                              ),
+                            ),
+                            if (resolution.options.length > 1 &&
+                                widget.reference != null) ...[
+                              const SizedBox(height: 10),
+                              Align(
+                                alignment: Alignment.centerRight,
+                                child: option.candidateId ==
+                                        resolution.active?.candidateId
+                                    ? const Text('이 카드에 적용됨',
+                                        style: TextStyle(
+                                            color: sea,
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w700))
+                                    : TextButton(
+                                        onPressed: () => _select(option),
+                                        child: const Text('이 카드에 적용'),
+                                      ),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ),
+                if (resolution.options.length > 1 &&
+                    widget.reference != null &&
+                    resolution.hasSavedSelection)
+                  TextButton.icon(
+                    onPressed: _clearSelection,
+                    icon: const Icon(Icons.restart_alt),
+                    label: const Text('이 카드의 고저 선택 초기화'),
+                  ),
+                const SizedBox(height: 6),
+                const Text('표기와 읽기가 정확히 맞는 사전 정보를 사용합니다.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Color(0xFF8E8E93), fontSize: 11)),
+              ],
+            );
+          },
+        ),
+      );
+}
+
 class _KanjiDetailSheet extends StatefulWidget {
   const _KanjiDetailSheet({
     required this.character,
@@ -3772,30 +3934,24 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
     if (mounted) setState(() {});
   }
 
-  Future<PronunciationMatch> _pronunciationMatch() => resolvePronunciationMatch(
-        resolver: _pronunciationResolver,
+  Future<PitchAccentResolution> _pitchAccentResolution() => resolvePitchAccent(
         term: widget.word.term,
         reading: widget.word.reading,
+        resolver: _pronunciationResolver,
         selections: _pronunciationSelections,
         reference: widget.pronunciationReference,
       );
 
-  Future<_ResolvedPitchAccent?> _resolvedPitchAccent() async {
-    final match = await _pronunciationMatch();
-    final installed = match.active?.entry.pattern;
-    if (installed != null) {
-      return _ResolvedPitchAccent(installed, fromDictionary: false);
-    }
-    if (widget.word.reading.trim().isEmpty) return null;
-    final candidates = await BundledPitchDictionary.lookup(
-      term: widget.word.term,
-      reading: widget.word.reading,
+  Future<void> _showPitchAccentDetails() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      useSafeArea: true,
+      builder: (_) => _PitchAccentDetailSheet(
+        word: widget.word,
+        reference: widget.pronunciationReference,
+      ),
     );
-    if (candidates.length != 1) return null;
-    final pattern = candidates.single.toPattern();
-    return pattern == null
-        ? null
-        : _ResolvedPitchAccent(pattern, fromDictionary: true);
   }
 
   void showMessage(String message) {
@@ -3884,11 +4040,16 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
 
   Future<void> _speakWordPronunciation() async {
     try {
-      final match = await _pronunciationMatch().timeout(
-          const Duration(milliseconds: 150),
-          onTimeout: PronunciationMatch.empty);
-      if (match.active != null &&
-          await playInstalledStudySpeechFile(match.active!.audioPath)) {
+      final active = cachedPitchAccent(
+        term: widget.word.term,
+        reading: widget.word.reading,
+      );
+      if (active != null &&
+          await playJapanesePitchAccent(
+            reading: active.pattern.reading,
+            accentPosition: active.pattern.accentPosition,
+            moraCount: active.pattern.morae.length,
+          )) {
         return;
       }
     } catch (_) {
@@ -3900,125 +4061,64 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
     ));
   }
 
-  Widget _pitchAccent() => FutureBuilder<_ResolvedPitchAccent?>(
-        future: _resolvedPitchAccent(),
+  Widget _pitchAccent() => FutureBuilder<PitchAccentResolution>(
+        future: _pitchAccentResolution(),
         builder: (context, snapshot) {
-          final resolved = snapshot.data;
-          if (resolved == null) {
+          final resolution = snapshot.data;
+          if (resolution == null) {
             return const SizedBox.shrink();
+          }
+          if (resolution.options.isEmpty) {
+            return const Padding(
+              padding: EdgeInsets.only(top: 10),
+              child: Text(
+                '고저 정보 없음',
+                style: TextStyle(color: Color(0xFF8E8E93), fontSize: 11),
+              ),
+            );
           }
           return Padding(
             padding: const EdgeInsets.only(top: 10),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                PitchAccentLine(pattern: resolved.pattern),
-                if (resolved.fromDictionary)
-                  const Padding(
-                    padding: EdgeInsets.only(top: 3),
-                    child: Text('Kanjium 사전 고저',
-                        style:
-                            TextStyle(color: Color(0xFF8E8E93), fontSize: 11)),
+            child: TextButton(
+              onPressed: _showPitchAccentDetails,
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+                minimumSize: Size.zero,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (resolution.active case final active?)
+                    PitchAccentLine(pattern: active.pattern),
+                  Text(
+                    resolution.options.length == 1
+                        ? '일본어 높낮이 보기'
+                        : '고저 후보 ${resolution.options.length}개 보기',
+                    style:
+                        const TextStyle(color: Color(0xFF8E8E93), fontSize: 11),
                   ),
-              ],
+                ],
+              ),
             ),
           );
         },
       );
 
-  Future<void> _showPronunciationChoices() async {
-    final reference = widget.pronunciationReference;
-    if (reference == null) return;
-    final match = await _pronunciationMatch();
-    if (!mounted || match.candidates.length < 2) return;
-    await showModalBottomSheet<void>(
-      context: context,
-      showDragHandle: true,
-      useSafeArea: true,
-      builder: (sheetContext) => Padding(
-        padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
-        child: ListView(
-          shrinkWrap: true,
-          children: [
-            const Text('발음 설정',
-                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900)),
-            const SizedBox(height: 6),
-            Text(
-                '${widget.word.term} · ${widget.word.reading}\n${widget.word.meaning}',
-                style: const TextStyle(color: Color(0xFF6E6E73))),
-            const SizedBox(height: 16),
-            for (final candidate in match.candidates)
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(children: [
-                        Expanded(
-                          child: Text(
-                            '${candidate.entry.accentPosition}형',
-                            style: const TextStyle(fontWeight: FontWeight.w800),
-                          ),
-                        ),
-                        IconButton(
-                          tooltip: '이 후보 미리 듣기',
-                          onPressed: () =>
-                              playInstalledStudySpeechFile(candidate.audioPath),
-                          icon: const Icon(Icons.play_circle_outline),
-                        ),
-                      ]),
-                      if (candidate.entry.pattern case final pattern?)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 10),
-                          child: PitchAccentLine(pattern: pattern),
-                        ),
-                      FilledButton(
-                        onPressed: () async {
-                          await _pronunciationSelections.select(
-                              reference, candidate.entry.candidateId);
-                          if (!sheetContext.mounted) return;
-                          Navigator.pop(sheetContext);
-                          if (mounted) setState(() {});
-                        },
-                        child: const Text('이 카드에 적용'),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            if (match.hasSavedSelection)
-              TextButton.icon(
-                onPressed: () async {
-                  await _pronunciationSelections.clear(reference);
-                  if (!sheetContext.mounted) return;
-                  Navigator.pop(sheetContext);
-                  if (mounted) setState(() {});
-                },
-                icon: const Icon(Icons.restart_alt),
-                label: const Text('선택 초기화'),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _pronunciationChoiceButton() => FutureBuilder<PronunciationMatch>(
-        future: _pronunciationMatch(),
+  Widget _pronunciationChoiceButton() => FutureBuilder<PitchAccentResolution>(
+        future: _pitchAccentResolution(),
         builder: (context, snapshot) {
-          final match = snapshot.data;
+          final resolution = snapshot.data;
           if (widget.pronunciationReference == null ||
-              match == null ||
-              match.candidates.length < 2) {
+              resolution == null ||
+              resolution.options.length < 2) {
             return const SizedBox.shrink();
           }
           return Padding(
             padding: const EdgeInsets.only(top: 8),
             child: OutlinedButton.icon(
-              onPressed: _showPronunciationChoices,
+              onPressed: _showPitchAccentDetails,
               icon: const Icon(Icons.tune_outlined, size: 18),
-              label: Text(match.requiresSelection ? '발음 선택 필요' : '발음 설정'),
+              label: Text(resolution.requiresSelection ? '고저 선택 필요' : '고저 설정'),
             ),
           );
         },
@@ -8963,9 +9063,14 @@ class _RelatedWordPickerSheetState extends State<_RelatedWordPickerSheet> {
 
   @override
   Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+        padding: EdgeInsets.fromLTRB(
+            20, 0, 20, 24 + MediaQuery.viewInsetsOf(context).bottom),
         child: SizedBox(
-          height: MediaQuery.sizeOf(context).height * .74,
+          height: max(
+              180,
+              (MediaQuery.sizeOf(context).height -
+                      MediaQuery.viewInsetsOf(context).bottom) *
+                  .70),
           child: Column(children: [
             const Text('관련 단어 연결',
                 style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900)),
@@ -8975,7 +9080,7 @@ class _RelatedWordPickerSheetState extends State<_RelatedWordPickerSheet> {
               onChanged: (_) => setState(() {}),
               decoration: const InputDecoration(
                 prefixIcon: Icon(Icons.search),
-                hintText: '단어·발음·뜻 검색',
+                hintText: '전체 단어장에서 단어·발음·뜻 검색',
               ),
             ),
             if (widget.currentScope != null)

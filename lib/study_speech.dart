@@ -125,6 +125,26 @@ Future<String?> synthesizeOnDeviceJapanesePitch({
   }
 }
 
+/// Plays a verified local recording when present, otherwise creates the same
+/// pitch pattern on-device. Callers retain the normal device-TTS fallback.
+Future<bool> playJapanesePitchAccent({
+  required String reading,
+  required int accentPosition,
+  required int moraCount,
+  String? prerecordedPath,
+}) async {
+  if (prerecordedPath != null &&
+      await playInstalledStudySpeechFile(prerecordedPath)) {
+    return true;
+  }
+  final generated = await synthesizeOnDeviceJapanesePitch(
+    reading: reading,
+    accentPosition: accentPosition,
+    moraCount: moraCount,
+  );
+  return generated != null && await playInstalledStudySpeechFile(generated);
+}
+
 Future<void> stopStudySpeech() async {
   if (kIsWeb) return;
   try {

@@ -10,11 +10,13 @@ class PitchAccentLine extends StatelessWidget {
     required this.pattern,
     this.color = const Color(0xFFFF6B61),
     this.textStyle,
+    this.showParticleDropHint = false,
   });
 
   final PitchAccentPattern pattern;
   final Color color;
   final TextStyle? textStyle;
+  final bool showParticleDropHint;
 
   String get _semanticLabel {
     if (pattern.isUnaccented) {
@@ -30,41 +32,48 @@ class PitchAccentLine extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     const spacing = 28.0;
-    final width = (pattern.morae.length - 1) * spacing + 16;
+    final showsParticle = showParticleDropHint && pattern.hasParticleOnlyDrop;
+    final morae = showsParticle ? [...pattern.morae, 'が'] : pattern.morae;
+    final levels =
+        showsParticle ? [...pattern.levels, PitchLevel.low] : pattern.levels;
+    final width = (morae.length - 1) * spacing + 16;
     return Semantics(
       label: _semanticLabel,
       child: ExcludeSemantics(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            CustomPaint(
-              key: const ValueKey('pitch-accent-line'),
-              size: Size(width, 23),
-              painter: _PitchAccentLinePainter(
-                levels: pattern.levels,
-                color: color,
-                spacing: spacing,
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              CustomPaint(
+                key: const ValueKey('pitch-accent-line'),
+                size: Size(width, 23),
+                painter: _PitchAccentLinePainter(
+                  levels: levels,
+                  color: color,
+                  spacing: spacing,
+                ),
               ),
-            ),
-            SizedBox(
-              width: width,
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  for (final mora in pattern.morae)
-                    Text(
-                      mora,
-                      style: textStyle ??
-                          const TextStyle(
-                            color: Color(0xFF6E6E73),
-                            fontSize: 12,
-                            height: 1.1,
-                          ),
-                    ),
-                ],
+              SizedBox(
+                width: width,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    for (final mora in morae)
+                      Text(
+                        mora,
+                        style: textStyle ??
+                            const TextStyle(
+                              color: Color(0xFF6E6E73),
+                              fontSize: 12,
+                              height: 1.1,
+                            ),
+                      ),
+                  ],
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
