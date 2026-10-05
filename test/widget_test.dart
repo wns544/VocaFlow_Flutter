@@ -7,6 +7,7 @@
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
@@ -1061,6 +1062,106 @@ void main() {
     expect(find.byKey(const ValueKey('open-naver-hanja')), findsNothing);
   });
 
+  testWidgets('study header keeps auto pronunciation in a compact toggle',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final speechCalls = <MethodCall>[];
+    final messenger = tester.binding.defaultBinaryMessenger;
+    const pathProviderChannel =
+        MethodChannel('plugins.flutter.io/path_provider');
+    messenger.setMockMethodCallHandler(pathProviderChannel, (call) async {
+      if (call.method == 'getApplicationSupportDirectory') {
+        return Directory.systemTemp.path;
+      }
+      return null;
+    });
+    messenger.setMockMethodCallHandler(studySpeechChannel, (call) async {
+      speechCalls.add(call);
+      return null;
+    });
+    addTearDown(() {
+      messenger.setMockMethodCallHandler(pathProviderChannel, null);
+      messenger.setMockMethodCallHandler(studySpeechChannel, null);
+    });
+    final store = await VocaStore.load();
+    expect(store.autoPlayPronunciation, isTrue);
+    final word = Word(
+      term: '発音',
+      reading: 'はつおん',
+      meaning: '발음',
+    );
+    await tester.pumpWidget(MaterialApp(
+      home: CardStudyPage(store: store, words: [word]),
+    ));
+    await tester.pumpAndSettle();
+
+    final toggle = find.byKey(const ValueKey('auto-pronunciation-toggle'));
+    expect(toggle, findsOneWidget);
+    expect(find.text('발음 자동 재생'), findsNothing);
+    expect(
+        find.descendant(
+            of: toggle, matching: find.byIcon(Icons.volume_up_outlined)),
+        findsOneWidget);
+
+    await tester.tap(toggle);
+    await tester.pump();
+    expect(store.autoPlayPronunciation, isFalse);
+    expect(find.text('자동 발음을 껐어요'), findsOneWidget);
+    expect(
+        find.descendant(
+            of: toggle, matching: find.byIcon(Icons.volume_off_outlined)),
+        findsOneWidget);
+    await tester.pumpAndSettle();
+    expect((await VocaStore.load()).autoPlayPronunciation, isFalse);
+    await tester.tap(find.byKey(const ValueKey('study-card')));
+    await tester.pumpAndSettle();
+    expect(speechCalls, isEmpty);
+
+    await tester.tap(toggle);
+    await tester.pumpAndSettle();
+    expect((await VocaStore.load()).autoPlayPronunciation, isTrue);
+    expect(speechCalls, isEmpty);
+    await tester.tap(find.byKey(const ValueKey('study-card')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('study-card')));
+    await tester.pumpAndSettle();
+    await tester.runAsync(() async {
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    });
+    await tester.pump();
+    final ttsCalls = speechCalls.where((call) => call.method == 'speak');
+    expect(ttsCalls, hasLength(1));
+    expect(ttsCalls.single.arguments['text'], 'はつおん');
+  });
+
+  testWidgets('compact pronunciation toolbar fits a narrow study screen',
+      (tester) async {
+    tester.view.physicalSize = const Size(320, 640);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    await tester.pumpWidget(MaterialApp(
+      home: CardStudyPage(
+        store: store,
+        words: [Word(term: '発音', reading: 'はつおん', meaning: '발음')],
+      ),
+    ));
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    final toggle = find.byKey(const ValueKey('auto-pronunciation-toggle'));
+    expect(toggle.hitTestable(), findsOneWidget);
+    expect(
+        tester.getBottomRight(toggle).dy,
+        lessThan(
+            tester.getTopLeft(find.byKey(const ValueKey('study-card'))).dy));
+    await tester.tap(toggle);
+    await tester.pumpAndSettle();
+    expect(store.autoPlayPronunciation, isFalse);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('study card fades details in term-reading-meaning order',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({});
@@ -1096,9 +1197,10 @@ void main() {
 
     await tester.tap(find.byKey(const ValueKey('study-card')));
     await tester.pumpAndSettle();
-    expect(speechCalls, hasLength(1));
-    expect(speechCalls.single.method, 'speak');
-    expect(speechCalls.single.arguments, {
+    final ttsCalls = speechCalls.where((call) => call.method == 'speak');
+    expect(ttsCalls, hasLength(1));
+    expect(ttsCalls.single.method, 'speak');
+    expect(ttsCalls.single.arguments, {
       'text': 'いせき',
       'language': 'ja-JP',
     });

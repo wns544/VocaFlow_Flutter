@@ -88,3 +88,50 @@ Future<void> speakStudySpeechRequest(StudySpeechRequest request) async {
     // Studying should continue even when a device has no matching TTS voice.
   }
 }
+
+/// Plays an installed pronunciation-pack WAV. Returns false when the native
+/// player rejects the path so callers can fall back to the device TTS.
+Future<bool> playInstalledStudySpeechFile(String path) async {
+  if (path.trim().isEmpty || kIsWeb) return false;
+  try {
+    return await studySpeechChannel
+            .invokeMethod<bool>('playFile', {'path': path}) ??
+        false;
+  } on MissingPluginException {
+    return false;
+  } on Exception {
+    return false;
+  }
+}
+
+/// Creates (or reuses) an on-device Japanese WAV whose accent position was
+/// resolved locally. A null result deliberately falls back to the device TTS.
+Future<String?> synthesizeOnDeviceJapanesePitch({
+  required String reading,
+  required int accentPosition,
+  required int moraCount,
+}) async {
+  if (kIsWeb || reading.trim().isEmpty) return null;
+  try {
+    return await studySpeechChannel.invokeMethod<String>('synthesizePitch', {
+      'reading': reading,
+      'accentPosition': accentPosition,
+      'moraCount': moraCount,
+    });
+  } on MissingPluginException {
+    return null;
+  } on Exception {
+    return null;
+  }
+}
+
+Future<void> stopStudySpeech() async {
+  if (kIsWeb) return;
+  try {
+    await studySpeechChannel.invokeMethod<void>('stop');
+  } on MissingPluginException {
+    // No native audio host is available.
+  } on Exception {
+    // Stopping audio must not interrupt studying.
+  }
+}

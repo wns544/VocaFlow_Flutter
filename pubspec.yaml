@@ -1,7 +1,7 @@
 name: vocaflow
 description: A calm, focused vocabulary study app.
 publish_to: "none"
-version: 1.0.21+28
+version: 1.0.22+29
 
 environment:
   sdk: ">=3.4.0 <4.0.0"
@@ -26,6 +26,7 @@ dependencies:
   flutter_tts: ^4.2.3
   archive: ^3.6.1
   share_plus: ^10.1.4
+  crypto: ^3.0.6
 
 dev_dependencies:
   flutter_test:
@@ -38,8 +39,25 @@ dependency_overrides:
 flutter:
   uses-material-design: true
   assets:
+    - assets/pronunciation/vocaflow-pitch-samples.vfpitch.zip
+    - assets/data/kanjium-accents.txt
     - assets/data/hanja_ko.json
     - assets/licenses/hanjadict-LICENSE.txt
+    - assets/licenses/KANJIUM-NOTICE.txt
+    - assets/licenses/VOICEVOX-CORE-MIT-LICENSE.txt
+    - assets/licenses/VOICEVOX-VVM-TERMS-0.16.4.txt
+    - assets/licenses/VOICEVOX-ONNXRUNTIME-TERMS.txt
+    - assets/licenses/VOICEVOX-ONNXRUNTIME-NOTICES.html
+    - assets/voicevox/shikoku-metan.vvm
+    - assets/voicevox/open_jtalk_dic_utf_8-1.11/COPYING
+    - assets/voicevox/open_jtalk_dic_utf_8-1.11/char.bin
+    - assets/voicevox/open_jtalk_dic_utf_8-1.11/left-id.def
+    - assets/voicevox/open_jtalk_dic_utf_8-1.11/matrix.bin
+    - assets/voicevox/open_jtalk_dic_utf_8-1.11/pos-id.def
+    - assets/voicevox/open_jtalk_dic_utf_8-1.11/rewrite.def
+    - assets/voicevox/open_jtalk_dic_utf_8-1.11/right-id.def
+    - assets/voicevox/open_jtalk_dic_utf_8-1.11/sys.dic
+    - assets/voicevox/open_jtalk_dic_utf_8-1.11/unk.dic
     - assets/splash_design.png
     - assets/icon/vocaflow_icon_1024_coral.png
   fonts:

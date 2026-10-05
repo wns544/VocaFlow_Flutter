@@ -1,0 +1,12 @@
+Kanjium pitch-accent data
+
+Source: https://github.com/mifunetoshiro/kanjium
+Data file: data/source_files/raw/accents.txt
+
+The upstream project attributes the pitch-accent data to Uros O. and licenses
+it under Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA
+4.0). This app includes an unmodified snapshot solely for exact
+spelling-and-reading lookups. The source and license must be retained in
+redistributions of derived data.
+
+License: https://creativecommons.org/licenses/by-sa/4.0/

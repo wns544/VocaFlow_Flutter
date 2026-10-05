@@ -26,6 +26,15 @@ import 'kanji_lookup.dart';
 import 'local_word_search.dart';
 import 'models.dart';
 import 'navigation_trace.dart';
+import 'pronunciation/pronunciation_pack_manager.dart';
+import 'pronunciation/pronunciation_pack_store.dart';
+import 'pronunciation/pronunciation_match.dart';
+import 'pronunciation/pronunciation_resolver.dart';
+import 'pronunciation/pronunciation_store.dart';
+import 'pronunciation/bundled_pitch_dictionary.dart';
+import 'pronunciation/kanjium_pitch_dictionary.dart';
+import 'pronunciation/pitch_accent.dart';
+import 'pronunciation/pitch_accent_line.dart';
 import 'store.dart';
 import 'study_course.dart';
 import 'study_speech.dart';
@@ -40,10 +49,19 @@ const flutterSplashMinimumDuration = Duration(milliseconds: 900);
 const resumeSnapshotChannel = MethodChannel('com.vocaflow.app/resume_snapshot');
 const navigationDiagnosticChannel =
     MethodChannel('com.vocaflow.app/navigation_diagnostics');
+const _bundledPronunciationPackAsset =
+    'assets/pronunciation/vocaflow-pitch-samples.vfpitch.zip';
 final defaultKanjiLookupService = KanjiLookupService();
 final resumeSnapshotNavigatorObserver = _ResumeSnapshotNavigatorObserver();
 final resumeRouteObserver = RouteObserver<ModalRoute<dynamic>>();
 final navigationRouteObserver = _NavigationRouteObserver();
+
+class _ResolvedPitchAccent {
+  const _ResolvedPitchAccent(this.pattern, {required this.fromDictionary});
+
+  final PitchAccentPattern pattern;
+  final bool fromDictionary;
+}
 
 class FavoriteStarIcon extends StatelessWidget {
   const FavoriteStarIcon({super.key, required this.selected, this.size = 22});
@@ -1826,6 +1844,9 @@ class _CardStudyPageState extends State<CardStudyPage>
   var revealed = false;
   var showingExplanation = false;
   late bool _autoPlayPronunciation;
+  final _pronunciationResolver =
+      PronunciationResolver(PronunciationPackStore());
+  final _pronunciationSelections = PronunciationSelectionStore();
   var _relatedCurrentScopeOnly = false;
   var exiting = false;
   var finishingStudy = false;
@@ -1940,6 +1961,9 @@ class _CardStudyPageState extends State<CardStudyPage>
     navigationBackGate.reset('study_page_initialized');
     WidgetsBinding.instance.addObserver(this);
     _autoPlayPronunciation = widget.store.autoPlayPronunciation;
+    unawaited(_loadPronunciationSelections());
+    unawaited(_installBundledPronunciationPack());
+    unawaited(BundledPitchDictionary.load());
     _bookIdsByWord = {
       for (final book in widget.store.books)
         for (final word in book.words) word: book.id,
@@ -2164,6 +2188,77 @@ class _CardStudyPageState extends State<CardStudyPage>
   }
 
   String? _bookIdForWord(Word word) => _bookIdsByWord[word];
+
+  PronunciationCardRef? _pronunciationReferenceFor(Word word) {
+    final bookId = _bookIdForWord(word) ?? activeBookId;
+    if (bookId == null) return null;
+    return PronunciationCardRef.fromCard(
+      bookId: bookId,
+      wordId: word.id,
+      term: word.term,
+      reading: word.reading,
+      meaning: word.meaning,
+    );
+  }
+
+  Future<void> _loadPronunciationSelections() async {
+    await _pronunciationSelections.load();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _installBundledPronunciationPack() async {
+    if (kIsWeb) return;
+    try {
+      final bytes = (await rootBundle.load(_bundledPronunciationPackAsset))
+          .buffer
+          .asUint8List();
+      await _pronunciationResolver.store.install(bytes);
+      _pronunciationResolver.invalidate();
+      if (mounted) setState(() {});
+    } catch (_) {
+      // The existing device TTS remains available if an optional bundled pack
+      // cannot be installed on this device.
+    }
+  }
+
+  Future<PronunciationMatch> _pronunciationMatch(Word word) =>
+      resolvePronunciationMatch(
+        resolver: _pronunciationResolver,
+        term: word.term,
+        reading: word.reading,
+        selections: _pronunciationSelections,
+        reference: _pronunciationReferenceFor(word),
+      );
+
+  Future<_ResolvedPitchAccent?> _pitchAccentFor(Word word) async {
+    final match = await _pronunciationMatch(word);
+    final installed = match.active?.entry.pattern;
+    if (installed != null) {
+      return _ResolvedPitchAccent(installed, fromDictionary: false);
+    }
+    if (word.reading.trim().isEmpty) return null;
+    final candidates = await BundledPitchDictionary.lookup(
+      term: word.term,
+      reading: word.reading,
+    );
+    if (candidates.length != 1) return null;
+    final pattern = candidates.single.toPattern();
+    return pattern == null
+        ? null
+        : _ResolvedPitchAccent(pattern, fromDictionary: true);
+  }
+
+  _ResolvedPitchAccent? _cachedDictionaryPitchAccentFor(Word word) {
+    final dictionary = BundledPitchDictionary.cached;
+    if (dictionary == null || word.reading.trim().isEmpty) return null;
+    final candidates =
+        dictionary.lookup(term: word.term, reading: word.reading);
+    if (candidates.length != 1) return null;
+    final pattern = candidates.single.toPattern();
+    return pattern == null
+        ? null
+        : _ResolvedPitchAccent(pattern, fromDictionary: true);
+  }
 
   List<Word> _resolveStoredWords(List<int> ids, List<String> bookIds) {
     final resolved = <Word>[];
@@ -2472,11 +2567,13 @@ class _CardStudyPageState extends State<CardStudyPage>
       builder: (context) => _KanjiDetailSheet(
         character: character,
         word: word,
+        pronunciationReference: _pronunciationReferenceFor(word),
         store: widget.store,
         service: widget.kanjiLookupService ?? defaultKanjiLookupService,
       ),
     );
     vocaBackLog('kanji sheet closed character=$character word=${word.term}');
+    if (mounted) setState(() {});
   }
 
   Future<void> editCurrentWord() async {
@@ -2516,10 +2613,7 @@ class _CardStudyPageState extends State<CardStudyPage>
     persistStudy();
     scheduleResumeSnapshotCapture('study');
     if (shouldReveal && _autoPlayPronunciation) {
-      speakStudySpeechRequest(studySpeechRequestForWord(
-        term: word.term,
-        reading: word.reading,
-      ));
+      unawaited(_speakPronunciation(word));
     }
   }
 
@@ -2528,6 +2622,93 @@ class _CardStudyPageState extends State<CardStudyPage>
     setState(() => _autoPlayPronunciation = value);
     unawaited(widget.store.setAutoPlayPronunciation(value));
   }
+
+  void _toggleAutoPlayPronunciation() {
+    final enabled = !_autoPlayPronunciation;
+    _setAutoPlayPronunciation(enabled);
+    ScaffoldMessenger.of(context)
+      ..removeCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: Text(enabled ? '자동 발음을 켰어요' : '자동 발음을 껐어요'),
+        duration: const Duration(milliseconds: 900),
+      ));
+  }
+
+  Future<void> _speakPronunciation(Word word) async {
+    try {
+      final match = await _pronunciationMatch(word).timeout(
+          const Duration(milliseconds: 150),
+          onTimeout: PronunciationMatch.empty);
+      if (match.active != null &&
+          await playInstalledStudySpeechFile(match.active!.audioPath)) {
+        return;
+      }
+      final pitch = _cachedDictionaryPitchAccentFor(word);
+      if (pitch != null) {
+        final generated = await synthesizeOnDeviceJapanesePitch(
+          reading: pitch.pattern.reading,
+          accentPosition: pitch.pattern.accentPosition,
+          moraCount: pitch.pattern.morae.length,
+        );
+        if (generated != null &&
+            await playInstalledStudySpeechFile(generated)) {
+          return;
+        }
+      }
+    } catch (_) {
+      // A missing or malformed optional pronunciation pack must never prevent
+      // the device TTS fallback from speaking the study card.
+    }
+    await speakStudySpeechRequest(studySpeechRequestForWord(
+      term: word.term,
+      reading: word.reading,
+    ));
+  }
+
+  Widget _pitchAccentForWord(Word word) => FutureBuilder<_ResolvedPitchAccent?>(
+        future: _pitchAccentFor(word),
+        builder: (context, snapshot) {
+          final resolved = snapshot.data;
+          if (resolved == null) {
+            return const SizedBox.shrink();
+          }
+          return Padding(
+            padding: const EdgeInsets.only(top: 9),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                PitchAccentLine(pattern: resolved.pattern),
+                if (resolved.fromDictionary)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 3),
+                    child: Text('사전 고저',
+                        style:
+                            TextStyle(color: Color(0xFF8E8E93), fontSize: 11)),
+                  ),
+              ],
+            ),
+          );
+        },
+      );
+
+  Widget _pronunciationChoiceForWord(Word word) =>
+      FutureBuilder<PronunciationMatch>(
+        future: _pronunciationMatch(word),
+        builder: (context, snapshot) {
+          final match = snapshot.data;
+          if (match == null || match.candidates.length < 2) {
+            return const SizedBox.shrink();
+          }
+          return Padding(
+            padding: const EdgeInsets.only(top: 7),
+            child: TextButton.icon(
+              onPressed: () => showKanjiDetails(word.term, word),
+              icon: const Icon(Icons.tune_outlined, size: 17),
+              label: Text(match.requiresSelection ? '발음 선택 필요' : '발음 설정'),
+            ),
+          );
+        },
+      );
 
   void showExplanation(Word word) {
     if (word.explanation.trim().isEmpty) return;
@@ -2668,6 +2849,8 @@ class _CardStudyPageState extends State<CardStudyPage>
                     const SizedBox(height: 12),
                     readingText(word),
                   ],
+                  _pitchAccentForWord(word),
+                  _pronunciationChoiceForWord(word),
                   const SizedBox(height: 8),
                   Text(word.meaning,
                       textAlign: TextAlign.center,
@@ -2888,6 +3071,23 @@ class _CardStudyPageState extends State<CardStudyPage>
                     _RoundIconButton(
                         icon: Icons.edit_outlined, onTap: editCurrentWord),
                     const SizedBox(width: 6),
+                    _RoundIconButton(
+                      key: const ValueKey('auto-pronunciation-toggle'),
+                      icon: _autoPlayPronunciation
+                          ? Icons.volume_up_outlined
+                          : Icons.volume_off_outlined,
+                      tooltip: _autoPlayPronunciation ? '자동 발음 켜짐' : '자동 발음 꺼짐',
+                      semanticLabel: '발음 자동 재생',
+                      toggled: _autoPlayPronunciation,
+                      iconColor: _autoPlayPronunciation
+                          ? coral
+                          : const Color(0xFF8E8E93),
+                      backgroundColor: _autoPlayPronunciation
+                          ? coral.withValues(alpha: .10)
+                          : Colors.white,
+                      onTap: _toggleAutoPlayPronunciation,
+                    ),
+                    const SizedBox(width: 6),
                     if (kIsWeb) ...[
                       _RoundIconButton(
                         icon: Icons.keyboard_alt_outlined,
@@ -3055,47 +3255,6 @@ class _CardStudyPageState extends State<CardStudyPage>
                     ),
                   ],
                   const SizedBox(height: 4),
-                  Semantics(
-                    label: '발음 자동 재생',
-                    toggled: _autoPlayPronunciation,
-                    child: Container(
-                      padding: const EdgeInsets.only(left: 11, right: 4),
-                      decoration: BoxDecoration(
-                        color: _autoPlayPronunciation
-                            ? sea.withValues(alpha: .10)
-                            : const Color(0xFFF2F2F7),
-                        borderRadius: BorderRadius.circular(99),
-                      ),
-                      child: Row(mainAxisSize: MainAxisSize.min, children: [
-                        Icon(
-                          _autoPlayPronunciation
-                              ? Icons.volume_up_outlined
-                              : Icons.volume_off_outlined,
-                          size: 17,
-                          color: _autoPlayPronunciation
-                              ? sea
-                              : const Color(0xFF8E8E93),
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          '발음 자동 재생',
-                          style: TextStyle(
-                            color: _autoPlayPronunciation
-                                ? sea
-                                : const Color(0xFF6E6E73),
-                            fontSize: 12,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                        Switch.adaptive(
-                          key: const ValueKey('auto-pronunciation-toggle'),
-                          value: _autoPlayPronunciation,
-                          onChanged: _setAutoPlayPronunciation,
-                        ),
-                      ]),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
                   Row(children: [
                     if (!horizontalSwipe)
                       Expanded(
@@ -3459,26 +3618,49 @@ class _StudyCardLayer extends StatelessWidget {
 }
 
 class _RoundIconButton extends StatelessWidget {
-  const _RoundIconButton({super.key, required this.icon, required this.onTap});
+  const _RoundIconButton({
+    super.key,
+    required this.icon,
+    required this.onTap,
+    this.tooltip,
+    this.semanticLabel,
+    this.toggled,
+    this.iconColor = const Color(0xFF8E8E93),
+    this.backgroundColor = Colors.white,
+  });
+
   final IconData icon;
   final VoidCallback? onTap;
+  final String? tooltip;
+  final String? semanticLabel;
+  final bool? toggled;
+  final Color iconColor;
+  final Color backgroundColor;
 
   @override
-  Widget build(BuildContext context) => Opacity(
-        opacity: onTap == null ? .35 : 1,
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(99),
-          child: Container(
-              width: 36,
-              height: 36,
-              decoration: BoxDecoration(
-                  color: Colors.white,
-                  border: Border.all(color: const Color(0x14000000)),
-                  shape: BoxShape.circle),
-              child: Icon(icon, color: const Color(0xFF8E8E93), size: 17)),
-        ),
-      );
+  Widget build(BuildContext context) {
+    final button = Opacity(
+      opacity: onTap == null ? .35 : 1,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(99),
+        child: Container(
+            width: 36,
+            height: 36,
+            decoration: BoxDecoration(
+                color: backgroundColor,
+                border: Border.all(color: const Color(0x14000000)),
+                shape: BoxShape.circle),
+            child: Icon(icon, color: iconColor, size: 17)),
+      ),
+    );
+    final semanticButton = semanticLabel == null
+        ? button
+        : Semantics(label: semanticLabel, toggled: toggled, child: button);
+    return tooltip == null
+        ? semanticButton
+        : Tooltip(message: tooltip!, child: semanticButton);
+  }
 }
 
 class _TappableHanTerm extends StatelessWidget {
@@ -3551,12 +3733,14 @@ class _KanjiDetailSheet extends StatefulWidget {
   const _KanjiDetailSheet({
     required this.character,
     required this.word,
+    required this.pronunciationReference,
     required this.store,
     required this.service,
   });
 
   final String character;
   final Word word;
+  final PronunciationCardRef? pronunciationReference;
   final VocaStore store;
   final KanjiLookupService service;
 
@@ -3565,14 +3749,54 @@ class _KanjiDetailSheet extends StatefulWidget {
 }
 
 class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
+  final _pronunciationResolver =
+      PronunciationResolver(PronunciationPackStore());
+  final _pronunciationSelections = PronunciationSelectionStore();
   bool get isKanjiDetail =>
-      widget.character.runes.map(String.fromCharCode).any(isHanCharacter);
+      widget.character.runes.length == 1 && isHanCharacter(widget.character);
   late final Future<KoreanHanjaEntry?> korean = isKanjiDetail
       ? widget.service.lookupKorean(widget.character)
       : Future<KoreanHanjaEntry?>.value(null);
   late final Future<JapaneseKanjiEntry?> japanese = isKanjiDetail
       ? widget.service.lookupJapanese(widget.character)
       : Future<JapaneseKanjiEntry?>.value(null);
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadPronunciationSelections());
+  }
+
+  Future<void> _loadPronunciationSelections() async {
+    await _pronunciationSelections.load();
+    if (mounted) setState(() {});
+  }
+
+  Future<PronunciationMatch> _pronunciationMatch() => resolvePronunciationMatch(
+        resolver: _pronunciationResolver,
+        term: widget.word.term,
+        reading: widget.word.reading,
+        selections: _pronunciationSelections,
+        reference: widget.pronunciationReference,
+      );
+
+  Future<_ResolvedPitchAccent?> _resolvedPitchAccent() async {
+    final match = await _pronunciationMatch();
+    final installed = match.active?.entry.pattern;
+    if (installed != null) {
+      return _ResolvedPitchAccent(installed, fromDictionary: false);
+    }
+    if (widget.word.reading.trim().isEmpty) return null;
+    final candidates = await BundledPitchDictionary.lookup(
+      term: widget.word.term,
+      reading: widget.word.reading,
+    );
+    if (candidates.length != 1) return null;
+    final pattern = candidates.single.toPattern();
+    return pattern == null
+        ? null
+        : _ResolvedPitchAccent(pattern, fromDictionary: true);
+  }
 
   void showMessage(String message) {
     if (!mounted) return;
@@ -3658,6 +3882,148 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
     ));
   }
 
+  Future<void> _speakWordPronunciation() async {
+    try {
+      final match = await _pronunciationMatch().timeout(
+          const Duration(milliseconds: 150),
+          onTimeout: PronunciationMatch.empty);
+      if (match.active != null &&
+          await playInstalledStudySpeechFile(match.active!.audioPath)) {
+        return;
+      }
+    } catch (_) {
+      // Optional downloaded audio must not stop the device TTS fallback.
+    }
+    await speakStudySpeechRequest(studySpeechRequestForWord(
+      term: widget.word.term,
+      reading: widget.word.reading,
+    ));
+  }
+
+  Widget _pitchAccent() => FutureBuilder<_ResolvedPitchAccent?>(
+        future: _resolvedPitchAccent(),
+        builder: (context, snapshot) {
+          final resolved = snapshot.data;
+          if (resolved == null) {
+            return const SizedBox.shrink();
+          }
+          return Padding(
+            padding: const EdgeInsets.only(top: 10),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                PitchAccentLine(pattern: resolved.pattern),
+                if (resolved.fromDictionary)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 3),
+                    child: Text('Kanjium 사전 고저',
+                        style:
+                            TextStyle(color: Color(0xFF8E8E93), fontSize: 11)),
+                  ),
+              ],
+            ),
+          );
+        },
+      );
+
+  Future<void> _showPronunciationChoices() async {
+    final reference = widget.pronunciationReference;
+    if (reference == null) return;
+    final match = await _pronunciationMatch();
+    if (!mounted || match.candidates.length < 2) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      useSafeArea: true,
+      builder: (sheetContext) => Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            const Text('발음 설정',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900)),
+            const SizedBox(height: 6),
+            Text(
+                '${widget.word.term} · ${widget.word.reading}\n${widget.word.meaning}',
+                style: const TextStyle(color: Color(0xFF6E6E73))),
+            const SizedBox(height: 16),
+            for (final candidate in match.candidates)
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(children: [
+                        Expanded(
+                          child: Text(
+                            '${candidate.entry.accentPosition}형',
+                            style: const TextStyle(fontWeight: FontWeight.w800),
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: '이 후보 미리 듣기',
+                          onPressed: () =>
+                              playInstalledStudySpeechFile(candidate.audioPath),
+                          icon: const Icon(Icons.play_circle_outline),
+                        ),
+                      ]),
+                      if (candidate.entry.pattern case final pattern?)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 10),
+                          child: PitchAccentLine(pattern: pattern),
+                        ),
+                      FilledButton(
+                        onPressed: () async {
+                          await _pronunciationSelections.select(
+                              reference, candidate.entry.candidateId);
+                          if (!sheetContext.mounted) return;
+                          Navigator.pop(sheetContext);
+                          if (mounted) setState(() {});
+                        },
+                        child: const Text('이 카드에 적용'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            if (match.hasSavedSelection)
+              TextButton.icon(
+                onPressed: () async {
+                  await _pronunciationSelections.clear(reference);
+                  if (!sheetContext.mounted) return;
+                  Navigator.pop(sheetContext);
+                  if (mounted) setState(() {});
+                },
+                icon: const Icon(Icons.restart_alt),
+                label: const Text('선택 초기화'),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _pronunciationChoiceButton() => FutureBuilder<PronunciationMatch>(
+        future: _pronunciationMatch(),
+        builder: (context, snapshot) {
+          final match = snapshot.data;
+          if (widget.pronunciationReference == null ||
+              match == null ||
+              match.candidates.length < 2) {
+            return const SizedBox.shrink();
+          }
+          return Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: OutlinedButton.icon(
+              onPressed: _showPronunciationChoices,
+              icon: const Icon(Icons.tune_outlined, size: 18),
+              label: Text(match.requiresSelection ? '발음 선택 필요' : '발음 설정'),
+            ),
+          );
+        },
+      );
+
   Future<void> openChatGptPrompt(String prompt) async {
     final configured = widget.store.chatGptConversationUrl;
     final uri = Uri.tryParse(configured);
@@ -3739,12 +4105,18 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
               if (!isKanjiDetail) ...[
                 _KanjiInfoCard(
                   title: '발음',
-                  child: Text(widget.word.reading,
-                      style: TextStyle(
-                        fontSize: 20,
-                        fontFamily: japaneseFontFamily(widget.store),
-                        fontWeight: FontWeight.w700,
-                      )),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(widget.word.reading,
+                          style: TextStyle(
+                            fontSize: 20,
+                            fontFamily: japaneseFontFamily(widget.store),
+                            fontWeight: FontWeight.w700,
+                          )),
+                      _pitchAccent(),
+                    ],
+                  ),
                 ),
                 const SizedBox(height: 10),
                 _KanjiInfoCard(
@@ -3757,6 +4129,15 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
                 ),
               ],
               const SizedBox(height: 14),
+              if (!isKanjiDetail)
+                FilledButton.icon(
+                  key: const ValueKey('listen-kana-word-pronunciation'),
+                  onPressed: _speakWordPronunciation,
+                  icon: const Icon(Icons.volume_up_outlined, size: 18),
+                  label: const Text('발음 듣기'),
+                ),
+              if (!isKanjiDetail) _pronunciationChoiceButton(),
+              if (!isKanjiDetail) const SizedBox(height: 8),
               OutlinedButton.icon(
                 key: const ValueKey('copy-kanji-detail'),
                 onPressed: copyCharacter,
@@ -7088,6 +7469,29 @@ class _SettingsPageState extends State<SettingsPage> {
         ),
         const SizedBox(height: 20),
         const _SectionTitle('학습 카드 설정'),
+        Card(
+          child: ListTile(
+            key: const ValueKey('pronunciation-pack-setting'),
+            leading: const Icon(Icons.graphic_eq, color: sea),
+            title: const Text('일본어 발음팩',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+            subtitle: const Text('고저 액센트 음성과 표시용 팩을 가져옵니다.'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(MaterialPageRoute(
+              builder: (_) => const PronunciationPackManager(),
+            )),
+          ),
+        ),
+        const SizedBox(height: 10),
+        const Card(
+          child: ListTile(
+            leading: Icon(Icons.record_voice_over_outlined, color: sea),
+            title: Text('오프라인 일본어 고저 발음',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+            subtitle: Text('기기 안에서 생성 · VOICEVOX:四国めたん'),
+          ),
+        ),
+        const SizedBox(height: 10),
         Card(
           child: ListTile(
             key: const ValueKey('card-font-size-setting'),

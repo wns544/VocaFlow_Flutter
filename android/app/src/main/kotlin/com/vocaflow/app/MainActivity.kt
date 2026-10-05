@@ -12,6 +12,7 @@ import android.os.Handler
 import android.os.Looper
 
 import android.os.SystemClock
+import android.media.MediaPlayer
 import android.speech.tts.TextToSpeech
 import android.util.Log
 import android.view.KeyEvent
@@ -39,6 +40,7 @@ class MainActivity : FlutterActivity() {
         getSharedPreferences("resume_snapshot", MODE_PRIVATE)
     }
     private var textToSpeech: TextToSpeech? = null
+    private var studyAudio: MediaPlayer? = null
     private var speechReady = false
     private var pendingSpeech: Pair<String, String>? = null
     private var snapshotOverlay: ImageView? = null
@@ -73,19 +75,43 @@ class MainActivity : FlutterActivity() {
         }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
             .setMethodCallHandler { call, result ->
-                if (call.method != "speak") {
-                    result.notImplemented()
-                    return@setMethodCallHandler
+                when (call.method) {
+                    "speak" -> {
+                        val text = call.argument<String>("text").orEmpty()
+                        val language = call.argument<String>("language") ?: "en-US"
+                        if (text.isBlank()) {
+                            result.success(null)
+                            return@setMethodCallHandler
+                        }
+                        stopStudyAudio()
+                        if (speechReady) speak(text, language)
+                        else pendingSpeech = text to language
+                        result.success(null)
+                    }
+                    "playFile" -> {
+                        result.success(playStudyAudio(call.argument<String>("path").orEmpty()))
+                    }
+                    "synthesizePitch" -> {
+                        val reading = call.argument<String>("reading").orEmpty()
+                        val accentPosition = call.argument<Int>("accentPosition") ?: -1
+                        val moraCount = call.argument<Int>("moraCount") ?: 0
+                        Thread {
+                            val path = VoicevoxBridge.synthesize(
+                                this,
+                                reading,
+                                accentPosition,
+                                moraCount,
+                            )
+                            mainHandler.post { result.success(path) }
+                        }.start()
+                    }
+                    "stop" -> {
+                        stopStudyAudio()
+                        textToSpeech?.stop()
+                        result.success(null)
+                    }
+                    else -> result.notImplemented()
                 }
-                val text = call.argument<String>("text").orEmpty()
-                val language = call.argument<String>("language") ?: "en-US"
-                if (text.isBlank()) {
-                    result.success(null)
-                    return@setMethodCallHandler
-                }
-                if (speechReady) speak(text, language)
-                else pendingSpeech = text to language
-                result.success(null)
             }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, externalChannelName)
             .setMethodCallHandler { call, result ->
@@ -376,8 +402,37 @@ class MainActivity : FlutterActivity() {
         engine.speak(text, TextToSpeech.QUEUE_FLUSH, Bundle(), "vocaflow-study-word")
     }
 
+    private fun playStudyAudio(path: String): Boolean {
+        val root = File(filesDir, "pronunciation").canonicalFile
+        val candidate = try { File(path).canonicalFile } catch (_: Exception) { return false }
+        if (!candidate.isFile || !candidate.path.startsWith(root.path + File.separator) ||
+            candidate.extension.lowercase() != "wav") return false
+        stopStudyAudio()
+        textToSpeech?.stop()
+        return try {
+            studyAudio = MediaPlayer.create(this, Uri.fromFile(candidate)).apply {
+                setOnCompletionListener { stopStudyAudio() }
+                start()
+            }
+            studyAudio != null
+        } catch (_: Exception) {
+            stopStudyAudio()
+            false
+        }
+    }
+
+    private fun stopStudyAudio() {
+        studyAudio?.let { player ->
+            player.setOnCompletionListener(null)
+            player.stop()
+            player.release()
+        }
+        studyAudio = null
+    }
+
     override fun onDestroy() {
         snapshotOverlay = null
+        stopStudyAudio()
         textToSpeech?.stop()
         textToSpeech?.shutdown()
         textToSpeech = null

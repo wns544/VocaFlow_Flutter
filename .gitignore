@@ -4,6 +4,9 @@
 .flutter-plugins-dependencies
 .packages
 build/
+# Bundled offline VOICEVOX model/dictionary files exceed normal GitHub file
+# limits. They ship inside the signed GitHub Release APK instead.
+assets/voicevox/
 coverage/
 android/.gradle/
 android/local.properties
