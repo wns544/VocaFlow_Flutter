@@ -34,11 +34,10 @@ class StudySpeechRequest {
 const studySpeechChannel = MethodChannel('com.vocaflow.app/study_speech');
 final _webStudySpeech = FlutterTts();
 
-// VOICEVOX runs as a native Android library.  A native fault terminates the
-// whole process before Dart can recover, so keep the experimental synthesizer
-// disabled until it has been verified against affected Samsung devices.  The
-// caller deliberately falls back to the device's normal Japanese TTS.
-const _onDevicePitchSynthesisEnabled = false;
+// The native bridge itself has a guarded loader. If a device cannot load its
+// bundled voice runtime, callers fall back to the device's normal Japanese
+// TTS instead of interrupting study.
+const _onDevicePitchSynthesisEnabled = true;
 
 StudySpeechLanguage detectStudySpeechLanguage(String text) {
   if (RegExp(r'[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]')

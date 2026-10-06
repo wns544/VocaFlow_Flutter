@@ -19,10 +19,17 @@ object VoicevoxBridge {
     private const val cacheVersion = "voicevox-0.17.0-metan-normal-1"
     private val initializationLock = Any()
 
-    init {
-        System.loadLibrary("voicevox_onnxruntime")
-        System.loadLibrary("voicevox_core")
-        System.loadLibrary("vocaflow_voicevox")
+    // A missing or incompatible native dependency must not escape a worker
+    // thread: Android treats that as an uncaught exception and terminates the
+    // whole app.  The Dart caller then uses the normal device TTS instead.
+    private val nativeAvailable: Boolean by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        runCatching {
+            System.loadLibrary("voicevox_onnxruntime")
+            System.loadLibrary("voicevox_core")
+            System.loadLibrary("vocaflow_voicevox")
+        }.onFailure { error ->
+            Log.w(logTag, "Bundled Japanese voice runtime unavailable", error)
+        }.isSuccess
     }
 
     fun synthesize(
@@ -34,6 +41,7 @@ object VoicevoxBridge {
         if (reading.isBlank() || accentPosition !in 0..moraCount || moraCount <= 0) {
             return null
         }
+        if (!nativeAvailable) return null
         return try {
             val root = File(context.filesDir, assetRoot)
             copyAssetTree(context, assetRoot, root)
