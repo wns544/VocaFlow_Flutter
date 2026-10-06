@@ -34,6 +34,12 @@ class StudySpeechRequest {
 const studySpeechChannel = MethodChannel('com.vocaflow.app/study_speech');
 final _webStudySpeech = FlutterTts();
 
+// VOICEVOX runs as a native Android library.  A native fault terminates the
+// whole process before Dart can recover, so keep the experimental synthesizer
+// disabled until it has been verified against affected Samsung devices.  The
+// caller deliberately falls back to the device's normal Japanese TTS.
+const _onDevicePitchSynthesisEnabled = false;
+
 StudySpeechLanguage detectStudySpeechLanguage(String text) {
   if (RegExp(r'[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]')
       .hasMatch(text)) {
@@ -111,7 +117,9 @@ Future<String?> synthesizeOnDeviceJapanesePitch({
   required int accentPosition,
   required int moraCount,
 }) async {
-  if (kIsWeb || reading.trim().isEmpty) return null;
+  if (!_onDevicePitchSynthesisEnabled || kIsWeb || reading.trim().isEmpty) {
+    return null;
+  }
   try {
     return await studySpeechChannel.invokeMethod<String>('synthesizePitch', {
       'reading': reading,
