@@ -138,6 +138,11 @@ void main() {
     expect(store.studyEventLog, hasLength(1));
     expect(store.studyEventLog.single.wordId, word.id);
     expect(store.studyEventLog.single.sessionIndexes, [0]);
+    expect(store.studyEventLog.single.previousState, StudyState.fresh);
+    expect(store.studyEventLog.single.previousCorrectCount, 0);
+    expect(store.studyEventLog.single.previousWrongCount, 0);
+    expect(store.studyEventLog.single.previousLastStudiedAt, isNull);
+    expect(store.studyEventLog.single.previousLastWrongAt, isNull);
 
     await store.completeSessions(store.books.first.id, const [0]);
     expect(store.dailyStudyStats[today]?.completedSessions, 1);

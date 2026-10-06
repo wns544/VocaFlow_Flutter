@@ -234,6 +234,11 @@ class StudyEventLog {
     required this.wordId,
     required this.sessionIndexes,
     required this.decision,
+    this.previousState,
+    this.previousCorrectCount,
+    this.previousWrongCount,
+    this.previousLastStudiedAt,
+    this.previousLastWrongAt,
   });
 
   final String id;
@@ -243,6 +248,11 @@ class StudyEventLog {
   final int wordId;
   final List<int> sessionIndexes;
   final StudyState decision;
+  final StudyState? previousState;
+  final int? previousCorrectCount;
+  final int? previousWrongCount;
+  final DateTime? previousLastStudiedAt;
+  final DateTime? previousLastWrongAt;
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -252,6 +262,11 @@ class StudyEventLog {
         'wordId': wordId,
         'sessionIndexes': sessionIndexes,
         'decision': decision.name,
+        'previousState': previousState?.name,
+        'previousCorrectCount': previousCorrectCount,
+        'previousWrongCount': previousWrongCount,
+        'previousLastStudiedAt': previousLastStudiedAt?.toIso8601String(),
+        'previousLastWrongAt': previousLastWrongAt?.toIso8601String(),
       };
 
   factory StudyEventLog.fromJson(Map<String, dynamic> json) => StudyEventLog(
@@ -268,6 +283,15 @@ class StudyEventLog {
           (state) => state.name == json['decision'],
           orElse: () => StudyState.fresh,
         ),
+        previousState: StudyState.values
+            .where((state) => state.name == json['previousState'])
+            .firstOrNull,
+        previousCorrectCount: (json['previousCorrectCount'] as num?)?.toInt(),
+        previousWrongCount: (json['previousWrongCount'] as num?)?.toInt(),
+        previousLastStudiedAt:
+            DateTime.tryParse(json['previousLastStudiedAt'] as String? ?? ''),
+        previousLastWrongAt:
+            DateTime.tryParse(json['previousLastWrongAt'] as String? ?? ''),
       );
 }
 
@@ -564,6 +588,39 @@ class VocaStore {
     }
   }
 
+  /// Completion badges on book and course lists are learning state too. Keep
+  /// them beside every recovery checkpoint so a rollback cannot leave a book
+  /// looking completed after its card decisions were restored.
+  Map<String, Object?> _completionRecoverySnapshot() => {
+        'completedSessionKeys':
+            List<String>.from(_prefs.getStringList(_completedKey) ?? const [])
+              ..sort(),
+        'completedAt': completedAt.map(
+          (key, value) => MapEntry(key, value.toIso8601String()),
+        ),
+        'rangeCoursePasses': coursePasses,
+        'dailyStudyStats': dailyStudyStats.map(
+          (key, value) => MapEntry(key, value.toJson()),
+        ),
+      };
+
+  Future<void> _recordCompletionRecoveryCheckpoint({
+    required String reason,
+    String? bookId,
+    List<int> sessionIndexes = const [],
+    int? rangeStart,
+    int? rangeEnd,
+  }) =>
+      cloudChanges
+          .recordDiagnostic('study_completion_recovery_checkpoint', data: {
+        'reason': reason,
+        'bookId': bookId,
+        'sessionIndexes': sessionIndexes,
+        'rangeStart': rangeStart,
+        'rangeEnd': rangeEnd,
+        'completion': _completionRecoverySnapshot(),
+      });
+
   Future<void> _saveCompletedAt(Map<String, DateTime> values) {
     _completedAtCache = Map<String, DateTime>.from(values);
     return _prefs.setString(
@@ -609,6 +666,11 @@ class VocaStore {
     required String? bookId,
     required List<int> sessionIndexes,
     required DateTime now,
+    required StudyState previousState,
+    required int previousCorrectCount,
+    required int previousWrongCount,
+    required DateTime? previousLastStudiedAt,
+    required DateTime? previousLastWrongAt,
   }) async {
     final day = _dayKey(now);
     final stats = Map<String, DailyStudyStats>.from(dailyStudyStats);
@@ -629,6 +691,11 @@ class VocaStore {
       wordId: word.id,
       sessionIndexes: sessionIndexes,
       decision: decision,
+      previousState: previousState,
+      previousCorrectCount: previousCorrectCount,
+      previousWrongCount: previousWrongCount,
+      previousLastStudiedAt: previousLastStudiedAt,
+      previousLastWrongAt: previousLastWrongAt,
     );
     await _saveStudyEventLog(
         _prunedStudyEventLog([event, ...studyEventLog], now: now));
@@ -900,20 +967,14 @@ class VocaStore {
       await _saveActiveStudyTombstones(tombstones);
     }
     if (markCloudChange) await cloudChanges.markLearningState();
-    unawaited(cloudChanges.recordDiagnostic('active_study_saved', data: {
+    // Keep full queue and decision context in the device-local append-only
+    // journal. This is recovery evidence only; vocabulary card documents are
+    // never written or extended for this feature.
+    await cloudChanges.recordDiagnostic('study_recovery_checkpoint', data: {
       'studyKey': resolvedKey,
-      'bookId': updatedActive.bookId,
-      'sessionIndexes': updatedActive.sessionIndexes,
-      'rangeStart': updatedActive.rangeStart,
-      'rangeEnd': updatedActive.rangeEnd,
-      'queueCount': updatedActive.queueIds.length,
-      'queueHeadWordId':
-          updatedActive.queueIds.isEmpty ? null : updatedActive.queueIds.first,
-      'memorized': updatedActive.memorized,
-      'total': updatedActive.total,
-      'lastWordId': updatedActive.lastWordId,
-      'lastState': updatedActive.lastState?.name,
-    }));
+      'activeStudy': updatedActive.toJson(),
+      'completion': _completionRecoverySnapshot(),
+    });
     return updatedActive;
   }
 
@@ -1484,6 +1545,11 @@ class VocaStore {
       ..add(_dayKey(DateTime.now()));
     await _prefs.setStringList(_studyDaysKey, days.toList());
     await _clearActiveStudiesForSessions(bookId, completedIndexes);
+    await _recordCompletionRecoveryCheckpoint(
+      reason: 'sessions_completed',
+      bookId: bookId,
+      sessionIndexes: completedIndexes.toList()..sort(),
+    );
     await cloudChanges.markProfile();
     onSessionCompleted?.call();
   }
@@ -1500,6 +1566,12 @@ class VocaStore {
       ..add(_dayKey(now));
     await _prefs.setStringList(_studyDaysKey, days.toList());
     await clearActiveCourseForBook(bookId, markCloudChange: false);
+    await _recordCompletionRecoveryCheckpoint(
+      reason: 'range_course_completed',
+      bookId: bookId,
+      rangeStart: rangeStart,
+      rangeEnd: rangeEnd,
+    );
     await cloudChanges.markProfile();
     onSessionCompleted?.call();
     return true;
@@ -1779,7 +1851,9 @@ class VocaStore {
     final beforeState = word.state;
     final beforeCorrect = word.correctCount;
     final beforeWrong = word.wrongCount;
-    word.state = state;
+    final beforeLastStudiedAt = word.lastStudiedAt;
+    final beforeLastWrongAt = word.lastWrongAt;
+    final now = DateTime.now();
     WordBook? book;
     for (final candidate in books) {
       if (candidate.words.any((item) => item.id == word.id)) {
@@ -1787,8 +1861,28 @@ class VocaStore {
         break;
       }
     }
+    final recoveryId =
+        '${now.microsecondsSinceEpoch}:${bookId ?? book?.id ?? 'unknown'}:${word.id}';
     if (recordAttempt) {
-      final now = DateTime.now();
+      // Write the inverse data before mutating the word. If the process dies
+      // during this decision, this record is enough to restore the card.
+      await cloudChanges.recordDiagnostic('study_decision_prepared', data: {
+        'recoveryId': recoveryId,
+        'bookId': bookId ?? book?.id,
+        'wordId': word.id,
+        'term': word.term,
+        'reading': word.reading,
+        'decision': state.name,
+        'beforeState': beforeState.name,
+        'beforeCorrectCount': beforeCorrect,
+        'beforeWrongCount': beforeWrong,
+        'beforeLastStudiedAt': beforeLastStudiedAt?.toIso8601String(),
+        'beforeLastWrongAt': beforeLastWrongAt?.toIso8601String(),
+        'sessionIndexes': sessionIndexes,
+      });
+    }
+    word.state = state;
+    if (recordAttempt) {
       word.lastStudiedAt = now;
       if (state == StudyState.memorized) {
         word.correctCount++;
@@ -1802,12 +1896,18 @@ class VocaStore {
         bookId: bookId ?? book?.id,
         sessionIndexes: sessionIndexes,
         now: now,
+        previousState: beforeState,
+        previousCorrectCount: beforeCorrect,
+        previousWrongCount: beforeWrong,
+        previousLastStudiedAt: beforeLastStudiedAt,
+        previousLastWrongAt: beforeLastWrongAt,
       );
     }
     await _saveBooks();
     if (recordAttempt) {
       await cloudChanges.markLearningState();
-      unawaited(cloudChanges.recordDiagnostic('card_decision', data: {
+      await cloudChanges.recordDiagnostic('card_decision_committed', data: {
+        'recoveryId': recoveryId,
         'bookId': bookId ?? book?.id,
         'wordId': word.id,
         'term': word.term,
@@ -1820,7 +1920,7 @@ class VocaStore {
         'beforeWrongCount': beforeWrong,
         'afterWrongCount': word.wrongCount,
         'sessionIndexes': sessionIndexes,
-      }));
+      });
     }
   }
 
@@ -1839,6 +1939,11 @@ class VocaStore {
       ..add(_dayKey(DateTime.now()));
     await _prefs.setStringList(_studyDaysKey, days.toList());
     await _clearActiveStudiesForSessions(quickBook.id, {completedIndex});
+    await _recordCompletionRecoveryCheckpoint(
+      reason: 'current_session_completed',
+      bookId: quickBook.id,
+      sessionIndexes: [completedIndex],
+    );
     await cloudChanges.markLearningState();
     unawaited(cloudChanges.recordDiagnostic('session_completed', data: {
       'bookId': quickBook.id,

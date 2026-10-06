@@ -2456,7 +2456,6 @@ class _CardStudyPageState extends State<CardStudyPage>
   Future<void> _finishRound() async {
     if (roundUnknown.isNotEmpty) {
       final remaining = List<Word>.of(roundUnknown);
-      final finishedRound = roundNumber;
       queue.addAll(shuffledNextRound(remaining, lastWord));
       roundUnknown.clear();
       roundNumber++;
@@ -2476,14 +2475,14 @@ class _CardStudyPageState extends State<CardStudyPage>
         barrierDismissible: false,
         builder: (context) => AlertDialog(
           icon: const Icon(Icons.refresh_rounded, color: sea, size: 32),
-          title: Text('$finishedRound바퀴 완료'),
+          title: const Text('이번 학습을 모두 확인했어요'),
           content: Text(
-            '보류 ${remaining.length}개를 순서를 섞어\n${roundNumber}바퀴로 이어갑니다.',
+            '보류 ${remaining.length}개를 순서를 섞어\n다시 확인합니다.',
           ),
           actions: [
             FilledButton(
               onPressed: () => Navigator.pop(context),
-              child: Text('${roundNumber}바퀴 시작'),
+              child: const Text('보류 단어 다시 보기'),
             ),
           ],
         ),
@@ -3048,7 +3047,7 @@ class _CardStudyPageState extends State<CardStudyPage>
                               overflow: TextOverflow.ellipsis,
                               style: const TextStyle(
                                   color: Color(0xFF8E8E93), fontSize: 12)),
-                          Text('$roundNumber바퀴 · $roundCompleted / $roundTotal',
+                          Text('$roundCompleted / $roundTotal',
                               style: const TextStyle(
                                   color: ink,
                                   fontSize: 14,
@@ -3106,7 +3105,7 @@ class _CardStudyPageState extends State<CardStudyPage>
                                     : coral,
                                 fontSize: 11,
                                 fontWeight: FontWeight.w700)),
-                        Text('이번 바퀴',
+                        Text('현재 진행',
                             style: const TextStyle(
                                 color: Color(0xFF8E8E93), fontSize: 11)),
                       ]),

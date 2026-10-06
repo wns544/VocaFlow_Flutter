@@ -60,7 +60,7 @@ void main() {
       decisionWriter: (_, __) async {},
     )));
     await tester.pumpAndSettle();
-    expect(find.text('1바퀴 · 96 / 100'), findsOneWidget);
+    expect(find.text('96 / 100'), findsOneWidget);
     for (var i = 0; i < 4; i++) {
       final gesture = await tester.startGesture(
           tester.getCenter(find.byKey(const ValueKey('study-card'))));
@@ -70,9 +70,9 @@ void main() {
       await tester.pumpAndSettle();
     }
     expect(find.textContaining('보류 74개'), findsOneWidget);
-    await tester.tap(find.text('2바퀴 시작'));
+    await tester.tap(find.text('보류 단어 다시 보기'));
     await tester.pumpAndSettle();
-    expect(find.text('2바퀴 · 0 / 74'), findsOneWidget);
+    expect(find.text('0 / 74'), findsOneWidget);
     expect((await VocaStore.load()).activeStudy!.roundNumber, 2);
   });
 
@@ -460,13 +460,13 @@ void main() {
     await gesture.up();
     await tester.pumpAndSettle();
 
-    expect(find.text('1바퀴 완료'), findsOneWidget);
+    expect(find.text('이번 학습을 모두 확인했어요'), findsOneWidget);
     expect(find.textContaining('보류 1개'), findsOneWidget);
     expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
-    await tester.tap(find.text('2바퀴 시작'));
+    await tester.tap(find.text('보류 단어 다시 보기'));
     await tester.pumpAndSettle();
     expect(find.text('final'), findsOneWidget);
-    expect(find.text('2바퀴 · 0 / 1'), findsOneWidget);
+    expect(find.text('0 / 1'), findsOneWidget);
     expect(decisions, [StudyState.review]);
   });
 
@@ -587,7 +587,7 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('start-multi-session-study')));
     await tester.pumpAndSettle();
 
-    expect(find.textContaining('1바퀴 · 0 /'), findsOneWidget);
+    expect(find.textContaining('0 /'), findsOneWidget);
     expect(find.textContaining('단어 1~10 + 단어 11~'), findsOneWidget);
   });
 
