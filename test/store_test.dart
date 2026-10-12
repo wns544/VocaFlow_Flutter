@@ -6,6 +6,65 @@ import 'package:vocaflow/models.dart';
 import 'package:vocaflow/store.dart';
 
 void main() {
+  test(
+      'question settings sync latest values and default reset without editing cards',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    await store.setChatGptPromptTemplates('단어 {{단어}}', '한자 {{한자}}');
+    final cards = jsonEncode(store.books.map((book) => book.toJson()).toList());
+    final old = store.toLearningStateJson();
+    final newer = Map<String, dynamic>.from(old);
+    newer['chatGptPrompts'] = {
+      'word': '새 문구',
+      'kanji': '새 한자',
+      'updatedAt': DateTime.now()
+          .toUtc()
+          .add(const Duration(seconds: 1))
+          .toIso8601String(),
+    };
+    await store.applyLearningStateSnapshots([newer, old]);
+    expect(store.chatGptWordPromptTemplate, '새 문구');
+    expect(store.chatGptKanjiPromptTemplate, '새 한자');
+    await store.setChatGptPromptTemplates('', '');
+    await store.applyLearningStateSnapshots([newer, old]);
+    expect(store.chatGptWordPromptTemplate, '');
+    expect(store.chatGptKanjiPromptTemplate, '');
+    expect(
+        jsonEncode(store.books.map((book) => book.toJson()).toList()), cards);
+  });
+  test('custom question templates survive restart and backup restoration',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    await store.setChatGptPromptTemplates('{{단어}} 설명', '{{한자}} 설명');
+    expect((await VocaStore.load()).chatGptWordPromptTemplate, '{{단어}} 설명');
+    final backup = store.toBackupJson();
+    await store.setChatGptPromptTemplates('', '');
+    expect(backup.containsKey('chatGptWordPromptTemplate'), isFalse);
+    expect(store.chatGptKanjiPromptTemplate, '');
+  });
+  test('ChatGPT project conversation URL syncs newest value without cards',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    const first = 'https://chatgpt.com/g/g-p-jlpt/c/first-conversation';
+    const latest = 'https://chatgpt.com/g/g-p-jlpt/c/latest-conversation';
+    expect(await store.setChatGptConversationUrl(first), isTrue);
+    final cards = jsonEncode(store.books.map((book) => book.toJson()).toList());
+    final remote = store.toLearningStateJson();
+    remote['chatGptConnection'] = {
+      'url': latest,
+      'updatedAt': DateTime.now()
+          .toUtc()
+          .add(const Duration(seconds: 1))
+          .toIso8601String(),
+    };
+    await store.applyLearningStateSnapshots([remote]);
+    expect(store.chatGptConversationUrl, latest);
+    expect(
+        jsonEncode(store.books.map((book) => book.toJson()).toList()), cards);
+  });
   test('resume merge keeps newest queue even with lower memorized count',
       () async {
     SharedPreferences.setMockInitialValues({});
@@ -91,6 +150,37 @@ void main() {
         reloaded.books.map((book) => book.name), ['기본 단어장', 'Alpha', 'Zebra']);
   });
 
+  test('newest remote book order reorders the library without changing cards',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final zebra = await store
+        .addBook('Zebra', [Word(term: 'z', reading: 'z', meaning: 'z')]);
+    final alpha = await store
+        .addBook('Alpha', [Word(term: 'a', reading: 'a', meaning: 'a')]);
+    final contents = {
+      for (final book in store.books)
+        book.id: book.words.map((word) => word.term).toList(),
+    };
+    final remote = store.toLearningStateJson();
+    remote['bookOrder'] = {
+      'ids': [alpha.id, 'default', zebra.id],
+      'updatedAt': DateTime.now()
+          .toUtc()
+          .add(const Duration(seconds: 1))
+          .toIso8601String(),
+    };
+    await store.applyLearningStateSnapshots([remote]);
+    expect(store.books.map((book) => book.id), [alpha.id, 'default', zebra.id]);
+    expect(
+      {
+        for (final book in store.books)
+          book.id: book.words.map((word) => word.term).toList(),
+      },
+      contents,
+    );
+  });
+
   test('book library cache is isolated per signed-in account', () async {
     final store = await VocaStore.load();
     await store.activateAccount('account-a');
@@ -116,6 +206,21 @@ void main() {
     final reloaded = await VocaStore.load();
     expect(reloaded.isSessionCompleted('default', 0), isTrue);
     expect(reloaded.completedCount(reloaded.quickBook), 1);
+  });
+
+  test('multi-session completion marks learning state for cloud sync',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+
+    expect(store.cloudChanges.learningStateDirty, isFalse);
+    await store.completeSessions('default', [0]);
+
+    expect(store.cloudChanges.learningStateDirty, isTrue);
+    final snapshot = store.toLearningStateJson();
+    expect(snapshot['completed'], contains('default:0'));
+    final today = store.recentDayKeys(count: 1).single;
+    expect((snapshot['dailyStudyStats'] as Map)[today], isNotNull);
   });
 
   test('study attempts and completed sessions update daily stats and log',
@@ -507,6 +612,60 @@ void main() {
     final preferences = await SharedPreferences.getInstance();
     expect(preferences.getBool('readingMeaningMigrationV1'), isTrue);
     expect(store.cloudChanges.snapshot.wordIdsByBook['japanese'], {88});
+  });
+
+  test('repairs placeholder-meaning imports without changing word identity',
+      () async {
+    final book = WordBook(
+      id: 'placeholder',
+      name: 'Japanese placeholder import',
+      words: [
+        Word(id: 89, term: 'あっけない', reading: '어이없다, 싱겁다', meaning: 'ㆍ'),
+      ],
+    );
+    SharedPreferences.setMockInitialValues({
+      'books': jsonEncode([book.toJson()]),
+      'readingMeaningMigrationV1': true,
+    });
+
+    final store = await VocaStore.load();
+    final repaired = store.books.single.words.single;
+
+    expect(repaired.id, 89);
+    expect(repaired.term, 'あっけない');
+    expect(repaired.reading, 'あっけない');
+    expect(repaired.meaning, '어이없다, 싱겁다');
+    final preferences = await SharedPreferences.getInstance();
+    expect(preferences.getBool('readingMeaningMigrationV2'), isTrue);
+    expect(store.cloudChanges.snapshot.wordIdsByBook['placeholder'], {89});
+  });
+
+  test('repairs verified Japanese form errors while preserving learner meanings',
+      () async {
+    final book = WordBook(
+      id: 'verified',
+      name: 'Verified corrections',
+      words: [
+        Word(id: 90, term: '食い止める', reading: 'くいやめる', meaning: '저지하다 (설명 보강)'),
+        Word(id: 91, term: '気掛かり', reading: 'きかかり', meaning: '사용자가 직접 고친 뜻'),
+        Word(id: 92, term: '食い止める', reading: 'くいやめる', meaning: '저지하다'),
+      ],
+    );
+    SharedPreferences.setMockInitialValues({
+      'books': jsonEncode([book.toJson()]),
+      'readingMeaningMigrationV1': true,
+      'readingMeaningMigrationV2': true,
+    });
+
+    final store = await VocaStore.load();
+    expect(store.books.single.words[0].reading, 'くいとめる');
+    expect(store.books.single.words[0].meaning, '저지하다 (설명 보강)');
+    expect(store.books.single.words[1].reading, 'きがかり');
+    expect(store.books.single.words[1].meaning, '사용자가 직접 고친 뜻');
+    expect(store.books.single.words[2].reading, 'くいとめる');
+    final preferences = await SharedPreferences.getInstance();
+    expect(preferences.getBool('verifiedTextCorrectionMigrationV4'), isTrue);
+    expect(store.cloudChanges.snapshot.wordIdsByBook['verified'], {90, 91, 92});
   });
 
   test('last main tab persists and clamps invalid values', () async {

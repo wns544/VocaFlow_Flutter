@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'cloud_backup.dart';
+import 'sync_auxiliary.dart';
 
 /// Stable identity for a card without changing the card document itself.
 class RelatedWordRef implements Comparable<RelatedWordRef> {
@@ -148,6 +149,12 @@ class WordRelationStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> reload() async {
+    _loaded = false;
+    _relations.clear();
+    await load();
+  }
+
   List<WordRelation> forWord(RelatedWordRef reference) => all
       .where((relation) => relation.involves(reference))
       .toList(growable: false);
@@ -249,6 +256,10 @@ class WordRelationStore extends ChangeNotifier {
   }
 
   Future<void> _uploadOne(WordRelation relation) async {
+    if (SyncAuxiliary.onChanged != null) {
+      await SyncAuxiliary.commit();
+      return;
+    }
     try {
       await CloudBackup().uploadRelation(relation.toJson());
     } catch (_) {

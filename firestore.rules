@@ -1,0 +1,49 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function owner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    // Original card material is deliberately read-only for this app.
+    match /users/{uid}/vocabBooks/{bookId} {
+      allow read: if owner(uid);
+      allow write: if false;
+      match /words/{wordId} {
+        allow read: if owner(uid);
+        allow write: if false;
+      }
+    }
+
+    match /users/{uid}/learningState/{deviceId} {
+      allow read, write: if owner(uid);
+    }
+    match /users/{uid}/learningStateV2/{deviceId} {
+      allow read, write: if owner(uid);
+      match /versions/{revision} {
+        allow read, write: if owner(uid);
+        match /chunks/{chunkId} {
+          allow read, write: if owner(uid);
+        }
+      }
+    }
+    match /users/{uid}/syncSignals/{signalId} {
+      allow read, write: if owner(uid);
+    }
+    match /users/{uid}/managedBooks/{bookId} {
+      allow read, write: if owner(uid);
+    }
+    match /users/{uid}/relations/{relationId} {
+      allow read, write: if owner(uid);
+    }
+    match /users/{uid}/bookArchives/{archiveId} {
+      allow read, write: if owner(uid);
+      match /chunks/{chunkId} {
+        allow read, write: if owner(uid);
+      }
+    }
+    match /users/{uid}/profile/{documentId} {
+      allow read, write: if owner(uid);
+    }
+  }
+}

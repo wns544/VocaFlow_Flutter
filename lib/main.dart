@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:ui' show FrameTiming;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -9,6 +10,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 
 import 'auto_backup.dart';
@@ -224,17 +226,36 @@ Future<void> captureResumeSnapshot(String target) async {
   }
 }
 
+int _resumeSnapshotGeneration = 0;
 void scheduleResumeSnapshotCapture(String target) {
-  WidgetsBinding.instance.addPostFrameCallback((_) {
+  final generation = ++_resumeSnapshotGeneration;
+  void afterFrame(Duration _) {
+    if (generation != _resumeSnapshotGeneration) return;
+    if (SchedulerBinding.instance.transientCallbackCount > 0) {
+      WidgetsBinding.instance.addPostFrameCallback(afterFrame);
+      return;
+    }
     unawaited(captureResumeSnapshot(target));
-  });
+  }
+
+  WidgetsBinding.instance.addPostFrameCallback(afterFrame);
 }
 
 Future<void> deleteResumeSnapshot() async {
+  _resumeSnapshotGeneration++;
   try {
     await resumeSnapshotChannel.invokeMethod<void>('delete');
   } on Exception {
     // The cache may already be absent.
+  }
+}
+
+Future<void> cancelResumeSnapshotCapture() async {
+  _resumeSnapshotGeneration++;
+  try {
+    await resumeSnapshotChannel.invokeMethod<void>('cancelCapture');
+  } on Exception {
+    // Other platforms do not install the Android snapshot channel.
   }
 }
 
@@ -1834,11 +1855,36 @@ class _CardStudyPageState extends State<CardStudyPage>
   Future<void> _persistenceChain = Future<void>.value();
   var memorized = 0;
   var revealed = false;
+  Word? _pendingRevealWord;
+  DateTime? _flipMeasureUntil;
+
+  void _recordStudyFrameTimings(List<FrameTiming> frames) {
+    final until = _flipMeasureUntil;
+    if (until == null || DateTime.now().isAfter(until) || frames.isEmpty)
+      return;
+    final buildUs =
+        frames.map((f) => f.buildDuration.inMicroseconds).reduce(max);
+    final rasterUs =
+        frames.map((f) => f.rasterDuration.inMicroseconds).reduce(max);
+    final slow = frames
+        .where((f) =>
+            f.buildDuration.inMicroseconds > 16667 ||
+            f.rasterDuration.inMicroseconds > 16667)
+        .length;
+    debugPrint('VOCAFRAME frames=${frames.length} slow16ms=$slow '
+        'buildMaxUs=$buildUs rasterMaxUs=$rasterUs');
+  }
+
   var showingExplanation = false;
   late bool _autoPlayPronunciation;
   final _pronunciationResolver =
       PronunciationResolver(PronunciationPackStore());
   final _pronunciationSelections = PronunciationSelectionStore();
+  // FutureBuilder must receive the same Future while a card is on screen.
+  // Recreating the asynchronous accent lookup in build caused a completed
+  // lookup to schedule another lookup and frame forever (especially visible
+  // in a resumed study session).
+  final Map<String, Future<PitchAccentResolution>> _pitchAccentFutures = {};
   var _relatedCurrentScopeOnly = false;
   var exiting = false;
   var finishingStudy = false;
@@ -1990,6 +2036,17 @@ class _CardStudyPageState extends State<CardStudyPage>
     } else {
       _activeStudyUpdatedAt = resume.updatedAt;
       queue = widget.store.resolveActiveWords(resume);
+      // Keep the original-book association even when this is a combined
+      // review.  The queue can contain same-id cards from several books, so
+      // falling back to a global id lookup is not enough for card actions
+      // such as related-word linking.
+      final associatedCount = min(queue.length, resume.queueBookIds.length);
+      for (var index = 0; index < associatedCount; index++) {
+        final bookId = resume.queueBookIds[index];
+        if (widget.store.books.any((book) => book.id == bookId)) {
+          _bookIdsByWord[queue[index]] = bookId;
+        }
+      }
       if (resume.isRangeCourse) {
         total = resume.total;
         memorized = resume.memorized.clamp(0, total);
@@ -2029,11 +2086,12 @@ class _CardStudyPageState extends State<CardStudyPage>
       }
     }
     widget.store.learningStateRevision.addListener(_onLearningStateMerged);
+    SchedulerBinding.instance.addTimingsCallback(_recordStudyFrameTimings);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       // A resumed route already has a stored snapshot. Re-saving it here used
       // to race a just-finished cloud merge and could put an older queue back.
       if (resume == null) unawaited(persistStudy());
-      if (mounted) unawaited(captureResumeSnapshot('study'));
+      if (mounted) scheduleResumeSnapshotCapture('study');
     });
   }
 
@@ -2055,6 +2113,7 @@ class _CardStudyPageState extends State<CardStudyPage>
   @override
   void dispose() {
     widget.store.learningStateRevision.removeListener(_onLearningStateMerged);
+    SchedulerBinding.instance.removeTimingsCallback(_recordStudyFrameTimings);
     _keyboardFocusNode.dispose();
     WidgetsBinding.instance.removeObserver(this);
     resumeRouteObserver.unsubscribe(this);
@@ -2141,14 +2200,17 @@ class _CardStudyPageState extends State<CardStudyPage>
     });
   }
 
-  Future<void> persistStudy() async {
-    if (queue.isEmpty || exiting) return;
+  Future<void> persistStudy({
+    bool markCloudChange = true,
+    bool allowWhileExiting = false,
+  }) async {
+    if (queue.isEmpty || (exiting && !allowWhileExiting)) return;
     final key = _activeStudyStorageKey;
     final saved = await widget.store.saveActiveStudyFor(
         key,
         ActiveStudy(
           queueIds: queue.map((word) => word.id).toList(),
-          queueBookIds: queue.map(_bookIdForWord).whereType<String>().toList(),
+          queueBookIds: _completeBookIdList(queue),
           total: total,
           memorized: memorized,
           reviewed: reviewed.toList(),
@@ -2163,15 +2225,15 @@ class _CardStudyPageState extends State<CardStudyPage>
           roundTotal: roundTotal,
           roundCompleted: roundCompleted,
           roundUnknownIds: roundUnknown.map((word) => word.id).toList(),
-          roundUnknownBookIds:
-              roundUnknown.map(_bookIdForWord).whereType<String>().toList(),
+          roundUnknownBookIds: _completeBookIdList(roundUnknown),
           sessionSelections: activeSessionSelections,
           lastWordBookId: lastWord == null ? null : _bookIdForWord(lastWord!),
           rangeStart: activeRangeStart,
           rangeEnd: activeRangeEnd,
           sourceMode: activeSourceMode,
         ),
-        expectedUpdatedAt: _activeStudyUpdatedAt);
+        expectedUpdatedAt: _activeStudyUpdatedAt,
+        markCloudChange: markCloudChange);
     if (saved == null) {
       _onLearningStateMerged();
     } else {
@@ -2179,7 +2241,68 @@ class _CardStudyPageState extends State<CardStudyPage>
     }
   }
 
-  String? _bookIdForWord(Word word) => _bookIdsByWord[word];
+  bool _matchesStoredWord(Word candidate, Word word) =>
+      candidate.id == word.id &&
+      candidate.term == word.term &&
+      candidate.reading == word.reading &&
+      candidate.meaning == word.meaning;
+
+  List<String> _completeBookIdList(Iterable<Word> words) {
+    final ids = words.map(_bookIdForWord).toList();
+    // queueBookIds is positional. A filtered list can pair a later card with
+    // the wrong book on the next app launch, so only persist it when every
+    // position has a verified source book.
+    return ids.every((id) => id != null) ? ids.cast<String>() : const [];
+  }
+
+  String? _bookIdForWord(Word word) {
+    final mapped = _bookIdsByWord[word];
+    if (mapped != null) return mapped;
+
+    // A restored card can be a different Word instance from the one the
+    // route received initially. Prefer the active book, then only accept an
+    // unambiguous match across the remaining books.
+    final active = activeBookId;
+    if (active != null) {
+      final activeBook =
+          widget.store.books.where((book) => book.id == active).firstOrNull;
+      if (activeBook != null &&
+          activeBook.words
+              .any((candidate) => _matchesStoredWord(candidate, word))) {
+        _bookIdsByWord[word] = active;
+        return active;
+      }
+    }
+    final matches = widget.store.books
+        .where((book) =>
+            book.words.any((candidate) => _matchesStoredWord(candidate, word)))
+        .toList();
+    if (matches.length != 1) return null;
+    final resolved = matches.single.id;
+    _bookIdsByWord[word] = resolved;
+    return resolved;
+  }
+
+  WordBook? _bookForStudyWord(Word word) {
+    final bookId = _bookIdForWord(word) ?? activeBookId;
+    return bookId == null
+        ? null
+        : widget.store.books.where((book) => book.id == bookId).firstOrNull;
+  }
+
+  StudySession? _sessionForStudyWord(WordBook book, Word word) => book
+      .sessions(widget.store.sessionSize)
+      .where((session) =>
+          session.words.any((candidate) => _matchesStoredWord(candidate, word)))
+      .firstOrNull;
+
+  String _studySessionContextFor(Word word, WordBook? book) {
+    if (book == null) return '이어서 학습';
+    if (isRangeCourse && book.id == activeBookId) {
+      return 'No.$activeRangeStart~$activeRangeEnd';
+    }
+    return _sessionForStudyWord(book, word)?.label ?? '이어서 학습';
+  }
 
   PronunciationCardRef? _pronunciationReferenceFor(Word word) {
     final bookId = _bookIdForWord(word) ?? activeBookId;
@@ -2195,6 +2318,7 @@ class _CardStudyPageState extends State<CardStudyPage>
 
   Future<void> _loadPronunciationSelections() async {
     await _pronunciationSelections.load();
+    _pitchAccentFutures.clear();
     if (mounted) setState(() {});
   }
 
@@ -2206,6 +2330,7 @@ class _CardStudyPageState extends State<CardStudyPage>
           .asUint8List();
       await _pronunciationResolver.store.install(bytes);
       _pronunciationResolver.invalidate();
+      _pitchAccentFutures.clear();
       if (mounted) setState(() {});
     } catch (_) {
       // The existing device TTS remains available if an optional bundled pack
@@ -2213,14 +2338,22 @@ class _CardStudyPageState extends State<CardStudyPage>
     }
   }
 
-  Future<PitchAccentResolution> _pitchAccentResolutionFor(Word word) =>
-      resolvePitchAccent(
+  Future<PitchAccentResolution> _pitchAccentResolutionFor(Word word) {
+    final reference = _pronunciationReferenceFor(word);
+    final key = reference == null
+        ? '${word.id}\u0000${word.term}\u0000${word.reading}\u0000${word.meaning}'
+        : '${reference.key}\u0000${reference.fingerprint}';
+    return _pitchAccentFutures.putIfAbsent(
+      key,
+      () => resolvePitchAccent(
         term: word.term,
         reading: word.reading,
         resolver: _pronunciationResolver,
         selections: _pronunciationSelections,
-        reference: _pronunciationReferenceFor(word),
-      );
+        reference: reference,
+      ),
+    );
+  }
 
   Future<void> _showPitchAccentDetails(Word word) async {
     await showModalBottomSheet<void>(
@@ -2273,7 +2406,7 @@ class _CardStudyPageState extends State<CardStudyPage>
       '${_bookIdForWord(word) ?? activeBookId ?? 'unknown'}:${word.id}';
 
   RelatedWordRef? _relationReferenceFor(Word word) {
-    final bookId = _bookIdForWord(word);
+    final bookId = _bookIdForWord(word) ?? activeBookId;
     return bookId == null
         ? null
         : RelatedWordRef(bookId: bookId, wordId: word.id);
@@ -2336,8 +2469,10 @@ class _CardStudyPageState extends State<CardStudyPage>
   }
 
   void _scheduleDecisionPersistence(Word word, StudyState state) {
+    final queuedAt = Stopwatch()..start();
     _persistenceChain = _persistenceChain.then((_) async {
       await WidgetsBinding.instance.endOfFrame;
+      final markAt = Stopwatch()..start();
       await (widget.decisionWriter?.call(word, state) ??
           widget.store.mark(
             word,
@@ -2345,7 +2480,20 @@ class _CardStudyPageState extends State<CardStudyPage>
             bookId: _bookIdForWord(word),
             sessionIndexes: _sessionIndexesForWord(word),
           ));
+      final markMs = markAt.elapsedMilliseconds;
+      final persistAt = Stopwatch()..start();
       if (queue.isNotEmpty && !exiting) await persistStudy();
+      final persistMs = persistAt.elapsedMilliseconds;
+      if (queuedAt.elapsedMilliseconds >= 24 ||
+          markMs >= 24 ||
+          persistMs >= 24) {
+        NavigationTrace.record('study_decision_persistence_timing', {
+          'queuedMs': queuedAt.elapsedMilliseconds,
+          'markMs': markMs,
+          'activeStudySaveMs': persistMs,
+          'queueLength': queue.length,
+        });
+      }
     });
   }
 
@@ -2393,15 +2541,36 @@ class _CardStudyPageState extends State<CardStudyPage>
 
   Future<void> exitStudy() async {
     if (exiting) return;
-    await _persistenceChain;
-    await persistStudy();
-    scheduleResumeSnapshotCapture('study');
-    AutoBackupCoordinator.activeInstance
-        ?.requestImmediateBackup(ignoreMinimumInterval: true);
+    final exitTiming = Stopwatch()..start();
+    NavigationTrace.record('study_exit_timing_started', {
+      'queueLength': queue.length,
+      'pendingDecisionPersistence': true,
+    });
+    // Keep the durable local save ordered after a pending decision, but never
+    // make navigation wait for it.  The active-study preference is enough to
+    // reopen exactly where the user left off; the normal 15-second sync
+    // scheduler uploads it after the interaction has finished.
+    _persistenceChain = _persistenceChain.then((_) async {
+      final saveAt = Stopwatch()..start();
+      await persistStudy(allowWhileExiting: true);
+      NavigationTrace.record('study_exit_persisted_after_pop', {
+        'waitAndSaveMs': exitTiming.elapsedMilliseconds,
+        'activeStudySaveMs': saveAt.elapsedMilliseconds,
+        'queueLength': queue.length,
+      });
+    });
+    unawaited(_persistenceChain.catchError((Object error, StackTrace stack) {
+      NavigationTrace.record('study_exit_persist_failed', {
+        'error': error.toString(),
+      });
+    }));
     if (!mounted) return;
     setState(() => exiting = true);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
+      NavigationTrace.record('study_exit_timing_pop_started', {
+        'totalBeforePopMs': exitTiming.elapsedMilliseconds,
+      });
       final navigator = Navigator.of(context);
       if (navigator.canPop()) {
         navigator.pop();
@@ -2582,10 +2751,37 @@ class _CardStudyPageState extends State<CardStudyPage>
       return;
     }
     final shouldReveal = !revealed;
+    _flipMeasureUntil = DateTime.now().add(const Duration(seconds: 2));
     setState(() => revealed = shouldReveal);
-    persistStudy();
+    if (widget.store.flipCard) {
+      unawaited(cancelResumeSnapshotCapture());
+      _pendingRevealWord = word;
+      // Persist the face locally without comparing/checkpointing every book
+      // while the rotation is on screen. Serialize with pending decisions.
+      _persistenceChain = _persistenceChain.then((_) async {
+        if (mounted && !exiting) await persistStudy(markCloudChange: false);
+      });
+      return;
+    }
+    unawaited(persistStudy());
     scheduleResumeSnapshotCapture('study');
     if (shouldReveal && _autoPlayPronunciation) {
+      unawaited(_speakPronunciation(word));
+    }
+  }
+
+  void _finishRevealEffects() {
+    final word = _pendingRevealWord;
+    if (word == null || !mounted || exiting) return;
+    _pendingRevealWord = null;
+    _persistenceChain = _persistenceChain.then((_) async {
+      await widget.store.cloudChanges.markLearningState();
+    });
+    scheduleResumeSnapshotCapture('study');
+    if (revealed &&
+        queue.isNotEmpty &&
+        identical(queue.first, word) &&
+        _autoPlayPronunciation) {
       unawaited(_speakPronunciation(word));
     }
   }
@@ -2714,6 +2910,26 @@ class _CardStudyPageState extends State<CardStudyPage>
             : const SizedBox(key: ValueKey('hidden')),
       );
 
+  Widget Function(BuildContext, double, Widget?) _flipTransformBuilder(
+      Word word) {
+    final front = RepaintBoundary(child: cardFace(word, false));
+    final back = RepaintBoundary(child: cardFace(word, true));
+    return (context, angle, _) {
+      final showingBack = angle > pi / 2;
+      return Transform(
+        alignment: Alignment.center,
+        transform: Matrix4.identity()
+          ..setEntry(3, 2, 0.0012)
+          ..rotateY(angle),
+        child: Transform(
+          alignment: Alignment.center,
+          transform: Matrix4.rotationY(showingBack ? pi : 0),
+          child: showingBack ? back : front,
+        ),
+      );
+    };
+  }
+
   Widget readingText(Word word) => Text(word.reading,
       textAlign: TextAlign.center,
       style: TextStyle(
@@ -2730,17 +2946,17 @@ class _CardStudyPageState extends State<CardStudyPage>
                 onLongPress: () => showExplanation(word),
               ),
             ),
-          if (_relationReferenceFor(word) != null)
+          if (back && _relationReferenceFor(word) != null)
             Positioned(
               top: 8,
               left: 8,
               child: IconButton(
                 key: const ValueKey('card-related-words'),
-                tooltip: '전체 단어장에서 검색·연결',
+                tooltip: '단어 연결',
                 visualDensity: VisualDensity.compact,
                 onPressed: () => _editRelatedWords(word),
-                icon: const Icon(Icons.hub_outlined,
-                    size: 22, color: Color(0xFF8E8E93)),
+                icon: const Icon(Icons.link_outlined,
+                    size: 24, color: Color(0xFF8E8E93)),
               ),
             ),
           if (back)
@@ -2758,7 +2974,7 @@ class _CardStudyPageState extends State<CardStudyPage>
           if (!back && word.explanation.trim().isNotEmpty) ...[
             const Positioned(
               top: 17,
-              left: 17,
+              left: 57,
               child: IgnorePointer(
                 child: Icon(Icons.lightbulb_outline,
                     size: 20, color: Color(0xFF34A853)),
@@ -2939,7 +3155,8 @@ class _CardStudyPageState extends State<CardStudyPage>
       roundUnknown.removeWhere((item) =>
           item.id == word.id && _bookIdForWord(item) == undone.bookId);
     }
-    await widget.store.mark(word, undone.previousState, recordAttempt: false);
+    await widget.store.undoWordDecision(word, undone.previousState,
+        bookId: undone.bookId ?? activeBookId);
     final previous = undoHistory.lastOrNull;
     lastWord = previous == null
         ? null
@@ -2976,29 +3193,9 @@ class _CardStudyPageState extends State<CardStudyPage>
     }
     final word = queue.first;
     final nextWord = queue.length > 1 ? queue[1] : null;
-    final selectedBook = activeBookId == null
-        ? null
-        : widget.store.books
-            .where((book) => book.id == activeBookId)
-            .firstOrNull;
-    final selectionLabels = activeSessionSelections.entries.map((entry) {
-      final selected = widget.store.books
-          .where((candidate) => candidate.id == entry.key)
-          .firstOrNull;
-      if (selected == null) return '';
-      final sessions = selected.sessions(widget.store.sessionSize);
-      final labels = entry.value
-          .where((index) => index >= 0 && index < sessions.length)
-          .map((index) => sessions[index].label)
-          .join(' + ');
-      return activeSessionSelections.length > 1
-          ? '${selected.name}: $labels'
-          : labels;
-    }).where((label) => label.isNotEmpty);
-    final sessionLabel =
-        selectionLabels.isEmpty ? '복습' : selectionLabels.join(' · ');
-    final studyContextLabel =
-        activeSessionSelections.length > 1 ? sessionLabel : sessionLabel;
+    final contextBook = _bookForStudyWord(word);
+    final studyBookLabel = contextBook?.name ?? '여러 단어장';
+    final studySessionLabel = _studySessionContextFor(word, contextBook);
     final negativeColor =
         stateForDirection(false) == StudyState.memorized ? sea : coral;
     final positiveColor =
@@ -3043,16 +3240,50 @@ class _CardStudyPageState extends State<CardStudyPage>
                         child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                          Text(studyContextLabel,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                  color: Color(0xFF8E8E93), fontSize: 12)),
-                          Text('$roundCompleted / $roundTotal',
-                              style: const TextStyle(
-                                  color: ink,
-                                  fontSize: 14,
-                                  height: 1.15,
-                                  fontWeight: FontWeight.w800)),
+                          Row(children: [
+                            const Icon(Icons.menu_book_outlined,
+                                size: 14, color: Color(0xFF8E8E93)),
+                            const SizedBox(width: 4),
+                            Expanded(
+                              child: Text(studyBookLabel,
+                                  key: const ValueKey('study-book-context'),
+                                  overflow: TextOverflow.ellipsis,
+                                  maxLines: 1,
+                                  style: const TextStyle(
+                                      color: Color(0xFF636366),
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w700)),
+                            ),
+                          ]),
+                          const SizedBox(height: 3),
+                          Row(children: [
+                            Flexible(
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 7, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: sea.withValues(alpha: .10),
+                                  borderRadius: BorderRadius.circular(99),
+                                ),
+                                child: Text(studySessionLabel,
+                                    key:
+                                        const ValueKey('study-session-context'),
+                                    overflow: TextOverflow.ellipsis,
+                                    maxLines: 1,
+                                    style: const TextStyle(
+                                        color: sea,
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w800)),
+                              ),
+                            ),
+                            const SizedBox(width: 7),
+                            Text('$roundCompleted / $roundTotal',
+                                style: const TextStyle(
+                                    color: ink,
+                                    fontSize: 14,
+                                    height: 1.15,
+                                    fontWeight: FontWeight.w800)),
+                          ]),
                         ])),
                     _RoundIconButton(
                         icon: Icons.edit_outlined, onTap: editCurrentWord),
@@ -3207,21 +3438,8 @@ class _CardStudyPageState extends State<CardStudyPage>
                                       duration:
                                           const Duration(milliseconds: 420),
                                       curve: Curves.easeInOutCubic,
-                                      builder: (context, angle, _) {
-                                        final back = angle > pi / 2;
-                                        return Transform(
-                                          alignment: Alignment.center,
-                                          transform: Matrix4.identity()
-                                            ..setEntry(3, 2, 0.0012)
-                                            ..rotateY(angle),
-                                          child: Transform(
-                                            alignment: Alignment.center,
-                                            transform: Matrix4.rotationY(
-                                                back ? pi : 0),
-                                            child: cardFace(word, back),
-                                          ),
-                                        );
-                                      },
+                                      onEnd: _finishRevealEffects,
+                                      builder: _flipTransformBuilder(word),
                                     )
                                   : cardFace(word, revealed),
                           back: nextWord == null
@@ -4022,6 +4240,7 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
 
   Future<void> openChatGpt() async {
     await openChatGptPrompt(buildChatGptKanjiPrompt(
+      template: widget.store.chatGptKanjiPromptTemplate,
       character: widget.character,
       term: widget.word.term,
       reading: widget.word.reading,
@@ -4031,6 +4250,15 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
 
   Future<void> openChatGptWord() async {
     await openChatGptPrompt(buildChatGptWordPrompt(
+      template: widget.store.chatGptWordPromptTemplate,
+      term: widget.word.term,
+      reading: widget.word.reading,
+      meaning: widget.word.meaning,
+    ));
+  }
+
+  Future<void> openChatGptExamples() async {
+    await openChatGptPrompt(buildChatGptExamplePrompt(
       term: widget.word.term,
       reading: widget.word.reading,
       meaning: widget.word.meaning,
@@ -4133,7 +4361,7 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
     await Clipboard.setData(ClipboardData(text: prompt));
     final inserted = await openChatGptWithPrompt(uri: uri, prompt: prompt);
     if (inserted) {
-      showMessage('ChatGPT 입력창에 질문을 넣었습니다.');
+      showMessage('질문을 복사하고 ChatGPT를 열었습니다. 입력창이 비어 있으면 붙여넣어 주세요.');
       return;
     }
     final opened = await openExternalUrl(uri);
@@ -4281,6 +4509,13 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
                 onPressed: openChatGptWord,
                 icon: const Icon(Icons.auto_awesome, size: 18),
                 label: Text('「${widget.word.term}」 단어 ChatGPT에 질문'),
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                key: const ValueKey('open-chatgpt-examples'),
+                onPressed: openChatGptExamples,
+                icon: const Icon(Icons.format_quote_outlined, size: 18),
+                label: Text('「${widget.word.term}」 예문 10개 ChatGPT에 질문'),
               ),
               if (widget.store.chatGptConversationUrl.isEmpty) ...[
                 const SizedBox(height: 6),
@@ -7298,6 +7533,9 @@ class _SettingsPageState extends State<SettingsPage> {
                 Text('마지막 내려받기: $lastDownloadText',
                     style: const TextStyle(
                         color: Color(0xFF8E8E93), fontSize: 12)),
+                Text('상태: ${auto?.syncStatus ?? '로그인 필요'}',
+                    style: const TextStyle(
+                        color: Color(0xFF8E8E93), fontSize: 12)),
                 Text(
                     '대기 중 변경: ${auto?.pendingCount ?? widget.store.cloudChanges.pendingCount}개',
                     style: const TextStyle(
@@ -7638,7 +7876,7 @@ class _SettingsPageState extends State<SettingsPage> {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Tooltip(
-                  message: '컴퓨터 브라우저에서 같은 ChatGPT 계정으로 로그인하세요.\n'
+                  message: '휴대폰에서 GPT 링크를 복사하거나 브라우저의 대화 주소를 복사하세요.\n'
                       '사용할 대화방을 열고 주소창의\n'
                       'https://chatgpt.com/c/... 또는 chatgpt.com/g/... URL을 복사해 붙여넣어 주세요.',
                   triggerMode: TooltipTriggerMode.tap,
@@ -7661,6 +7899,15 @@ class _SettingsPageState extends State<SettingsPage> {
             onTap: editChatGptConversationUrl,
           ),
         ),
+        const SizedBox(height: 20),
+        Card(
+            child: ListTile(
+          key: const ValueKey('chatgpt-prompt-setting'),
+          leading: const Icon(Icons.edit_note, color: sea),
+          title: const Text('ChatGPT 질문 문구'),
+          subtitle: const Text('단어·한자 질문을 직접 편집합니다.'),
+          onTap: editChatGptPrompts,
+        )),
         const SizedBox(height: 20),
         const _SectionTitle('일본어 글꼴'),
         Card(
@@ -7804,45 +8051,31 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> editChatGptConversationUrl() async {
     var input = widget.store.chatGptConversationUrl;
     String? errorText;
-    final value = await showDialog<String>(
+    final value = await showModalBottomSheet<String>(
       context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
       builder: (context) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: const Text('ChatGPT 전용 대화 URL'),
-          content: SizedBox(
-            width: 520,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'ChatGPT 앱의 공유 링크가 아니라,\n'
-                  '브라우저 주소창에 보이는\n'
-                  'chatgpt.com/c/... 또는 chatgpt.com/g/... 대화 URL을 입력해 주세요.',
-                  style: TextStyle(color: Color(0xFF6E6E73), fontSize: 12),
-                ),
-                const SizedBox(height: 12),
-                TextFormField(
-                  key: const ValueKey('chatgpt-conversation-url-input'),
-                  initialValue: input,
-                  onChanged: (value) => input = value,
-                  autofocus: true,
-                  keyboardType: TextInputType.url,
-                  autocorrect: false,
-                  minLines: 3,
-                  maxLines: 5,
-                  decoration: InputDecoration(
-                    alignLabelWithHint: true,
-                    hintText:
-                        'https://chatgpt.com/g/g-p-.../c/...\n또는\nhttps://chatgpt.com/c/...',
-                    errorText: errorText,
-                    border: const OutlineInputBorder(),
-                  ),
-                ),
-              ],
-            ),
-          ),
+        builder: (context, setDialogState) => _ChatGptSettingsSheet(
+          title: 'ChatGPT 연결',
           actions: [
+            TextButton(
+              key: const ValueKey('test-chatgpt-connection'),
+              onPressed: () async {
+                final url = normalizeChatGptConversationUrl(input);
+                if (url == null) {
+                  setDialogState(
+                      () => errorText = 'GPT 링크 또는 실제 대화 주소를 입력해 주세요.');
+                  return;
+                }
+                final opened = await openExternalUrl(Uri.parse(url));
+                if (!context.mounted) return;
+                setDialogState(() => errorText = opened
+                    ? '원하는 GPT 또는 대화가 열렸는지 확인한 뒤 저장하세요.'
+                    : '주소를 열 수 없습니다. 링크를 확인해 주세요.');
+              },
+              child: const Text('연결 테스트'),
+            ),
             TextButton(
               onPressed: () => Navigator.pop(context),
               child: const Text('취소'),
@@ -7867,12 +8100,124 @@ class _SettingsPageState extends State<SettingsPage> {
               child: const Text('저장'),
             ),
           ],
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'GPT 링크 또는 대화 주소를 붙여넣으세요.\n'
+                'GPT 링크는 해당 GPT를 열고, /c/ 주소는 해당 대화를 엽니다.\n'
+                '/share/ 링크는 읽기 전용이라 연결할 수 없습니다.',
+                style: TextStyle(color: Color(0xFF6E6E73), fontSize: 12),
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                key: const ValueKey('chatgpt-conversation-url-input'),
+                initialValue: input,
+                onChanged: (value) => input = value,
+                autofocus: true,
+                keyboardType: TextInputType.url,
+                autocorrect: false,
+                minLines: 3,
+                maxLines: 5,
+                decoration: InputDecoration(
+                  alignLabelWithHint: true,
+                  hintText:
+                      'https://chatgpt.com/g/g-p-.../c/...\n또는\nhttps://chatgpt.com/c/...',
+                  errorText: errorText,
+                  border: const OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
     if (value == null) return;
     await widget.store.setChatGptConversationUrl(value);
     if (mounted) setState(() {});
+  }
+
+  Future<void> editChatGptPrompts() async {
+    final word = TextEditingController(
+        text: widget.store.chatGptWordPromptTemplate.isEmpty
+            ? buildChatGptWordPrompt(
+                term: '{{단어}}', reading: '{{발음}}', meaning: '{{뜻}}')
+            : widget.store.chatGptWordPromptTemplate);
+    final kanji = TextEditingController(
+        text: widget.store.chatGptKanjiPromptTemplate.isEmpty
+            ? buildChatGptKanjiPrompt(
+                character: '{{한자}}',
+                term: '{{단어}}',
+                reading: '{{발음}}',
+                meaning: '{{뜻}}')
+            : widget.store.chatGptKanjiPromptTemplate);
+    final saved = await showModalBottomSheet<bool>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: Colors.transparent,
+        builder: (context) => _ChatGptSettingsSheet(
+              title: 'ChatGPT 질문 문구',
+              actions: [
+                TextButton(
+                  onPressed: () {
+                    word.clear();
+                    kanji.clear();
+                  },
+                  child: const Text('기본값 복원'),
+                ),
+                TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('취소'),
+                ),
+                FilledButton(
+                  key: const ValueKey('save-chatgpt-prompts'),
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const Text('저장'),
+                ),
+              ],
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    '{{단어}} · {{발음}} · {{뜻}}은 카드 정보로 바뀝니다. 한자 질문에는 {{한자}}도 사용할 수 있습니다. 비워서 저장하면 기본 문구가 적용됩니다.',
+                    style: TextStyle(color: Color(0xFF6E6E73), fontSize: 12),
+                  ),
+                  const SizedBox(height: 16),
+                  TextField(
+                    key: const ValueKey('chatgpt-word-template'),
+                    controller: word,
+                    minLines: 3,
+                    maxLines: 7,
+                    maxLength: 4000,
+                    decoration: const InputDecoration(
+                      labelText: '단어 질문',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  TextField(
+                    key: const ValueKey('chatgpt-kanji-template'),
+                    controller: kanji,
+                    minLines: 3,
+                    maxLines: 7,
+                    maxLength: 4000,
+                    decoration: const InputDecoration(
+                      labelText: '한자 질문',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ],
+              ),
+            ));
+    if (saved == true) {
+      await widget.store.setChatGptPromptTemplates(word.text, kanji.text);
+      if (mounted) setState(() {});
+    }
+    // Allow the dialog exit animation to finish before disposing its fields.
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    word.dispose();
+    kanji.dispose();
   }
 
   Future<void> editTarget() async {
@@ -7929,6 +8274,97 @@ class _SettingsPageState extends State<SettingsPage> {
     await deleteResumeSnapshot();
     widget.refresh();
     if (mounted) setState(() {});
+  }
+}
+
+class _ChatGptSettingsSheet extends StatelessWidget {
+  const _ChatGptSettingsSheet({
+    required this.title,
+    required this.child,
+    required this.actions,
+  });
+
+  final String title;
+  final Widget child;
+  final List<Widget> actions;
+
+  @override
+  Widget build(BuildContext context) {
+    final media = MediaQuery.of(context);
+    final availableHeight =
+        (media.size.height - media.viewInsets.bottom - 24).clamp(280.0, 760.0);
+    return AnimatedPadding(
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOut,
+      padding: EdgeInsets.fromLTRB(12, 12, 12, media.viewInsets.bottom + 12),
+      child: Material(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(24),
+        clipBehavior: Clip.antiAlias,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: availableHeight),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Padding(
+                padding: EdgeInsets.only(top: 10),
+                child: Center(
+                  child: SizedBox(
+                    width: 34,
+                    height: 4,
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: Color(0xFFC7C7CC),
+                        borderRadius: BorderRadius.all(Radius.circular(4)),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 18, 12, 14),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(title,
+                          style: const TextStyle(
+                              fontSize: 20, fontWeight: FontWeight.w800)),
+                    ),
+                    IconButton(
+                      tooltip: '닫기',
+                      onPressed: () => Navigator.pop(context),
+                      icon: const Icon(Icons.close),
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              Expanded(
+                child: SingleChildScrollView(
+                  keyboardDismissBehavior:
+                      ScrollViewKeyboardDismissBehavior.onDrag,
+                  padding: const EdgeInsets.fromLTRB(20, 20, 20, 12),
+                  child: child,
+                ),
+              ),
+              const Divider(height: 1),
+              SafeArea(
+                top: false,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                  child: Wrap(
+                    alignment: WrapAlignment.end,
+                    spacing: 4,
+                    runSpacing: 4,
+                    children: actions,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }
 

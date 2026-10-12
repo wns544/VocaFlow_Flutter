@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../sync_auxiliary.dart';
 
 /// Stable reference to a card without adding pronunciation fields to it.
 class PronunciationCardRef {
@@ -75,6 +76,11 @@ class PronunciationSelectionStore extends ChangeNotifier {
 
   Future<void> load() async {
     _prefs = await SharedPreferences.getInstance();
+    _reload();
+  }
+
+  void _reload() {
+    _selections.clear();
     final raw = _prefs!.getString(_storageKey);
     if (raw == null) return;
     try {
@@ -93,6 +99,7 @@ class PronunciationSelectionStore extends ChangeNotifier {
   }
 
   PronunciationSelection? forCard(PronunciationCardRef reference) {
+    if (_prefs != null) _reload();
     final selection = _selections[reference.key];
     return selection?.reference.fingerprint == reference.fingerprint
         ? selection
@@ -101,6 +108,7 @@ class PronunciationSelectionStore extends ChangeNotifier {
 
   Future<void> select(
       PronunciationCardRef reference, String candidateId) async {
+    await load();
     _selections[reference.key] = PronunciationSelection(
       reference: reference,
       candidateId: candidateId,
@@ -111,6 +119,7 @@ class PronunciationSelectionStore extends ChangeNotifier {
   }
 
   Future<void> clear(PronunciationCardRef reference) async {
+    await load();
     _selections.remove(reference.key);
     await _save();
     notifyListeners();
@@ -159,5 +168,6 @@ class PronunciationSelectionStore extends ChangeNotifier {
     final prefs = _prefs ??= await SharedPreferences.getInstance();
     await prefs.setString(_storageKey,
         jsonEncode(_selections.values.map((e) => e.toJson()).toList()));
+    await SyncAuxiliary.commit();
   }
 }

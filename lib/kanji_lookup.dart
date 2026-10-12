@@ -183,7 +183,11 @@ String? normalizeChatGptConversationUrl(String value) {
       segments[1].isNotEmpty &&
       segments[2] == 'c' &&
       segments[3].isNotEmpty;
-  if (!isStandardConversation && !isGptConversation) return null;
+  final isGpt = segments.length == 2 &&
+      segments[0] == 'g' &&
+      segments[1].startsWith('g-') &&
+      segments[1].length > 2;
+  if (!isStandardConversation && !isGptConversation && !isGpt) return null;
 
   return Uri(
     scheme: 'https',
@@ -197,8 +201,11 @@ String buildChatGptKanjiPrompt({
   required String term,
   required String reading,
   required String meaning,
+  String? template,
 }) =>
-    '''한자 $character를 한국어로 자세히 설명해 줘.
+    template != null && template.trim().isNotEmpty
+        ? renderChatGptTemplate(template, character, term, reading, meaning)
+        : '''한자 $character를 한국어로 자세히 설명해 줘.
 
 현재 학습 단어: $term
 발음: $reading
@@ -210,8 +217,11 @@ String buildChatGptWordPrompt({
   required String term,
   required String reading,
   required String meaning,
+  String? template,
 }) =>
-    '''일본어 단어 "$term"을 한국어로 자세히 설명해 줘.
+    template != null && template.trim().isNotEmpty
+        ? renderChatGptTemplate(template, '', term, reading, meaning)
+        : '''일본어 단어 "$term"을 한국어로 자세히 설명해 줘.
 
 발음: $reading
 뜻: $meaning
@@ -219,6 +229,24 @@ String buildChatGptWordPrompt({
 이 단어를 한자 조합 단위로 쪼개서 각 한자의 역할, 단어 전체 의미가 만들어지는 방식, 비슷한 단어와 헷갈리기 쉬운 점, 기억하기 쉬운 암기법을 알려 줘.
 
 또한 이 단어를 자연스럽게 사용한 일본어 예문 1개와 한국어 뜻을 함께 보여 줘. 예문 안에서 학습 단어는 반드시 **$term**처럼 앞뒤에 별표 두 개씩을 붙여 강조해 줘.''';
+
+String buildChatGptExamplePrompt({
+  required String term,
+  required String reading,
+  required String meaning,
+}) =>
+    '''일본어 단어 "$term"(발음: $reading, 뜻: $meaning)을 자연스럽게 익힐 수 있는 일본어 예문 10개를 만들어 줘.
+
+난이도는 쉬운 것부터 자연스러운 일상 표현까지 조금씩 올려 줘. 각 예문마다 한국어 뜻을 바로 아래에 적고, 학습 단어 "$term"은 반드시 **$term**처럼 강조해 줘.
+
+뜻이나 쓰임이 여러 개라면 대표적인 쓰임을 고르게 포함하고, 어색하거나 교과서적인 문장은 피해서 실제 일본어에서 자연스러운 표현으로 써 줘.''';
+
+String renderChatGptTemplate(String template, String character, String term,
+    String reading, String meaning) {
+  final values = {'한자': character, '단어': term, '발음': reading, '뜻': meaning};
+  return template.replaceAllMapped(
+      RegExp(r'\{\{(한자|단어|발음|뜻)\}\}'), (match) => values[match[1]]!);
+}
 
 Map<String, String> _decodeKoreanTable(String source) {
   final decoded = jsonDecode(source) as Map<String, dynamic>;

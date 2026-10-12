@@ -5,11 +5,19 @@ import 'dart:typed_data';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
+import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 
 import 'cloud_change_tracker.dart';
 import 'book_restore_archive.dart';
 import 'models.dart';
 import 'store.dart';
+
+Uint8List _encodeSyncPayload(Map<String, dynamic> payload) =>
+    Uint8List.fromList(utf8.encode(jsonEncode(payload)));
+
+Map<String, dynamic> _decodeSyncPayload(List<int> bytes) =>
+    Map<String, dynamic>.from(jsonDecode(utf8.decode(bytes)));
 
 class CloudQuotaExceededException implements Exception {
   const CloudQuotaExceededException();
@@ -166,15 +174,34 @@ class CloudBackup {
   CollectionReference<Map<String, dynamic>> get _learningStatesRef =>
       firestore.collection('users').doc(_user.uid).collection('learningState');
 
+  CollectionReference<Map<String, dynamic>> get _syncV2Ref => firestore
+      .collection('users')
+      .doc(_user.uid)
+      .collection('learningStateV2');
+  DocumentReference<Map<String, dynamic>> get _syncSignal => firestore
+      .collection('users')
+      .doc(_user.uid)
+      .collection('syncSignals')
+      .doc('main');
+  final Map<String, Map<String, dynamic>> _syncPayloadCache = {};
+
+  Stream<Map<String, dynamic>?> watchSyncSignal() =>
+      _syncSignal.snapshots().map((event) => event.data());
+
+  Future<void> publishSyncSignal(String deviceId, String revision) =>
+      _syncSignal.set({
+        'deviceId': deviceId,
+        'revision': revision,
+        'updatedAt': FieldValue.serverTimestamp()
+      });
+
   /// Imported/user-authored card content. This deliberately never writes the
   /// legacy vocabBooks/*/words documents.
   CollectionReference<Map<String, dynamic>> get _managedBooksRef =>
       firestore.collection('users').doc(_user.uid).collection('managedBooks');
 
-  CollectionReference<Map<String, dynamic>> get _bookArchivesRef => firestore
-      .collection('users')
-      .doc(_user.uid)
-      .collection('bookArchives');
+  CollectionReference<Map<String, dynamic>> get _bookArchivesRef =>
+      firestore.collection('users').doc(_user.uid).collection('bookArchives');
 
   /// Stores a recovery point in small chunks, avoiding Firestore's per-document
   /// size limit even for a large imported book. Existing card documents are
@@ -200,7 +227,8 @@ class CloudBackup {
                 sum + ((document.data()['byteSize'] as num?)?.toInt() ?? 0),
           );
           if (used + bytes.length > maxBookArchiveBytes) {
-            throw StateError('복원 보관함 100MB 한도가 가득 찼습니다. 오래된 기록을 지운 뒤 다시 시도해 주세요.');
+            throw StateError(
+                '복원 보관함 100MB 한도가 가득 찼습니다. 오래된 기록을 지운 뒤 다시 시도해 주세요.');
           }
         }
         await ref.set({
@@ -222,8 +250,10 @@ class CloudBackup {
           batch = firestore.batch();
           count = 0;
         }
+
         for (var index = 0; index < chunks.length; index++) {
-          batch.set(ref.collection('chunks').doc(index.toString().padLeft(6, '0')),
+          batch.set(
+              ref.collection('chunks').doc(index.toString().padLeft(6, '0')),
               {'index': index, 'data': chunks[index]});
           count++;
           if (count >= 400) await commit();
@@ -234,7 +264,8 @@ class CloudBackup {
   Future<List<Map<String, dynamic>>> downloadBookArchiveMetadata() =>
       _runCloudOperation(() async {
         final snapshot = await _bookArchivesRef.get();
-        return snapshot.docs.map((doc) => Map<String, dynamic>.from(doc.data()))
+        return snapshot.docs
+            .map((doc) => Map<String, dynamic>.from(doc.data()))
             .toList(growable: false);
       });
 
@@ -290,6 +321,7 @@ class CloudBackup {
           batch = firestore.batch();
           count = 0;
         }
+
         for (final chunk in chunks.docs) {
           batch.delete(chunk.reference);
           count++;
@@ -354,7 +386,9 @@ class CloudBackup {
       firestore.collection('users').doc(_user.uid).collection('relations');
 
   Future<bool> hasLearningState() => _runCloudOperation(
-      () async => !(await _learningStatesRef.limit(1).get()).docs.isEmpty,
+      () async =>
+          !(await _syncV2Ref.limit(1).get()).docs.isEmpty ||
+          !(await _learningStatesRef.limit(1).get()).docs.isEmpty,
       timeout: _learningStateOperationTimeout);
 
   Future<void> uploadLearningState(
@@ -363,17 +397,45 @@ class CloudBackup {
   ) =>
       _runCloudOperation(() async {
         final deviceId = await store.cloudChanges.deviceId();
-        await _learningStatesRef.doc(deviceId).set({
-          'schema': 1,
+        final payload = await store.syncV2Snapshot();
+        final bytes = await compute(_encodeSyncPayload, payload);
+        final revision = sha256.convert(bytes).toString();
+        final head = _syncV2Ref.doc(deviceId);
+        final previous = await head.get();
+        if (previous.data()?['revision'] == revision) return;
+        final version = head.collection('versions').doc(revision);
+        const chunkBytes = 256 * 1024;
+        final chunkCount = (bytes.length / chunkBytes).ceil();
+        for (var i = 0; i < chunkCount; i++) {
+          final end = ((i + 1) * chunkBytes).clamp(0, bytes.length);
+          await version.collection('chunks').doc('$i').set({
+            'index': i,
+            'data': base64Encode(bytes.sublist(i * chunkBytes, end)),
+          });
+        }
+        final metadata = {
+          'schema': 2,
           'deviceId': deviceId,
+          'revision': revision,
+          'chunkCount': chunkCount,
+          'byteLength': bytes.length,
           'sequence': changes.learningStateGeneration,
-          'clientUpdatedAt': DateTime.now().toUtc().toIso8601String(),
           'updatedAt': FieldValue.serverTimestamp(),
-          'payload': store.toLearningStateJson(),
-        }, SetOptions(merge: true));
-      }, timeout: _learningStateOperationTimeout);
+        };
+        await version.set(metadata);
+        // Publish only after every immutable chunk exists. A failed upload
+        // leaves the previous complete version readable.
+        final batch = firestore.batch();
+        batch.set(head, metadata);
+        batch.set(_syncSignal, {
+          'deviceId': deviceId,
+          'revision': revision,
+          'updatedAt': FieldValue.serverTimestamp()
+        });
+        await batch.commit();
+      });
 
-  Future<List<Map<String, dynamic>>> downloadLearningStates() =>
+  Future<List<Map<String, dynamic>>> downloadLegacyLearningStates() =>
       _runCloudOperation(() async {
         final snapshot = await _learningStatesRef.get();
         return snapshot.docs
@@ -382,6 +444,48 @@ class CloudBackup {
             .map((payload) => Map<String, dynamic>.from(payload))
             .toList();
       }, timeout: _learningStateOperationTimeout);
+
+  Future<List<Map<String, dynamic>>> downloadLearningStates() =>
+      _runCloudOperation(() async {
+        final uid = _user.uid;
+        final heads = await _syncV2Ref.get();
+        if (heads.docs.isEmpty) return downloadLegacyLearningStates();
+        final result = <Map<String, dynamic>>[];
+        for (final doc in heads.docs) {
+          final head = doc.data();
+          final revision = head['revision'] as String;
+          final key = '$uid/${doc.id}/$revision';
+          var payload = _syncPayloadCache[key];
+          if (payload == null) {
+            final chunks = await doc.reference
+                .collection('versions')
+                .doc(revision)
+                .collection('chunks')
+                .get();
+            final sorted = chunks.docs.map((d) => d.data()).toList()
+              ..sort(
+                  (a, b) => (a['index'] as int).compareTo(b['index'] as int));
+            if (sorted.length != head['chunkCount'])
+              throw StateError('동기화 조각이 누락되었습니다.');
+            final bytes = <int>[];
+            for (var i = 0; i < sorted.length; i++) {
+              if (sorted[i]['index'] != i) throw StateError('동기화 조각 순서 오류');
+              bytes.addAll(base64Decode(sorted[i]['data'] as String));
+            }
+            if (bytes.length != head['byteLength'] ||
+                sha256.convert(bytes).toString() != revision) {
+              throw StateError('동기화 데이터 검증 실패');
+            }
+            payload = await compute<List<int>, Map<String, dynamic>>(
+                _decodeSyncPayload, bytes);
+            _syncPayloadCache
+                .removeWhere((old, _) => old.startsWith('$uid/${doc.id}/'));
+            _syncPayloadCache[key] = payload;
+          }
+          result.add(payload);
+        }
+        return result;
+      });
 
   Future<void> uploadRelation(Map<String, dynamic> relation) =>
       _runCloudOperation(() async {
@@ -425,9 +529,7 @@ class CloudBackup {
     CloudChangeSnapshot changes, {
     bool forceProfile = false,
   }) =>
-      _runCloudOperation(
-        () => _uploadIncremental(store, changes, forceProfile: forceProfile),
-      );
+      uploadLearningState(store, changes);
 
   Future<void> _uploadIncremental(
     VocaStore store,
@@ -500,8 +602,10 @@ class CloudBackup {
     await commitIfNeeded(force: true);
   }
 
-  Future<void> upload(VocaStore store) =>
-      _runCloudOperation(() => _upload(store));
+  Future<void> upload(VocaStore store) async {
+    await store.cloudChanges.markLearningState();
+    await uploadLearningState(store, store.cloudChanges.snapshot);
+  }
 
   Future<void> _upload(VocaStore store) async {
     final backup = store.toBackupJson();

@@ -22,6 +22,34 @@ import 'package:vocaflow/store.dart';
 import 'package:vocaflow/study_speech.dart';
 
 void main() {
+  testWidgets('question template editor saves on a narrow phone',
+      (tester) async {
+    tester.view.physicalSize = const Size(360, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    SharedPreferences.setMockInitialValues({});
+    await tester.pumpWidget(const VocaFlowApp());
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('설정'));
+    await tester.pumpAndSettle();
+    final setting = find.byKey(const ValueKey('chatgpt-prompt-setting'));
+    await tester.scrollUntilVisible(setting, 250,
+        scrollable: find.byType(Scrollable).last);
+    await tester.tap(setting);
+    await tester.pumpAndSettle();
+    await tester.enterText(
+        find.byKey(const ValueKey('chatgpt-word-template')), '{{단어}} 설명해줘');
+    final kanji = find.byKey(const ValueKey('chatgpt-kanji-template'));
+    await tester.ensureVisible(kanji);
+    await tester.tap(kanji);
+    await tester.enterText(kanji, '{{한자}} 설명해줘');
+    await tester.tap(find.byKey(const ValueKey('save-chatgpt-prompts')));
+    await tester.pumpAndSettle();
+    expect((await VocaStore.load()).chatGptWordPromptTemplate, '{{단어}} 설명해줘');
+    expect((await VocaStore.load()).chatGptKanjiPromptTemplate, '{{한자}} 설명해줘');
+    expect(tester.takeException(), isNull);
+  });
   testWidgets('resumed round retains seventy unknown cards in next round',
       (tester) async {
     SharedPreferences.setMockInitialValues({});
@@ -53,6 +81,7 @@ void main() {
     final resume = reloaded.activeStudy!;
     expect(resume.roundUnknownIds, hasLength(70));
     expect(resume.seenWordIds, hasLength(96));
+    expect(reloaded.resolveActiveWords(resume), hasLength(4));
     await tester.pumpWidget(MaterialApp(
         home: CardStudyPage(
       store: reloaded,
@@ -61,6 +90,9 @@ void main() {
     )));
     await tester.pumpAndSettle();
     expect(find.text('96 / 100'), findsOneWidget);
+    expect(find.byKey(const ValueKey('study-book-context')), findsOneWidget);
+    expect(find.text('resume regression'), findsOneWidget);
+    expect(find.text('복습'), findsNothing);
     for (var i = 0; i < 4; i++) {
       final gesture = await tester.startGesture(
           tester.getCenter(find.byKey(const ValueKey('study-card'))));
@@ -76,12 +108,18 @@ void main() {
     expect((await VocaStore.load()).activeStudy!.roundNumber, 2);
   });
 
-  testWidgets('unrevealed study card searches other books by meaning for links',
+  testWidgets('revealed study card searches other books by meaning for links',
       (tester) async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();
     final source = await store.addBook('source', [
-      Word(id: 89101, term: 'sourceword', reading: '', meaning: '시작'),
+      Word(
+        id: 89101,
+        term: 'sourceword',
+        reading: '',
+        meaning: '시작',
+        explanation: '연결 버튼이 가려지면 안 됩니다.',
+      ),
     ]);
     await store.addBook('other book', [
       Word(id: 89102, term: 'targetword', reading: '', meaning: '검색단서'),
@@ -93,6 +131,10 @@ void main() {
       bookId: source.id,
     )));
     await tester.pumpAndSettle();
+    expect(find.byTooltip('단어 연결'), findsNothing);
+    await tester.tap(find.byKey(const ValueKey('study-card')));
+    await tester.pumpAndSettle();
+    expect(find.byTooltip('단어 연결'), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('card-related-words')));
     await tester.pumpAndSettle();
     await tester.enterText(find.byType(TextField), '검색단서');
@@ -101,6 +143,56 @@ void main() {
     await tester.tap(find.text('targetword'));
     await tester.pumpAndSettle();
     expect(find.byIcon(Icons.link), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('study header identifies the current book and session',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final book = await store.addBook('아주 긴 이름의 테스트 단어장', [
+      Word(id: 89110, term: '確認', reading: 'かくにん', meaning: '확인'),
+    ]);
+    await tester.pumpWidget(MaterialApp(
+        home: CardStudyPage(
+      store: store,
+      words: book.words,
+      bookId: book.id,
+      useSavedResume: false,
+    )));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('study-book-context')), findsOneWidget);
+    expect(find.text('아주 긴 이름의 테스트 단어장'), findsOneWidget);
+    expect(find.byKey(const ValueKey('study-session-context')), findsOneWidget);
+    expect(find.text('복습'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('restored detached card still shows its related-word control',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    await store.addBook('source', [
+      Word(id: 89111, term: '復習', reading: 'ふくしゅう', meaning: '복습'),
+    ]);
+    // Restores can hand the card route a newly created Word instance instead
+    // of the object in the book. It must still resolve its source book.
+    final restoredCopy =
+        Word(id: 89111, term: '復習', reading: 'ふくしゅう', meaning: '복습');
+    await tester.pumpWidget(MaterialApp(
+        home: CardStudyPage(
+      store: store,
+      words: [restoredCopy],
+      bookId: null,
+    )));
+    await tester.pumpAndSettle();
+    expect(find.byTooltip('단어 연결'), findsNothing);
+    await tester.tap(find.byKey(const ValueKey('study-card')));
+    await tester.pumpAndSettle();
+    expect(find.byTooltip('단어 연결'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('card-related-words')));
+    await tester.pumpAndSettle();
+    expect(find.byType(TextField), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -543,6 +635,48 @@ void main() {
     await tester.pumpAndSettle();
   });
 
+  testWidgets('leaving study does not wait for pending decision persistence',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final write = Completer<void>();
+    final words = [
+      Word(id: 9451, term: 'front', reading: '', meaning: 'one'),
+      Word(id: 9452, term: 'next', reading: '', meaning: 'two'),
+    ];
+    await tester.pumpWidget(MaterialApp(
+      home: const Scaffold(body: Center(child: Text('home'))),
+    ));
+    final navigator = tester.state<NavigatorState>(find.byType(Navigator));
+    unawaited(navigator.push(MaterialPageRoute<void>(
+      builder: (_) => CardStudyPage(
+        store: store,
+        words: words,
+        decisionWriter: (_, __) => write.future,
+      ),
+    )));
+    await tester.pumpAndSettle();
+
+    final card = find.byKey(const ValueKey('study-card'));
+    final gesture = await tester.startGesture(tester.getCenter(card));
+    await gesture.moveBy(const Offset(0, -240));
+    await gesture.up();
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(write.isCompleted, isFalse);
+
+    await tester.tap(find.byIcon(Icons.arrow_back));
+    await tester.pump();
+    await tester.pump();
+    expect(find.text('home'), findsOneWidget);
+    expect(write.isCompleted, isFalse);
+
+    write.complete();
+    await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 20)));
+    await tester.pumpAndSettle();
+    expect((await VocaStore.load()).activeStudies, isNotEmpty);
+  });
+
   testWidgets('starts multiple selected sessions from the study tab',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({});
@@ -588,7 +722,10 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.textContaining('0 /'), findsOneWidget);
-    expect(find.textContaining('단어 1~10 + 단어 11~'), findsOneWidget);
+    // The compact study header identifies the card currently on screen, not
+    // the entire combined queue.
+    expect(find.byKey(const ValueKey('study-session-context')), findsOneWidget);
+    expect(find.text('단어 1~10'), findsOneWidget);
   });
 
   testWidgets('leaving an active study saves progress immediately',
@@ -1338,6 +1475,37 @@ void main() {
     );
     expect(find.text('example sentence'), findsNothing);
     expect(find.text('예문 뜻'), findsNothing);
+  });
+
+  testWidgets('flip saves face locally before running full sync after rotation',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({'flipCard': true});
+    final store = await VocaStore.load();
+    final word = Word(term: 'target', reading: 'reading', meaning: 'meaning');
+    await tester.pumpWidget(MaterialApp(
+      home: CardStudyPage(store: store, words: [word]),
+    ));
+    await tester.pumpAndSettle();
+    var fullSyncCount = 0;
+    store.cloudChanges.beforeLearningStateChange = () async {
+      fullSyncCount++;
+    };
+    await tester.tap(find.byKey(const ValueKey('study-card')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(store.activeStudies.values.single.revealed, isTrue);
+    expect(fullSyncCount, 0);
+    await tester.pumpAndSettle();
+    expect(fullSyncCount, 1);
+    expect(word.correctCount, 0);
+    expect(word.wrongCount, 0);
+    await tester.tap(find.byKey(const ValueKey('study-card')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(store.activeStudies.values.single.revealed, isFalse);
+    expect(fullSyncCount, 1);
+    await tester.pumpAndSettle();
+    expect(fullSyncCount, 2);
   });
 
   testWidgets('flipped card keeps drag movement in screen direction',

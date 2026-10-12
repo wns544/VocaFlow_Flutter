@@ -45,8 +45,11 @@ class MainActivity : FlutterActivity() {
     private var pendingSpeech: Pair<String, String>? = null
     private var snapshotOverlay: ImageView? = null
     private var snapshotCaptureInProgress = false
+    private var pendingSnapshotCapture: Runnable? = null
+    private var pendingSnapshotResult: MethodChannel.Result? = null
     private var navigationDiagnosticChannel: MethodChannel? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val snapshotIdleDelayMs = 750L
     private val snapshotTimeout = Runnable {
         removeSnapshotOverlay(deleteFile = true)
     }
@@ -155,7 +158,12 @@ class MainActivity : FlutterActivity() {
                         removeSnapshotOverlay(deleteFile = false)
                         result.success(null)
                     }
+                    "cancelCapture" -> {
+                        cancelPendingSnapshotCapture()
+                        result.success(null)
+                    }
                     "delete" -> {
+                        cancelPendingSnapshotCapture()
                         removeSnapshotOverlay(deleteFile = true)
                         result.success(null)
                     }
@@ -275,6 +283,35 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun captureResumeSnapshot(target: String, result: MethodChannel.Result?) {
+        if (target.isBlank() || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            result?.success(false)
+            return
+        }
+
+        // The Flutter route asks for a recovery screenshot after many small UI
+        // actions (card flip, answer, back navigation). PixelCopy of the full
+        // surface steals GPU time from those animations. Keep only the newest
+        // request and capture after interaction has been quiet briefly.
+        pendingSnapshotCapture?.let { mainHandler.removeCallbacks(it) }
+        pendingSnapshotResult?.success(false)
+        val capture = Runnable {
+            pendingSnapshotCapture = null
+            pendingSnapshotResult = null
+            captureResumeSnapshotNow(target, result)
+        }
+        pendingSnapshotCapture = capture
+        pendingSnapshotResult = result
+        mainHandler.postDelayed(capture, snapshotIdleDelayMs)
+    }
+
+    private fun cancelPendingSnapshotCapture() {
+        pendingSnapshotCapture?.let { mainHandler.removeCallbacks(it) }
+        pendingSnapshotCapture = null
+        pendingSnapshotResult?.success(false)
+        pendingSnapshotResult = null
+    }
+
+    private fun captureResumeSnapshotNow(target: String, result: MethodChannel.Result?) {
         if (target.isBlank() ||
             snapshotCaptureInProgress ||
             Build.VERSION.SDK_INT < Build.VERSION_CODES.O

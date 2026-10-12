@@ -2,6 +2,31 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vocaflow/kanji_lookup.dart';
 
 void main() {
+  test('custom prompts substitute once and GPT links reject shared snapshots',
+      () {
+    expect(
+        buildChatGptWordPrompt(
+            term: '{{뜻}}',
+            reading: 'よみ',
+            meaning: '뜻값',
+            template: '{{단어}} / {{발음}} / {{뜻}}'),
+        '{{뜻}} / よみ / 뜻값');
+    expect(
+        buildChatGptKanjiPrompt(
+            character: '新',
+            term: '新聞',
+            reading: 'しんぶん',
+            meaning: '신문',
+            template: '{{한자}}: {{단어}}'),
+        '新: 新聞');
+    expect(normalizeChatGptConversationUrl('https://chatgpt.com/g/g-study?x=1'),
+        'https://chatgpt.com/g/g-study');
+    expect(normalizeChatGptConversationUrl('https://chatgpt.com/share/test'),
+        isNull);
+    expect(
+        buildChatGptExamplePrompt(term: '食べる', reading: 'たべる', meaning: '먹다'),
+        allOf(contains('예문 10개'), contains('**食べる**'), contains('먹다')));
+  });
   TestWidgetsFlutterBinding.ensureInitialized();
 
   test('bundled Korean dictionary contains common hun-eum entries', () async {

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -31,6 +32,7 @@ class CloudChangeSnapshot {
   final Set<String> deletedBookIds;
   final bool learningStateDirty;
   final int learningStateGeneration;
+
   /// Server revision observed before the local edit. A managed-book write may
   /// only replace the exact revision it was based on.
   final Map<String, int> bookBaseRevisions;
@@ -69,6 +71,7 @@ class CloudChangeTracker {
   final SharedPreferences _prefs;
   final SyncDiagnosticLog diagnostics = SyncDiagnosticLog();
   void Function()? onChanged;
+  Future<void> Function()? beforeLearningStateChange;
   int _diagnosticSequence = 0;
 
   int _generation = 0;
@@ -171,29 +174,37 @@ class CloudChangeTracker {
       final sequence = ++_diagnosticSequence;
       final timestamp = DateTime.now().toUtc();
       await _prefs.setInt(_diagnosticSequenceKey, sequence);
-      await diagnostics.record(
-        deviceId: await deviceId(),
-        sequence: sequence,
-        event: event,
-        data: data,
-        timestamp: timestamp,
-      );
+      final id = await deviceId();
+      // This journal is recovery evidence only. In particular, never wait for
+      // a slow platform directory lookup before the card queue can be saved
+      // or the user can make the next decision.
+      unawaited(diagnostics
+          .record(
+            deviceId: id,
+            sequence: sequence,
+            event: event,
+            data: data,
+            timestamp: timestamp,
+          )
+          .catchError((Object _) {}));
     } catch (_) {
       // Diagnostics must never block study or synchronization.
     }
   }
 
-  Future<void> markLearningState() => _mutate(() {
-        _learningStateDirty = true;
-        _learningStateGeneration++;
-        return true;
-      });
+  Future<void> markLearningState() async {
+    await beforeLearningStateChange?.call();
+    await _mutate(() {
+      _learningStateDirty = true;
+      _learningStateGeneration++;
+      return true;
+    });
+  }
 
   Future<void> markArchive(String archiveId) =>
       _mutate(() => _archiveIds.add(archiveId));
 
-  Future<void> acknowledgeArchives(Iterable<String> archiveIds) =>
-      _mutate(() {
+  Future<void> acknowledgeArchives(Iterable<String> archiveIds) => _mutate(() {
         var changed = false;
         for (final archiveId in archiveIds) {
           changed = _archiveIds.remove(archiveId) || changed;
@@ -210,17 +221,23 @@ class CloudChangeTracker {
     onChanged?.call();
   }
 
-  Future<void> markProfile() => _mutate(() {
-        if (_profileDirty) return false;
-        _profileDirty = true;
-        return true;
-      });
+  Future<void> markProfile() async {
+    if (beforeLearningStateChange != null) await markLearningState();
+    await _mutate(() {
+      if (_profileDirty) return false;
+      _profileDirty = true;
+      return true;
+    });
+  }
 
-  Future<void> markDictionaryOpenSetting() => _mutate(() {
-        if (_dictionaryOpenSettingDirty) return false;
-        _dictionaryOpenSettingDirty = true;
-        return true;
-      });
+  Future<void> markDictionaryOpenSetting() async {
+    if (beforeLearningStateChange != null) await markLearningState();
+    await _mutate(() {
+      if (_dictionaryOpenSettingDirty) return false;
+      _dictionaryOpenSettingDirty = true;
+      return true;
+    });
+  }
 
   Future<void> markBook(String bookId) => _mutate(() {
         _captureBookBaseRevision(bookId);
@@ -398,8 +415,8 @@ class CloudChangeTracker {
       _restoreMap(json['deletedWordIdsByBook'], _deletedWordIdsByBook);
       _deletedBookIds.addAll(
           (json['deletedBookIds'] as List<dynamic>? ?? []).cast<String>());
-      _archiveIds.addAll(
-          (json['archiveIds'] as List<dynamic>? ?? []).cast<String>());
+      _archiveIds
+          .addAll((json['archiveIds'] as List<dynamic>? ?? []).cast<String>());
       _learningStateDirty = json['learningStateDirty'] as bool? ?? false;
       _learningStateGeneration =
           (json['learningStateGeneration'] as num?)?.toInt() ?? 0;
@@ -417,24 +434,26 @@ class CloudChangeTracker {
   }
 
   Future<void> _persist() => _prefs.setString(
-        _activeAccountId == null ? _stateKey : '$_accountStatePrefix$_activeAccountId',
+        _activeAccountId == null
+            ? _stateKey
+            : '$_accountStatePrefix$_activeAccountId',
         _encodeState(),
       );
 
   String _encodeState() => jsonEncode({
-          'generation': _generation,
-          'profileDirty': _profileDirty,
-          'dictionaryOpenSettingDirty': _dictionaryOpenSettingDirty,
-          'bookIds': _bookIds.toList(),
-          'wordIdsByBook': _encodeMap(_wordIdsByBook),
-          'deletedWordIdsByBook': _encodeMap(_deletedWordIdsByBook),
-          'deletedBookIds': _deletedBookIds.toList(),
-          'archiveIds': _archiveIds.toList(),
-          'learningStateDirty': _learningStateDirty,
-          'learningStateGeneration': _learningStateGeneration,
-          'remoteBookRevisions': _remoteBookRevisions,
-          'bookBaseRevisions': _bookBaseRevisions,
-        });
+        'generation': _generation,
+        'profileDirty': _profileDirty,
+        'dictionaryOpenSettingDirty': _dictionaryOpenSettingDirty,
+        'bookIds': _bookIds.toList(),
+        'wordIdsByBook': _encodeMap(_wordIdsByBook),
+        'deletedWordIdsByBook': _encodeMap(_deletedWordIdsByBook),
+        'deletedBookIds': _deletedBookIds.toList(),
+        'archiveIds': _archiveIds.toList(),
+        'learningStateDirty': _learningStateDirty,
+        'learningStateGeneration': _learningStateGeneration,
+        'remoteBookRevisions': _remoteBookRevisions,
+        'bookBaseRevisions': _bookBaseRevisions,
+      });
 
   /// A downloaded revision is bookkeeping only: it must not schedule an
   /// upload. It is nevertheless durable so a restarted phone cannot write an
@@ -445,7 +464,8 @@ class CloudChangeTracker {
   }
 
   void _captureBookBaseRevision(String bookId) {
-    _bookBaseRevisions.putIfAbsent(bookId, () => _remoteBookRevisions[bookId] ?? 0);
+    _bookBaseRevisions.putIfAbsent(
+        bookId, () => _remoteBookRevisions[bookId] ?? 0);
   }
 
   void _clearInMemory() {

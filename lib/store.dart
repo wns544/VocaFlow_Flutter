@@ -8,6 +8,13 @@ import 'cloud_change_tracker.dart';
 import 'kanji_lookup.dart';
 import 'local_word_search.dart';
 import 'models.dart';
+import 'sync_replica.dart';
+import 'sync_auxiliary.dart';
+import 'word_relations.dart';
+
+part 'store_sync.dart';
+
+String _encodeAccountSnapshot(Map<String, dynamic> state) => jsonEncode(state);
 
 class ActiveStudy {
   const ActiveStudy({
@@ -302,6 +309,10 @@ class VocaStore {
 
   static const _booksKey = 'books';
   static const _accountStatePrefix = 'accountState.v1.';
+  // The unscoped preferences are the live cache for this account while the
+  // app is closed.  Remember who owns that cache so a restart never replaces
+  // recent local settings with an older account snapshot.
+  static const _lastActiveAccountKey = 'activeAccount.v1';
   static const _quickBookKey = 'quickBook';
   static const _sessionSizeKey = 'sessionSize';
   static const _completedKey = 'completed';
@@ -331,10 +342,17 @@ class VocaStore {
   static const _exampleFontSizeKey = 'exampleFontSize';
   static const _exampleMeaningFontSizeKey = 'exampleMeaningFontSize';
   static const _chatGptConversationUrlKey = 'chatGptConversationUrl';
+  static const _chatGptConversationUrlUpdatedAtKey =
+      'chatGptConversationUrlUpdatedAt';
+  static const _bookOrderUpdatedAtKey = 'bookOrderUpdatedAt';
   static const _openDictionaryInAppKey = 'openDictionaryInApp';
   static const _openDictionaryInAppUpdatedAtKey =
       'openDictionaryInAppUpdatedAt';
   static const _readingMeaningMigrationKey = 'readingMeaningMigrationV1';
+  static const _placeholderReadingMeaningMigrationKey =
+      'readingMeaningMigrationV2';
+  static const _verifiedTextCorrectionMigrationKey =
+      'verifiedTextCorrectionMigrationV4';
   static const int rangeCourseSchemaVersion = 2;
   static const _rangeCourseMigrationKey = 'rangeCourseMigrationV4';
   static const studyEventLogMaxItems = 3000;
@@ -356,6 +374,10 @@ class VocaStore {
   Map<String, DateTime>? _activeStudyTombstonesCache;
   Map<String, DateTime>? _completedAtCache;
   Map<String, DateTime>? _resetMarkersCache;
+  SyncReplica? _replica;
+  Future<void> _syncWork = Future<void>.value();
+  Future<void> Function()? beforeRemoteApply;
+  bool _applyingReplica = false;
 
   /// Increments only after a complete dedicated learning-state merge.
   /// Study routes listen to it so they never keep showing a stale queue.
@@ -365,11 +387,32 @@ class VocaStore {
     final store = VocaStore._(await SharedPreferences.getInstance());
     store.books = store._loadBooks();
     store.cloudChanges = await CloudChangeTracker.load();
+    if (store._activeAccountId != null) {
+      await store.cloudChanges.activateAccount(store._activeAccountId!);
+    }
+    if (store._prefs.getString('chatGptPromptsUpdatedAt') == null &&
+        (store.chatGptWordPromptTemplate.isNotEmpty ||
+            store.chatGptKanjiPromptTemplate.isNotEmpty)) {
+      await store.setChatGptPromptTemplates(
+          store.chatGptWordPromptTemplate, store.chatGptKanjiPromptTemplate);
+    }
+    if (store._prefs.getString(_chatGptConversationUrlUpdatedAtKey) == null &&
+        store.chatGptConversationUrl.isNotEmpty) {
+      await store.setChatGptConversationUrl(store.chatGptConversationUrl);
+    }
     await store._migrateOpenDictionaryInAppSetting();
     await store._migrateMainTab();
     store.wordSearch = LocalWordSearchIndex(() => store.books);
     await store._migrateRangeCourses();
     await store._repairSwappedJapaneseFields();
+    await store._repairPlaceholderReadingMeaningFields();
+    await store._applyVerifiedTextCorrections();
+    await store._loadSyncReplica();
+    // A learning-state change must be cheap: card decisions and card flips
+    // happen on the UI path.  The replica captures the current local state
+    // immediately before an upload in syncV2Snapshot instead.  Capturing it
+    // here serialized every word in every book on each interaction.
+    SyncAuxiliary.onChanged = store.cloudChanges.markLearningState;
     return store;
   }
 
@@ -428,6 +471,25 @@ class VocaStore {
       _prefs.getDouble(_exampleMeaningFontSizeKey) ?? 14;
   String get chatGptConversationUrl =>
       _prefs.getString(_chatGptConversationUrlKey) ?? '';
+  String get chatGptWordPromptTemplate =>
+      _prefs.getString('chatGptWordPromptTemplate') ?? '';
+  String get chatGptKanjiPromptTemplate =>
+      _prefs.getString('chatGptKanjiPromptTemplate') ?? '';
+
+  Future<void> setChatGptPromptTemplates(String word, String kanji) async {
+    await _prefs.setString('chatGptWordPromptTemplate', word.trim());
+    await _prefs.setString('chatGptKanjiPromptTemplate', kanji.trim());
+    final previous =
+        DateTime.tryParse(_prefs.getString('chatGptPromptsUpdatedAt') ?? '');
+    final now = DateTime.now().toUtc();
+    final updated = previous != null && !now.isAfter(previous)
+        ? previous.add(const Duration(microseconds: 1))
+        : now;
+    await _prefs.setString(
+        'chatGptPromptsUpdatedAt', updated.toIso8601String());
+    await cloudChanges.markLearningState();
+  }
+
   bool get openDictionaryInApp =>
       _prefs.getBool(_openDictionaryInAppKey) ?? false;
 
@@ -699,6 +761,15 @@ class VocaStore {
     );
     await _saveStudyEventLog(
         _prunedStudyEventLog([event, ...studyEventLog], now: now));
+    await _appendSyncEvent(
+        day,
+        {
+          'studiedCards': 1,
+          'correctCount': decision == StudyState.memorized ? 1 : 0,
+          'wrongCount': decision == StudyState.review ? 1 : 0,
+        },
+        bookId: bookId,
+        wordId: word.id);
   }
 
   Future<void> _recordCompletedSessions(
@@ -711,6 +782,7 @@ class VocaStore {
       completedSessions: current.completedSessions + completedSessionCount,
     );
     await _saveDailyStudyStats(stats);
+    await _appendSyncEvent(day, {'completedSessions': completedSessionCount});
   }
 
   Future<void> _saveResetMarkers(Map<String, DateTime> markers) {
@@ -1200,9 +1272,10 @@ class VocaStore {
   }
 
   Future<void> setSessionSize(int value) async {
+    await _rememberCompletedMembership();
     await _prefs.setInt(_sessionSizeKey, value.clamp(5, 100).toInt());
-    await _prefs.remove(_completedKey);
-    await clearActiveStudy();
+    await _projectCompletedMembership();
+    await clearAllActiveStudies(markCloudChange: false);
     await cloudChanges.markProfile();
   }
 
@@ -1281,14 +1354,21 @@ class VocaStore {
   }
 
   Future<bool> setChatGptConversationUrl(String value) async {
-    if (value.trim().isEmpty) {
-      await _prefs.remove(_chatGptConversationUrlKey);
-      await cloudChanges.markProfile();
-      return true;
-    }
-    final normalized = normalizeChatGptConversationUrl(value);
+    final normalized =
+        value.trim().isEmpty ? '' : normalizeChatGptConversationUrl(value);
     if (normalized == null) return false;
-    await _prefs.setString(_chatGptConversationUrlKey, normalized);
+    final previous = DateTime.tryParse(
+        _prefs.getString(_chatGptConversationUrlUpdatedAtKey) ?? '');
+    final now = DateTime.now().toUtc();
+    final updated = previous != null && !now.isAfter(previous)
+        ? previous.add(const Duration(microseconds: 1))
+        : now;
+    await Future.wait([
+      _prefs.setString(_chatGptConversationUrlKey, normalized),
+      _prefs.setString(
+          _chatGptConversationUrlUpdatedAtKey, updated.toIso8601String()),
+    ]);
+    await cloudChanges.markLearningState();
     await cloudChanges.markProfile();
     return true;
   }
@@ -1357,6 +1437,7 @@ class VocaStore {
     await cloudChanges.markBook(added.id);
     await cloudChanges.markWords(added.id, added.words.map((word) => word.id));
     await cloudChanges.markProfile();
+    await _markBookOrderChanged();
     return added;
   }
 
@@ -1371,7 +1452,17 @@ class VocaStore {
     if (_activeAccountId != null) await _saveAccountState(_activeAccountId!);
     final key = '$_accountStatePrefix$uid';
     final saved = _prefs.getString(key);
-    if (saved != null) {
+    final previousOwner = _prefs.getString(_lastActiveAccountKey);
+    // On an ordinary restart, the root preferences are already this
+    // account's newest local state.  Restoring `accountState` here used to
+    // overwrite freshly changed font and swipe settings with an old snapshot.
+    // A missing owner is a legacy installation; keep its live cache as well.
+    final keepLiveCache = _activeAccountId == null &&
+        (previousOwner == null || previousOwner == uid);
+    if (keepLiveCache) {
+      _activeAccountId = uid;
+      await _saveAccountState(uid);
+    } else if (saved != null) {
       await _restoreAccountState(saved);
     } else {
       if (_activeAccountId != null) {
@@ -1383,6 +1474,11 @@ class VocaStore {
       await _saveAccountState(uid);
     }
     _activeAccountId = uid;
+    await _prefs.setString(_lastActiveAccountKey, uid);
+    await cloudChanges.activateAccount(uid);
+    await _restoreSyncCheckpoint(uid);
+    await _loadSyncReplica();
+    await wordRelations.reload();
     wordSearch.invalidate();
   }
 
@@ -1400,6 +1496,14 @@ class VocaStore {
     _activeStudiesKey,
     _activeStudyTombstonesKey,
     _resetMarkersKey,
+    _bookOrderUpdatedAtKey,
+    _syncReplicaKey,
+    _syncDailyBaseKey,
+    _syncEventsKey,
+    _syncCompletedKey,
+    ..._sharedPreferenceKeys,
+    'wordRelations.v1',
+    'pronunciationSelections.v1',
   ];
 
   Future<void> _saveAccountState(String uid) async {
@@ -1411,7 +1515,8 @@ class VocaStore {
     // The in-memory books can be newer than the last preference write when a
     // caller is midway through a change.
     state[_booksKey] = _encodeBooks();
-    await _prefs.setString('$_accountStatePrefix$uid', jsonEncode(state));
+    final encoded = await compute(_encodeAccountSnapshot, state);
+    await _prefs.setString('$_accountStatePrefix$uid', encoded);
   }
 
   Future<void> _restoreAccountState(String encoded) async {
@@ -1497,13 +1602,12 @@ class VocaStore {
       final index =
           book.words.indexWhere((candidate) => candidate.id == word.id);
       if (index < 0) continue;
-      await onBeforeBookMutation?.call(book.id, 'edit');
       final updated = book.words[index];
       updated.isFavorite = value;
       updated.favoriteUpdatedAt = now;
       await _saveBooks();
       wordSearch.invalidate();
-      await cloudChanges.markWord(book.id, updated.id);
+      await cloudChanges.markLearningState();
       return;
     }
   }
@@ -1516,6 +1620,7 @@ class VocaStore {
     for (final book in books) {
       await cloudChanges.markBook(book.id);
     }
+    await _markBookOrderChanged();
   }
 
   Future<void> reorderBooks(int oldIndex, int newIndex) async {
@@ -1527,6 +1632,7 @@ class VocaStore {
     for (final reordered in books) {
       await cloudChanges.markBook(reordered.id);
     }
+    await _markBookOrderChanged();
   }
 
   Future<void> completeSessions(String bookId, Iterable<int> indexes) async {
@@ -1534,6 +1640,7 @@ class VocaStore {
     final completed = (_prefs.getStringList(_completedKey) ?? []).toSet();
     completed.addAll(completedIndexes.map((index) => '$bookId:$index'));
     await _prefs.setStringList(_completedKey, completed.toList());
+    await _rememberCompletedMembership();
     final completedTimes = Map<String, DateTime>.from(completedAt);
     final now = DateTime.now();
     for (final index in completedIndexes) {
@@ -1550,7 +1657,10 @@ class VocaStore {
       bookId: bookId,
       sessionIndexes: completedIndexes.toList()..sort(),
     );
-    await cloudChanges.markProfile();
+    // Completion changes the session badges and daily-study indicator. These
+    // belong to learningState; marking only the legacy profile queue meant a
+    // multi-session completion could remain local while card attempts synced.
+    await cloudChanges.markLearningState();
     onSessionCompleted?.call();
   }
 
@@ -1572,7 +1682,7 @@ class VocaStore {
       rangeStart: rangeStart,
       rangeEnd: rangeEnd,
     );
-    await cloudChanges.markProfile();
+    await cloudChanges.markLearningState();
     onSessionCompleted?.call();
     return true;
   }
@@ -1596,7 +1706,21 @@ class VocaStore {
     wordSearch.invalidate();
     if (deleted != null && id != 'default') {
       await cloudChanges.deleteBook(id, deleted.words.map((word) => word.id));
+      await _markBookOrderChanged();
     }
+  }
+
+  Future<void> _markBookOrderChanged() async {
+    final previous =
+        DateTime.tryParse(_prefs.getString(_bookOrderUpdatedAtKey) ?? '');
+    final now = DateTime.now().toUtc();
+    final updated = previous != null && !now.isAfter(previous)
+        ? previous.add(const Duration(microseconds: 1))
+        : now;
+    await _prefs.setString(_bookOrderUpdatedAtKey, updated.toIso8601String());
+    final account = _activeAccountId;
+    if (account != null) await _saveAccountState(account);
+    await cloudChanges.markLearningState();
   }
 
   /// Captures exactly the selected book's content and the learning-state keys
@@ -1930,6 +2054,7 @@ class VocaStore {
     final completedKey = '${quickBook.id}:$completedIndex';
     completed.add(completedKey);
     await _prefs.setStringList(_completedKey, completed.toList());
+    await _rememberCompletedMembership();
     final completedTimes = Map<String, DateTime>.from(completedAt);
     final now = DateTime.now();
     completedTimes[completedKey] = now;
@@ -1955,6 +2080,7 @@ class VocaStore {
 
   Future<void> resetProgress() async {
     await _markReset('all');
+    await _prefs.remove(_syncCompletedKey);
     for (final book in books) {
       for (final word in book.words) {
         word.state = StudyState.fresh;
@@ -1972,6 +2098,9 @@ class VocaStore {
     await _prefs.remove(_studyDaysKey);
     await _prefs.remove(_dailyStudyStatsKey);
     await _prefs.remove(_studyEventLogKey);
+    await _prefs.remove(_coursePassesKey);
+    await _prefs.remove(_syncDailyBaseKey);
+    await _prefs.remove(_syncEventsKey);
     await clearAllActiveStudies(markCloudChange: false);
     await _saveBooks();
     await cloudChanges.markLearningState();
@@ -1980,6 +2109,19 @@ class VocaStore {
   /// A card-content-free snapshot. Only learning metadata is sent to the
   /// dedicated learningState collection; Firebase words remain read-only.
   Map<String, dynamic> toLearningStateJson() => {
+        'bookOrder': {
+          'ids': books.map((book) => book.id).toList(),
+          'updatedAt': _prefs.getString(_bookOrderUpdatedAtKey),
+        },
+        'chatGptConnection': {
+          'url': chatGptConversationUrl,
+          'updatedAt': _prefs.getString(_chatGptConversationUrlUpdatedAtKey),
+        },
+        'chatGptPrompts': {
+          'word': chatGptWordPromptTemplate,
+          'kanji': chatGptKanjiPromptTemplate,
+          'updatedAt': _prefs.getString('chatGptPromptsUpdatedAt'),
+        },
         'schema': 1,
         'wordStates': {
           for (final book in books)
@@ -2020,8 +2162,82 @@ class VocaStore {
   /// learning snapshots. No word text field is read from or written to here.
   Future<void> applyLearningStateSnapshots(
       Iterable<Map<String, dynamic>> snapshots) async {
+    if (snapshots.any(
+        (snapshot) => snapshot['schema'] == 2 && snapshot['records'] is Map)) {
+      await applySyncV2(snapshots.where((snapshot) => snapshot['schema'] == 2));
+      return;
+    }
     final remoteSnapshotCount = snapshots.length;
     final all = [toLearningStateJson(), ...snapshots];
+    var bookOrderDate =
+        DateTime.tryParse(_prefs.getString(_bookOrderUpdatedAtKey) ?? '');
+    List<String>? newestBookOrder;
+    for (final snapshot in snapshots) {
+      final order = snapshot['bookOrder'];
+      if (order is! Map || order['ids'] is! List) continue;
+      final date = DateTime.tryParse(order['updatedAt']?.toString() ?? '');
+      if (date == null ||
+          (bookOrderDate != null && !date.isAfter(bookOrderDate))) {
+        continue;
+      }
+      newestBookOrder = (order['ids'] as List)
+          .map((id) => id.toString())
+          .toList(growable: false);
+      bookOrderDate = date;
+    }
+    if (newestBookOrder != null) {
+      final byId = {for (final book in books) book.id: book};
+      final reordered = <WordBook>[];
+      for (final id in newestBookOrder) {
+        final book = byId.remove(id);
+        if (book != null) reordered.add(book);
+      }
+      // Keep offline-only books visible after the known remote order.
+      reordered.addAll(books.where((book) => byId.containsKey(book.id)));
+      if (!listEquals(books.map((book) => book.id).toList(),
+          reordered.map((book) => book.id).toList())) {
+        books = reordered;
+      }
+      await _prefs.setString(
+          _bookOrderUpdatedAtKey, bookOrderDate!.toUtc().toIso8601String());
+    }
+    var connectionDate = DateTime.tryParse(
+        _prefs.getString(_chatGptConversationUrlUpdatedAtKey) ?? '');
+    for (final snapshot in snapshots) {
+      final connection = snapshot['chatGptConnection'];
+      if (connection is! Map || connection['url'] is! String) continue;
+      final date = DateTime.tryParse(connection['updatedAt']?.toString() ?? '');
+      if (date == null ||
+          (connectionDate != null && !date.isAfter(connectionDate))) {
+        continue;
+      }
+      final url = connection['url'] as String;
+      if (url.isNotEmpty && normalizeChatGptConversationUrl(url) == null) {
+        continue;
+      }
+      await _prefs.setString(_chatGptConversationUrlKey, url);
+      await _prefs.setString(
+          _chatGptConversationUrlUpdatedAtKey, date.toUtc().toIso8601String());
+      connectionDate = date;
+    }
+    var promptDate =
+        DateTime.tryParse(_prefs.getString('chatGptPromptsUpdatedAt') ?? '');
+    for (final snapshot in snapshots) {
+      final prompts = snapshot['chatGptPrompts'];
+      if (prompts is! Map ||
+          prompts['word'] is! String ||
+          prompts['kanji'] is! String) continue;
+      final date = DateTime.tryParse(prompts['updatedAt']?.toString() ?? '');
+      if (date == null || (promptDate != null && !date.isAfter(promptDate)))
+        continue;
+      await _prefs.setString(
+          'chatGptWordPromptTemplate', prompts['word'] as String);
+      await _prefs.setString(
+          'chatGptKanjiPromptTemplate', prompts['kanji'] as String);
+      await _prefs.setString(
+          'chatGptPromptsUpdatedAt', date.toUtc().toIso8601String());
+      promptDate = date;
+    }
     final reset = <String, DateTime>{};
     final tombstones = <String, DateTime>{};
     final completed = <String>{};
@@ -2406,8 +2622,10 @@ class VocaStore {
   Future<void> _saveBooks() async {
     final encoded = _encodeBooks();
     await _prefs.setString(_booksKey, encoded);
-    final account = _activeAccountId;
-    if (account != null) await _saveAccountState(account);
+    // The root preference is already the durable, live account state.  Its
+    // account snapshot is refreshed before an account switch and before a
+    // cloud sync checkpoint; doing it for every card decision created a full
+    // 2,500-word JSON snapshot on the interaction path.
   }
 
   String _newBookId() {
@@ -2464,6 +2682,215 @@ class VocaStore {
       }
     }
     await _prefs.setBool(_readingMeaningMigrationKey, true);
+  }
+
+  /// Repairs an older import bug where rows without a dedicated Japanese
+  /// reading were stored as `meaning: ㆍ, reading: <Korean meaning>`.
+  ///
+  /// The import contract uses the Japanese term itself as the reading in this
+  /// case.  Keep the word ID and every learning field intact so study history,
+  /// session progress, and cloud merge identities are preserved.
+  Future<void> _repairPlaceholderReadingMeaningFields() async {
+    if (_prefs.getBool(_placeholderReadingMeaningMigrationKey) ?? false) {
+      return;
+    }
+    final changedWords = <String, List<int>>{};
+    final japaneseText = RegExp(r'[\u3040-\u30ff\u3400-\u9fff]');
+    final hangulText = RegExp(r'[가-힣]');
+    for (final book in books) {
+      for (var index = 0; index < book.words.length; index++) {
+        final word = book.words[index];
+        if (word.meaning.trim() != 'ㆍ' ||
+            !hangulText.hasMatch(word.reading) ||
+            !japaneseText.hasMatch(word.term)) {
+          continue;
+        }
+        book.words[index] = word.copyWith(
+          reading: word.term,
+          meaning: word.reading,
+        );
+        changedWords.putIfAbsent(book.id, () => []).add(word.id);
+      }
+    }
+    if (changedWords.isNotEmpty) {
+      await _saveBooks();
+      wordSearch.invalidate();
+      for (final entry in changedWords.entries) {
+        await cloudChanges.markWords(entry.key, entry.value);
+      }
+    }
+    await _prefs.setBool(_placeholderReadingMeaningMigrationKey, true);
+  }
+
+  /// Applies only individually source-verified N1 corrections. A correction
+  /// that changes Japanese spelling or reading preserves a learner's meaning
+  /// notes verbatim: once the known erroneous term/reading pair is present,
+  /// only that objectively wrong Japanese field is normalized. Meaning edits
+  /// still require the complete original card text.
+  Future<void> _applyVerifiedTextCorrections() async {
+    if (_prefs.getBool(_verifiedTextCorrectionMigrationKey) ?? false) return;
+    const repairs = <Map<String, String>>[
+      {
+        'term': '跡地',
+        'reading': 'あとち',
+        'meaning': '철거부지, 잔해',
+        'newMeaning': '이전 터, 철거지'
+      },
+      {
+        'term': '表向き',
+        'reading': 'おもてむき',
+        'meaning': '표면화함',
+        'newMeaning': '겉으로는, 표면상'
+      },
+      {
+        'term': '自ら',
+        'reading': 'みずから',
+        'meaning': '자기',
+        'newMeaning': '스스로, 몸소'
+      },
+      {
+        'term': '巡り',
+        'reading': 'めぐり',
+        'meaning': '한바퀴 돎, 여기저기 돌름, 순례',
+        'newMeaning': '돌아다님, 순환'
+      },
+      {
+        'term': '(改訂)版',
+        'reading': '(かいてい)はん',
+        'meaning': '(개정)판',
+        'newReading': '(かいてい)ばん'
+      },
+      {
+        'term': '気掛かり',
+        'reading': 'きかかり',
+        'meaning': '걱정, 마음에 걸림',
+        'newReading': 'きがかり'
+      },
+      {
+        'term': '食い止める',
+        'reading': 'くいやめる',
+        'meaning': '저지하다',
+        'newReading': 'くいとめる'
+      },
+      {
+        'term': '煙たい',
+        'reading': 'けむたい',
+        'meaning': '냄다, 맵고 싸하다',
+        'newMeaning': '맵고 싸하다, (대하기) 어렵다'
+      },
+      {
+        'term': '(情報)網',
+        'reading': '(じょうほう)あみ',
+        'meaning': '(정보)망',
+        'newReading': '(じょうほう)もう'
+      },
+      {
+        'term': '尻急',
+        'reading': 'しりきゅう',
+        'meaning': '응급',
+        'newTerm': '応急',
+        'newReading': 'おうきゅう'
+      },
+      {
+        'term': '猛(反対)',
+        'reading': 'たけし(はんたい)',
+        'meaning': '맹(반대)',
+        'newReading': 'もう(はんたい)'
+      },
+      {
+        'term': '楽観的',
+        'reading': 'らくかんてき',
+        'meaning': '낙관적',
+        'newReading': 'らっかんてき'
+      },
+      {
+        'term': '[歴史]上',
+        'reading': '[れきし]うえ',
+        'meaning': '(역사상)',
+        'newReading': '[れきし]じょう'
+      },
+      {
+        'term': '目ずと',
+        'reading': 'めずと',
+        'meaning': '자연스레',
+        'newTerm': '自ずと',
+        'newReading': 'おのずと'
+      },
+      {
+        'term': '今までになく新しい',
+        'reading': 'いままでになくあたらしい',
+        'meaning': '지금까지 없이 새로운',
+        'newMeaning': '지금까지 없을 만큼 새로운'
+      },
+      {
+        'term': '口数が少ない',
+        'reading': 'くちすうがすくない',
+        'meaning': '말수가 적은',
+        'newReading': 'くちかずがすくない'
+      },
+      {
+        'term': '気掛かり',
+        'reading': 'きかかり',
+        'meaning': '걱정',
+        'newReading': 'きがかり'
+      },
+      {
+        'term': 'つかの間',
+        'reading': 'つかのかん',
+        'meaning': '잠깐 동안, 순간',
+        'newReading': 'つかのま'
+      },
+      {
+        'term': '脈略',
+        'reading': 'みゃくりゃく',
+        'meaning': '맥락',
+        'newReading': 'みゃくらく'
+      },
+      {
+        'term': 'くまなく',
+        'reading': 'くまなく',
+        'meaning': '분명히, 뚜렷하게, 빠짐없이',
+        'newMeaning': '구석구석, 빠짐없이'
+      },
+      {
+        'term': '～だって',
+        'reading': '～だって',
+        'meaning': '①~도, ~라도, ~조차도 ②~도 또한 ③~라던대 ④(아무리)~해도, ~하더라도',
+        'newMeaning': '①~도, ~라도, ~조차도 ②~도 또한 ③~라던데 ④(아무리)~해도, ~하더라도'
+      },
+    ];
+    final changedWords = <String, List<int>>{};
+    for (final book in books) {
+      for (var index = 0; index < book.words.length; index++) {
+        final word = book.words[index];
+        final repair = repairs.where((candidate) {
+          if (candidate['term'] != word.term ||
+              candidate['reading'] != word.reading) {
+            return false;
+          }
+          final formOnlyCorrection = candidate['newMeaning'] == null &&
+              (candidate['newTerm'] != null || candidate['newReading'] != null);
+          if (formOnlyCorrection) return true;
+          final expectedMeaning = candidate['meaning'];
+          return expectedMeaning == null || expectedMeaning == word.meaning;
+        }).firstOrNull;
+        if (repair == null) continue;
+        book.words[index] = word.copyWith(
+          term: repair['newTerm'],
+          reading: repair['newReading'],
+          meaning: repair['newMeaning'],
+        );
+        changedWords.putIfAbsent(book.id, () => []).add(word.id);
+      }
+    }
+    if (changedWords.isNotEmpty) {
+      await _saveBooks();
+      wordSearch.invalidate();
+      for (final entry in changedWords.entries) {
+        await cloudChanges.markWords(entry.key, entry.value);
+      }
+    }
+    await _prefs.setBool(_verifiedTextCorrectionMigrationKey, true);
   }
 
   static String _dayKey(DateTime date) =>
