@@ -4,34 +4,6 @@ const _syncReplicaKey = 'sync.v2.replica';
 const _syncDailyBaseKey = 'sync.v2.dailyBaseline';
 const _syncEventsKey = 'sync.v2.events';
 const _syncCompletedKey = 'sync.v2.completedMembership';
-const _sharedPreferenceKeys = <String>[
-  'quickBook',
-  'sessionSize',
-  'targetName',
-  'targetDate',
-  'horizontalSwipe',
-  'reverseSwipe',
-  'readingAboveTerm',
-  'showExamples',
-  'flipCard',
-  'autoPlayPronunciation',
-  'undoHaptics',
-  'japaneseFont',
-  'termFontSize',
-  'readingFontSize',
-  'meaningFontSize',
-  'exampleFontSize',
-  'exampleMeaningFontSize',
-  'meaningFontWeight',
-  'meaningOpacity',
-  'chatGptConversationUrl',
-  'chatGptWordPromptTemplate',
-  'chatGptKanjiPromptTemplate',
-  'openDictionaryInApp',
-  'chatGptConversationUrlUpdatedAt',
-  'chatGptPromptsUpdatedAt',
-  'openDictionaryInAppUpdatedAt',
-];
 
 extension VocaStoreSync on VocaStore {
   bool get legacySyncImported =>
@@ -43,6 +15,11 @@ extension VocaStoreSync on VocaStore {
     final checkpoint = Map<String, dynamic>.from(jsonDecode(saved));
     final state = Map<String, dynamic>.from(checkpoint['state']);
     for (final key in VocaStore._accountScopedKeys) {
+      if (VocaStore.settingsPreferenceKeys.contains(key) ||
+          key == VocaStore._settingsVersionsKey ||
+          !state.containsKey(key)) {
+        continue;
+      }
       final value = state[key];
       if (value is List) {
         await _prefs.setStringList(key, value.cast<String>());
@@ -129,7 +106,6 @@ extension VocaStoreSync on VocaStore {
   Map<String, dynamic> _syncValues() {
     final state = toLearningStateJson();
     return {
-      for (final key in _sharedPreferenceKeys) 'setting/$key': _prefs.get(key),
       'bookOrder': books.map((b) => b.id).toList(),
       for (final raw
           in jsonDecode(_prefs.getString('wordRelations.v1') ?? '[]') as List)
@@ -197,7 +173,10 @@ extension VocaStoreSync on VocaStore {
   Future<void> _writeSyncCheckpoint() async {
     final data = <String, dynamic>{
       for (final key in VocaStore._accountScopedKeys)
-        if (_prefs.get(key) != null) key: _prefs.get(key),
+        if (!VocaStore.settingsPreferenceKeys.contains(key) &&
+            key != VocaStore._settingsVersionsKey &&
+            _prefs.get(key) != null)
+          key: _prefs.get(key),
       VocaStore._booksKey: _encodeBooks(),
     };
     final account = _activeAccountId;
@@ -321,10 +300,6 @@ extension VocaStoreSync on VocaStore {
         ]));
     await wordRelations.reload();
     SyncAuxiliary.revision.value++;
-    for (final key in _sharedPreferenceKeys) {
-      if (values.containsKey('setting/$key'))
-        await _setSharedPreference(key, values['setting/$key']);
-    }
     final order = values['bookOrder'];
     if (order is List) {
       final byId = {for (final b in books) b.id: b};

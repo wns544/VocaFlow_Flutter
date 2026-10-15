@@ -36,6 +36,8 @@ void main() {
     final setting = find.byKey(const ValueKey('chatgpt-prompt-setting'));
     await tester.scrollUntilVisible(setting, 250,
         scrollable: find.byType(Scrollable).last);
+    await tester.ensureVisible(setting);
+    await tester.pumpAndSettle();
     await tester.tap(setting);
     await tester.pumpAndSettle();
     await tester.enterText(
@@ -671,8 +673,8 @@ void main() {
     expect(write.isCompleted, isFalse);
 
     write.complete();
-    await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 20)));
+    await tester
+        .runAsync(() => Future<void>.delayed(const Duration(milliseconds: 20)));
     await tester.pumpAndSettle();
     expect((await VocaStore.load()).activeStudies, isNotEmpty);
   });
@@ -1201,6 +1203,13 @@ void main() {
     expect(find.text('남길 유'), findsOneWidget);
     expect(find.textContaining('음독: イ'), findsOneWidget);
     expect(find.textContaining('영문 뜻: leave behind'), findsOneWidget);
+    final detailCharacter =
+        find.byKey(const ValueKey('kanji-detail-character'));
+    final detailCopy = find.byKey(const ValueKey('copy-kanji-detail'));
+    expect(tester.getCenter(detailCopy).dx,
+        greaterThan(tester.getCenter(detailCharacter).dx));
+    expect(tester.getCenter(detailCopy).dy,
+        closeTo(tester.getCenter(detailCharacter).dy, 1));
     await tester.binding.handlePopRoute();
     await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey('kanji-detail-character')), findsNothing);
@@ -1218,8 +1227,10 @@ void main() {
 
     await tester
         .ensureVisible(find.byKey(const ValueKey('open-chatgpt-kanji')));
+    final callsBeforeKanjiQuestion = externalCalls.length;
     await tester.tap(find.byKey(const ValueKey('open-chatgpt-kanji')));
-    await tester.pump(const Duration(milliseconds: 1000));
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(externalCalls, hasLength(callsBeforeKanjiQuestion + 1));
     expect(externalCalls.last.method, 'openUrl');
     final chatGptUrl =
         Uri.parse((externalCalls.last.arguments as Map)['url'] as String);
@@ -1229,11 +1240,20 @@ void main() {
     expect(chatGptUrl.queryParameters['q'], contains('遺跡'));
     await tester.ensureVisible(find.byKey(const ValueKey('open-chatgpt-word')));
     await tester.tap(find.byKey(const ValueKey('open-chatgpt-word')));
-    await tester.pump(const Duration(milliseconds: 1000));
+    await tester.pump(const Duration(milliseconds: 100));
     final wordChatGptUrl =
         Uri.parse((externalCalls.last.arguments as Map)['url'] as String);
     expect(wordChatGptUrl.path, '/c/study-kanji');
-    expect(wordChatGptUrl.queryParameters['q'], contains('한자 조합'));
+    expect(wordChatGptUrl.queryParameters['q'], contains('핵심 뉘앙스'));
+
+    await tester.ensureVisible(
+        find.byKey(const ValueKey('open-chatgpt-meaning-origin')));
+    await tester.tap(find.byKey(const ValueKey('open-chatgpt-meaning-origin')));
+    await tester.pump(const Duration(milliseconds: 100));
+    final meaningOriginUrl =
+        Uri.parse((externalCalls.last.arguments as Map)['url'] as String);
+    expect(meaningOriginUrl.queryParameters['q'], contains('왜 이런 뜻'));
+    expect(meaningOriginUrl.queryParameters['q'], contains('억지 한자 풀이'));
 
     Navigator.of(tester
             .element(find.byKey(const ValueKey('kanji-detail-character'))))
@@ -1278,6 +1298,9 @@ void main() {
     expect(find.text('いやらしい'), findsWidgets);
     expect(find.text('불쾌하다'), findsOneWidget);
     expect(find.byKey(const ValueKey('open-chatgpt-word')), findsOneWidget);
+    expect(find.byKey(const ValueKey('open-chatgpt-meaning-origin')),
+        findsOneWidget);
+    expect(find.byKey(const ValueKey('open-chatgpt-kanji')), findsNothing);
     expect(find.byKey(const ValueKey('open-naver-hanja')), findsNothing);
   });
 

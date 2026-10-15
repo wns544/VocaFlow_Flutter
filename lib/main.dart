@@ -1890,6 +1890,7 @@ class _CardStudyPageState extends State<CardStudyPage>
   var finishingStudy = false;
   var completionValidated = false;
   var _undoTransitionRevision = 0;
+  Offset? _undoEntryDirection;
   Word? lastWord;
   StudyState? lastState;
   final undoHistory = <StudyDecision>[];
@@ -1937,13 +1938,13 @@ class _CardStudyPageState extends State<CardStudyPage>
     if (key == LogicalKeyboardKey.digit1 ||
         key == LogicalKeyboardKey.arrowLeft ||
         key == LogicalKeyboardKey.arrowUp) {
-      decide(stateForDirection(false));
+      decide(stateForDirection(false), dismissedPositive: false);
       return KeyEventResult.handled;
     }
     if (key == LogicalKeyboardKey.digit2 ||
         key == LogicalKeyboardKey.arrowRight ||
         key == LogicalKeyboardKey.arrowDown) {
-      decide(stateForDirection(true));
+      decide(stateForDirection(true), dismissedPositive: true);
       return KeyEventResult.handled;
     }
     if (key == LogicalKeyboardKey.keyZ && undoHistory.isNotEmpty) {
@@ -2580,7 +2581,7 @@ class _CardStudyPageState extends State<CardStudyPage>
     });
   }
 
-  void decide(StudyState state) {
+  void decide(StudyState state, {bool? dismissedPositive}) {
     if (queue.isEmpty) return;
     final word = queue.removeAt(0);
     seenWordIds.add(word.id);
@@ -2593,6 +2594,8 @@ class _CardStudyPageState extends State<CardStudyPage>
       previousState: previousState,
       decision: state,
       bookId: _bookIdForWord(word),
+      dismissedPositive: dismissedPositive,
+      usedHorizontalSwipe: dismissedPositive == null ? null : horizontalSwipe,
     ));
     if (state == StudyState.memorized) {
       memorized++;
@@ -2618,7 +2621,9 @@ class _CardStudyPageState extends State<CardStudyPage>
     } else {
       _scheduleDecisionPersistence(word, state);
     }
-    if (mounted) setState(() {});
+    if (mounted) {
+      setState(() => _undoEntryDirection = null);
+    }
     scheduleResumeSnapshotCapture('study');
   }
 
@@ -3155,8 +3160,6 @@ class _CardStudyPageState extends State<CardStudyPage>
       roundUnknown.removeWhere((item) =>
           item.id == word.id && _bookIdForWord(item) == undone.bookId);
     }
-    await widget.store.undoWordDecision(word, undone.previousState,
-        bookId: undone.bookId ?? activeBookId);
     final previous = undoHistory.lastOrNull;
     lastWord = previous == null
         ? null
@@ -3167,13 +3170,26 @@ class _CardStudyPageState extends State<CardStudyPage>
             .where((item) => item.id == previous.wordId)
             .firstOrNull;
     lastState = previous?.decision;
-    await persistStudy();
+    // Show the restored card immediately. Storage and sync work must not hold
+    // the visual transition hostage, otherwise the same card can appear once
+    // as plain content and again later through AnimatedSwitcher.
     if (mounted) {
-      setState(() => _undoTransitionRevision++);
+      final positive = undone.dismissedPositive ??
+          (stateForDirection(true) == undone.decision);
+      final horizontal = undone.usedHorizontalSwipe ?? horizontalSwipe;
+      setState(() {
+        _undoTransitionRevision++;
+        _undoEntryDirection = horizontal
+            ? Offset(positive ? 1 : -1, 0)
+            : Offset(0, positive ? 1 : -1);
+      });
       if (widget.store.undoHaptics) {
         unawaited(HapticFeedback.lightImpact());
       }
     }
+    await widget.store.undoWordDecision(word, undone.previousState,
+        bookId: undone.bookId ?? activeBookId);
+    await persistStudy();
     scheduleResumeSnapshotCapture('study');
   }
 
@@ -3297,10 +3313,10 @@ class _CardStudyPageState extends State<CardStudyPage>
                       semanticLabel: '발음 자동 재생',
                       toggled: _autoPlayPronunciation,
                       iconColor: _autoPlayPronunciation
-                          ? coral
+                          ? sea
                           : const Color(0xFF8E8E93),
                       backgroundColor: _autoPlayPronunciation
-                          ? coral.withValues(alpha: .10)
+                          ? sea.withValues(alpha: .10)
                           : Colors.white,
                       onTap: _toggleAutoPlayPronunciation,
                     ),
@@ -3384,8 +3400,8 @@ class _CardStudyPageState extends State<CardStudyPage>
                   const SizedBox(height: 12),
                   Expanded(
                     child: AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 280),
-                      switchInCurve: Curves.easeOutCubic,
+                      duration: const Duration(milliseconds: 300),
+                      switchInCurve: const Cubic(.16, 1, .3, 1),
                       switchOutCurve: Curves.easeInCubic,
                       layoutBuilder: (currentChild, previousChildren) => Stack(
                         clipBehavior: Clip.none,
@@ -3395,25 +3411,57 @@ class _CardStudyPageState extends State<CardStudyPage>
                           if (currentChild != null) currentChild,
                         ],
                       ),
-                      transitionBuilder: (child, animation) => AnimatedBuilder(
-                        animation: animation,
-                        child: child,
-                        builder: (context, child) {
-                          final leaving =
-                              animation.status == AnimationStatus.reverse;
-                          final distance = (1 - animation.value) * .16;
-                          return Opacity(
-                            opacity: animation.value,
-                            child: Transform.translate(
-                              offset: Offset(leaving ? distance : -distance, 0),
-                              child: Transform.scale(
-                                scale: 1 - (1 - animation.value) * .035,
-                                child: child,
+                      transitionBuilder: (child, animation) {
+                        final undoDirection = _undoEntryDirection;
+                        return AnimatedBuilder(
+                          animation: animation,
+                          child: child,
+                          builder: (context, child) {
+                            final leaving =
+                                animation.status == AnimationStatus.reverse;
+                            final progress = animation.value;
+                            if (!leaving && undoDirection != null) {
+                              final screen = MediaQuery.sizeOf(context);
+                              final distance = (undoDirection.dx != 0
+                                      ? screen.width
+                                      : screen.height) *
+                                  .22 *
+                                  (1 - progress);
+                              final rotation = undoDirection.dx != 0
+                                  ? -undoDirection.dx * (1 - progress) * .022
+                                  : undoDirection.dy * (1 - progress) * .015;
+                              return Opacity(
+                                opacity: .72 + progress * .28,
+                                child: Transform.translate(
+                                  offset: Offset(
+                                    undoDirection.dx * distance,
+                                    undoDirection.dy * distance,
+                                  ),
+                                  child: Transform.rotate(
+                                    angle: rotation,
+                                    child: Transform.scale(
+                                      scale: .965 + progress * .035,
+                                      child: child,
+                                    ),
+                                  ),
+                                ),
+                              );
+                            }
+                            final distance = (1 - progress) * .16;
+                            return Opacity(
+                              opacity: progress,
+                              child: Transform.translate(
+                                offset:
+                                    Offset(leaving ? distance : -distance, 0),
+                                child: Transform.scale(
+                                  scale: 1 - (1 - progress) * .035,
+                                  child: child,
+                                ),
                               ),
-                            ),
-                          );
-                        },
-                      ),
+                            );
+                          },
+                        );
+                      },
                       child: KeyedSubtree(
                         key: ValueKey('undo-card-$_undoTransitionRevision'),
                         child: _StudyCardDeck(
@@ -3425,8 +3473,9 @@ class _CardStudyPageState extends State<CardStudyPage>
                           onTap: () => toggleReveal(word),
                           onPrimaryDragChanged: (value) =>
                               _primaryDrag.value = value,
-                          onDismissed: (positive) =>
-                              decide(stateForDirection(positive)),
+                          onDismissed: (positive) => decide(
+                              stateForDirection(positive),
+                              dismissedPositive: positive),
                           front: showingExplanation
                               ? explanationFace(word)
                               : widget.store.flipCard
@@ -4257,6 +4306,14 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
     ));
   }
 
+  Future<void> openChatGptMeaningOrigin() async {
+    await openChatGptPrompt(buildChatGptMeaningOriginPrompt(
+      term: widget.word.term,
+      reading: widget.word.reading,
+      meaning: widget.word.meaning,
+    ));
+  }
+
   Future<void> openChatGptExamples() async {
     await openChatGptPrompt(buildChatGptExamplePrompt(
       term: widget.word.term,
@@ -4382,19 +4439,51 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Text(
-                widget.character,
-                key: ValueKey(isKanjiDetail
-                    ? 'kanji-detail-character'
-                    : 'kana-word-detail-term'),
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: ink,
-                  fontSize: 58,
-                  fontFamily: japaneseFontFamily(widget.store),
-                  fontWeight: FontWeight.w700,
+              if (isKanjiDetail)
+                Row(
+                  children: [
+                    const SizedBox(width: 40),
+                    Expanded(
+                      child: Text(
+                        widget.character,
+                        key: const ValueKey('kanji-detail-character'),
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: ink,
+                          fontSize: 58,
+                          fontFamily: japaneseFontFamily(widget.store),
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    SizedBox(
+                      width: 40,
+                      child: IconButton(
+                        key: const ValueKey('copy-kanji-detail'),
+                        tooltip: '한자 복사',
+                        visualDensity: VisualDensity.compact,
+                        onPressed: copyCharacter,
+                        icon: const Icon(
+                          Icons.copy_outlined,
+                          size: 18,
+                          color: Color(0xFF8E8E93),
+                        ),
+                      ),
+                    ),
+                  ],
+                )
+              else
+                Text(
+                  widget.character,
+                  key: const ValueKey('kana-word-detail-term'),
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: ink,
+                    fontSize: 58,
+                    fontFamily: japaneseFontFamily(widget.store),
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
-              ),
               const SizedBox(height: 14),
               if (isKanjiDetail)
                 FutureBuilder<KoreanHanjaEntry?>(
@@ -4465,12 +4554,13 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
                 ),
               if (!isKanjiDetail) _pronunciationChoiceButton(),
               if (!isKanjiDetail) const SizedBox(height: 8),
-              OutlinedButton.icon(
-                key: const ValueKey('copy-kanji-detail'),
-                onPressed: copyCharacter,
-                icon: const Icon(Icons.copy_outlined, size: 18),
-                label: Text(isKanjiDetail ? '한자 복사' : '단어 복사'),
-              ),
+              if (!isKanjiDetail)
+                OutlinedButton.icon(
+                  key: const ValueKey('copy-kanji-detail'),
+                  onPressed: copyCharacter,
+                  icon: const Icon(Icons.copy_outlined, size: 18),
+                  label: const Text('단어 복사'),
+                ),
               if (isKanjiDetail) const SizedBox(height: 8),
               if (isKanjiDetail)
                 OutlinedButton.icon(
@@ -4495,27 +4585,13 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
                   icon: const Icon(Icons.search, size: 19),
                   label: const Text('네이버 한자사전에서 보기'),
                 ),
-              if (isKanjiDetail) const SizedBox(height: 8),
-              if (isKanjiDetail)
-                FilledButton.icon(
-                  key: const ValueKey('open-chatgpt-kanji'),
-                  onPressed: openChatGpt,
-                  icon: const Icon(Icons.forum_outlined, size: 18),
-                  label: const Text('이 한자 ChatGPT에 질문'),
-                ),
-              const SizedBox(height: 8),
-              FilledButton.icon(
-                key: const ValueKey('open-chatgpt-word'),
-                onPressed: openChatGptWord,
-                icon: const Icon(Icons.auto_awesome, size: 18),
-                label: Text('「${widget.word.term}」 단어 ChatGPT에 질문'),
-              ),
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
-                key: const ValueKey('open-chatgpt-examples'),
-                onPressed: openChatGptExamples,
-                icon: const Icon(Icons.format_quote_outlined, size: 18),
-                label: Text('「${widget.word.term}」 예문 10개 ChatGPT에 질문'),
+              const SizedBox(height: 12),
+              _ChatGptQuestionSection(
+                showKanjiQuestion: isKanjiDetail,
+                onKanjiQuestion: openChatGpt,
+                onWordQuestion: openChatGptWord,
+                onMeaningOriginQuestion: openChatGptMeaningOrigin,
+                onExamplesQuestion: openChatGptExamples,
               ),
               if (widget.store.chatGptConversationUrl.isEmpty) ...[
                 const SizedBox(height: 6),
@@ -4526,6 +4602,105 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
                 ),
               ],
             ],
+          ),
+        ),
+      );
+}
+
+class _ChatGptQuestionSection extends StatelessWidget {
+  const _ChatGptQuestionSection({
+    required this.showKanjiQuestion,
+    required this.onKanjiQuestion,
+    required this.onWordQuestion,
+    required this.onMeaningOriginQuestion,
+    required this.onExamplesQuestion,
+  });
+
+  final bool showKanjiQuestion;
+  final VoidCallback onKanjiQuestion;
+  final VoidCallback onWordQuestion;
+  final VoidCallback onMeaningOriginQuestion;
+  final VoidCallback onExamplesQuestion;
+
+  @override
+  Widget build(BuildContext context) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'ChatGPT에 질문',
+            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800),
+          ),
+          const SizedBox(height: 8),
+          GridView.count(
+            key: const ValueKey('chatgpt-question-grid'),
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            crossAxisCount: 2,
+            mainAxisSpacing: 8,
+            crossAxisSpacing: 8,
+            childAspectRatio: 2.45,
+            children: [
+              if (showKanjiQuestion)
+                _ChatGptQuestionButton(
+                  key: const ValueKey('open-chatgpt-kanji'),
+                  icon: Icons.translate,
+                  label: '이 한자를 질문',
+                  onPressed: onKanjiQuestion,
+                ),
+              _ChatGptQuestionButton(
+                key: const ValueKey('open-chatgpt-word'),
+                icon: Icons.auto_awesome,
+                label: '이 단어를 질문',
+                onPressed: onWordQuestion,
+              ),
+              _ChatGptQuestionButton(
+                key: const ValueKey('open-chatgpt-meaning-origin'),
+                icon: Icons.account_tree_outlined,
+                label: '왜 이런 뜻?',
+                onPressed: onMeaningOriginQuestion,
+              ),
+              _ChatGptQuestionButton(
+                key: const ValueKey('open-chatgpt-examples'),
+                icon: Icons.format_quote_outlined,
+                label: '예문 10개',
+                onPressed: onExamplesQuestion,
+              ),
+            ],
+          ),
+        ],
+      );
+}
+
+class _ChatGptQuestionButton extends StatelessWidget {
+  const _ChatGptQuestionButton({
+    super.key,
+    required this.icon,
+    required this.label,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) => OutlinedButton.icon(
+        onPressed: onPressed,
+        icon: Icon(icon, size: 16),
+        label: Text(
+          label,
+          maxLines: 2,
+          textAlign: TextAlign.center,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+        ),
+        style: OutlinedButton.styleFrom(
+          foregroundColor: ink,
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
+          minimumSize: const Size(0, 44),
+          side: const BorderSide(color: Color(0xFFDADCE0)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
           ),
         ),
       );
@@ -7120,6 +7295,24 @@ class _SettingsPageState extends State<SettingsPage> {
     });
   }
 
+  Future<void> restorePresentationSettingsFromCloud() async {
+    final confirmed = await _confirm(
+      title: '클라우드 설정을 확인할까요?',
+      message:
+          '이 기기보다 클라우드에 더 최근에 저장된 설정 항목만 가져옵니다. 단어장, 카드, 학습 기록, 세션은 바뀌지 않습니다.',
+      action: '설정 확인',
+    );
+    if (!confirmed) return;
+    await _runCloudTask(() async {
+      final result = await CloudBackup()
+          .syncSettings(const <String, Map<String, dynamic>>{});
+      await widget.store.applySettingsEntries(result.fields);
+      widget.refresh();
+      if (mounted) setState(() {});
+      _showSnack('클라우드 설정을 확인했습니다.');
+    });
+  }
+
   Future<void> viewCloudContents() async {
     if (!firebaseReady || FirebaseAuth.instance.currentUser == null) {
       _showSnack('먼저 Google로 로그인해 주세요.');
@@ -7536,6 +7729,9 @@ class _SettingsPageState extends State<SettingsPage> {
                 Text('상태: ${auto?.syncStatus ?? '로그인 필요'}',
                     style: const TextStyle(
                         color: Color(0xFF8E8E93), fontSize: 12)),
+                Text('설정: ${auto?.settingsSyncStatus ?? '로그인 필요'}',
+                    style: const TextStyle(
+                        color: Color(0xFF8E8E93), fontSize: 12)),
                 Text(
                     '대기 중 변경: ${auto?.pendingCount ?? widget.store.cloudChanges.pendingCount}개',
                     style: const TextStyle(
@@ -7644,6 +7840,26 @@ class _SettingsPageState extends State<SettingsPage> {
                     style: FilledButton.styleFrom(
                       backgroundColor: sea,
                       foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  height: 44,
+                  child: OutlinedButton.icon(
+                    key: const ValueKey('restore-presentation-settings'),
+                    onPressed: syncing || user == null
+                        ? null
+                        : restorePresentationSettingsFromCloud,
+                    icon: const Icon(Icons.tune, size: 18),
+                    label: const Text('클라우드 설정 확인'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: ink,
+                      side: const BorderSide(color: Color(0xFFDADCE0)),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(14),
                       ),

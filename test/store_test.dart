@@ -6,8 +6,7 @@ import 'package:vocaflow/models.dart';
 import 'package:vocaflow/store.dart';
 
 void main() {
-  test(
-      'question settings sync latest values and default reset without editing cards',
+  test('legacy learning snapshots cannot overwrite question settings',
       () async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();
@@ -24,8 +23,8 @@ void main() {
           .toIso8601String(),
     };
     await store.applyLearningStateSnapshots([newer, old]);
-    expect(store.chatGptWordPromptTemplate, '새 문구');
-    expect(store.chatGptKanjiPromptTemplate, '새 한자');
+    expect(store.chatGptWordPromptTemplate, '단어 {{단어}}');
+    expect(store.chatGptKanjiPromptTemplate, '한자 {{한자}}');
     await store.setChatGptPromptTemplates('', '');
     await store.applyLearningStateSnapshots([newer, old]);
     expect(store.chatGptWordPromptTemplate, '');
@@ -61,7 +60,7 @@ void main() {
           .toIso8601String(),
     };
     await store.applyLearningStateSnapshots([remote]);
-    expect(store.chatGptConversationUrl, latest);
+    expect(store.chatGptConversationUrl, first);
     expect(
         jsonEncode(store.books.map((book) => book.toJson()).toList()), cards);
   });
@@ -298,6 +297,110 @@ void main() {
     final reloaded = await VocaStore.load();
     expect(reloaded.horizontalSwipe, isTrue);
     expect(reloaded.reverseSwipe, isTrue);
+  });
+
+  test('upgraded device seeds only its explicitly stored local settings',
+      () async {
+    SharedPreferences.setMockInitialValues({'horizontalSwipe': true});
+    final store = await VocaStore.load();
+
+    await store.activateAccount('account-a');
+
+    expect(store.cloudChanges.snapshot.settingsKeys, {'horizontalSwipe'});
+    expect(
+      store.settingsEntries({'horizontalSwipe'})['horizontalSwipe']?['value'],
+      isTrue,
+    );
+  });
+
+  test('fresh device does not create local setting values before restore',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+
+    await store.activateAccount('account-a');
+
+    expect(store.cloudChanges.snapshot.settingsKeys, isEmpty);
+  });
+
+  test('newer cloud setting changes only its matching local field', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    await store.setHorizontalSwipe(true);
+    await store.setCardFontSizes(
+      term: 40,
+      reading: 18,
+      meaning: 26,
+      example: 19,
+      exampleMeaning: 17,
+    );
+
+    await store.applySettingsEntries({
+      'horizontalSwipe': {
+        'value': false,
+        'updatedAtMicros': DateTime.now().toUtc().microsecondsSinceEpoch + 10,
+        'deviceId': 'other-device',
+      },
+    });
+
+    expect(store.horizontalSwipe, isFalse);
+    expect(store.termFontSize, 40);
+  });
+
+  test('cloud response cannot replace a setting changed during upload',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    await store.setHorizontalSwipe(true);
+    final captured = store.settingsEntries({'horizontalSwipe'});
+    await store.setHorizontalSwipe(false);
+
+    await store.applySettingsEntries({
+      'horizontalSwipe': {
+        'value': true,
+        'updatedAtMicros': DateTime.now().toUtc().microsecondsSinceEpoch + 10,
+        'deviceId': 'other-device',
+      },
+    }, expectedVersions: captured);
+
+    expect(store.horizontalSwipe, isFalse);
+    expect(store.cloudChanges.snapshot.settingsKeys, {'horizontalSwipe'});
+  });
+
+  test('saving one font size only queues that changed field', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    await store.setCardFontSizes(
+      term: 40,
+      reading: 18,
+      meaning: 26,
+      example: 19,
+      exampleMeaning: 17,
+    );
+    await store.cloudChanges
+        .acknowledgeSettings(store.cloudChanges.snapshot.settingsKeys);
+
+    await store.setCardFontSizes(
+      term: 42,
+      reading: 18,
+      meaning: 26,
+      example: 19,
+      exampleMeaning: 17,
+    );
+
+    expect(store.cloudChanges.snapshot.settingsKeys, {'termFontSize'});
+  });
+
+  test('question prompts are settings, not learning-state fields', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    await store.setChatGptPromptTemplates('단어 문구', '한자 문구');
+
+    final fields =
+        store.settingsEntries(store.cloudChanges.snapshot.settingsKeys);
+    expect(fields['chatGptWordPromptTemplate']?['value'], '단어 문구');
+    expect(fields['chatGptKanjiPromptTemplate']?['value'], '한자 문구');
+    expect(store.toLearningStateJson(), isNot(contains('chatGptPrompts')));
   });
 
   test('study card display settings persist', () async {
@@ -640,7 +743,8 @@ void main() {
     expect(store.cloudChanges.snapshot.wordIdsByBook['placeholder'], {89});
   });
 
-  test('repairs verified Japanese form errors while preserving learner meanings',
+  test(
+      'repairs verified Japanese form errors while preserving learner meanings',
       () async {
     final book = WordBook(
       id: 'verified',

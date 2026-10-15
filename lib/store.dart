@@ -162,18 +162,24 @@ class StudyDecision {
     required this.previousState,
     required this.decision,
     this.bookId,
+    this.dismissedPositive,
+    this.usedHorizontalSwipe,
   });
 
   final int wordId;
   final StudyState previousState;
   final StudyState decision;
   final String? bookId;
+  final bool? dismissedPositive;
+  final bool? usedHorizontalSwipe;
 
   Map<String, dynamic> toJson() => {
         'wordId': wordId,
         'previousState': previousState.name,
         'decision': decision.name,
         'bookId': bookId,
+        'dismissedPositive': dismissedPositive,
+        'usedHorizontalSwipe': usedHorizontalSwipe,
       };
 
   factory StudyDecision.fromJson(Map<String, dynamic> json) => StudyDecision(
@@ -187,6 +193,8 @@ class StudyDecision {
           orElse: () => StudyState.fresh,
         ),
         bookId: json['bookId'] as String?,
+        dismissedPositive: json['dismissedPositive'] as bool?,
+        usedHorizontalSwipe: json['usedHorizontalSwipe'] as bool?,
       );
 }
 
@@ -348,6 +356,10 @@ class VocaStore {
   static const _openDictionaryInAppKey = 'openDictionaryInApp';
   static const _openDictionaryInAppUpdatedAtKey =
       'openDictionaryInAppUpdatedAt';
+  static const _settingsVersionsKey = 'settings.v2.versions';
+  static const _settingsBootstrapPrefix = 'settings.v3.bootstrap.';
+  static const _chatGptWordPromptTemplateKey = 'chatGptWordPromptTemplate';
+  static const _chatGptKanjiPromptTemplateKey = 'chatGptKanjiPromptTemplate';
   static const _readingMeaningMigrationKey = 'readingMeaningMigrationV1';
   static const _placeholderReadingMeaningMigrationKey =
       'readingMeaningMigrationV2';
@@ -357,6 +369,34 @@ class VocaStore {
   static const _rangeCourseMigrationKey = 'rangeCourseMigrationV4';
   static const studyEventLogMaxItems = 3000;
   static const studyEventLogMaxAge = Duration(days: 90);
+
+  /// Preferences are deliberately separate from learning-state sync. Each key
+  /// has its own version so two phones can merge unrelated changes safely.
+  static const settingsPreferenceKeys = <String>[
+    _quickBookKey,
+    _sessionSizeKey,
+    _targetNameKey,
+    _targetDateKey,
+    _horizontalSwipeKey,
+    _reverseSwipeKey,
+    _readingAboveTermKey,
+    _showExamplesKey,
+    _flipCardKey,
+    _autoPlayPronunciationKey,
+    _undoHapticsKey,
+    _japaneseFontKey,
+    _termFontSizeKey,
+    _readingFontSizeKey,
+    _meaningFontSizeKey,
+    _exampleFontSizeKey,
+    _exampleMeaningFontSizeKey,
+    _meaningFontWeightKey,
+    _meaningOpacityKey,
+    _chatGptConversationUrlKey,
+    _chatGptWordPromptTemplateKey,
+    _chatGptKanjiPromptTemplateKey,
+    _openDictionaryInAppKey,
+  ];
 
   final SharedPreferences _prefs;
   String? _activeAccountId;
@@ -389,16 +429,6 @@ class VocaStore {
     store.cloudChanges = await CloudChangeTracker.load();
     if (store._activeAccountId != null) {
       await store.cloudChanges.activateAccount(store._activeAccountId!);
-    }
-    if (store._prefs.getString('chatGptPromptsUpdatedAt') == null &&
-        (store.chatGptWordPromptTemplate.isNotEmpty ||
-            store.chatGptKanjiPromptTemplate.isNotEmpty)) {
-      await store.setChatGptPromptTemplates(
-          store.chatGptWordPromptTemplate, store.chatGptKanjiPromptTemplate);
-    }
-    if (store._prefs.getString(_chatGptConversationUrlUpdatedAtKey) == null &&
-        store.chatGptConversationUrl.isNotEmpty) {
-      await store.setChatGptConversationUrl(store.chatGptConversationUrl);
     }
     await store._migrateOpenDictionaryInAppSetting();
     await store._migrateMainTab();
@@ -472,22 +502,23 @@ class VocaStore {
   String get chatGptConversationUrl =>
       _prefs.getString(_chatGptConversationUrlKey) ?? '';
   String get chatGptWordPromptTemplate =>
-      _prefs.getString('chatGptWordPromptTemplate') ?? '';
+      _prefs.getString(_chatGptWordPromptTemplateKey) ?? '';
   String get chatGptKanjiPromptTemplate =>
-      _prefs.getString('chatGptKanjiPromptTemplate') ?? '';
+      _prefs.getString(_chatGptKanjiPromptTemplateKey) ?? '';
 
   Future<void> setChatGptPromptTemplates(String word, String kanji) async {
-    await _prefs.setString('chatGptWordPromptTemplate', word.trim());
-    await _prefs.setString('chatGptKanjiPromptTemplate', kanji.trim());
-    final previous =
-        DateTime.tryParse(_prefs.getString('chatGptPromptsUpdatedAt') ?? '');
-    final now = DateTime.now().toUtc();
-    final updated = previous != null && !now.isAfter(previous)
-        ? previous.add(const Duration(microseconds: 1))
-        : now;
-    await _prefs.setString(
-        'chatGptPromptsUpdatedAt', updated.toIso8601String());
-    await cloudChanges.markLearningState();
+    final changed = <String>[];
+    final normalizedWord = word.trim();
+    final normalizedKanji = kanji.trim();
+    if (chatGptWordPromptTemplate != normalizedWord) {
+      await _prefs.setString(_chatGptWordPromptTemplateKey, normalizedWord);
+      changed.add(_chatGptWordPromptTemplateKey);
+    }
+    if (chatGptKanjiPromptTemplate != normalizedKanji) {
+      await _prefs.setString(_chatGptKanjiPromptTemplateKey, normalizedKanji);
+      changed.add(_chatGptKanjiPromptTemplateKey);
+    }
+    await _markSettingsChanged(changed);
   }
 
   bool get openDictionaryInApp =>
@@ -1266,9 +1297,127 @@ class VocaStore {
     return List.of(sessions[nextSessionIndex(book)].words);
   }
 
+  Map<String, Map<String, dynamic>> _settingsVersions() {
+    final raw = _prefs.getString(_settingsVersionsKey);
+    if (raw == null) return {};
+    try {
+      final decoded = Map<String, dynamic>.from(jsonDecode(raw) as Map);
+      return {
+        for (final entry in decoded.entries)
+          if (entry.value is Map)
+            entry.key: Map<String, dynamic>.from(entry.value as Map),
+      };
+    } catch (_) {
+      return {};
+    }
+  }
+
+  int _compareSettingsVersion(Map<String, dynamic> a, Map<String, dynamic> b) {
+    final clock = ((a['updatedAtMicros'] as num?)?.toInt() ?? 0)
+        .compareTo((b['updatedAtMicros'] as num?)?.toInt() ?? 0);
+    return clock != 0
+        ? clock
+        : '${a['deviceId'] ?? ''}'.compareTo('${b['deviceId'] ?? ''}');
+  }
+
+  Future<void> _markSettingsChanged(Iterable<String> keys) async {
+    final changed = keys.toSet().where(settingsPreferenceKeys.contains).toSet();
+    if (changed.isEmpty) return;
+    final versions = _settingsVersions();
+    final deviceId = await cloudChanges.deviceId();
+    var clock = DateTime.now().toUtc().microsecondsSinceEpoch;
+    for (final key in changed) {
+      final previous =
+          (versions[key]?['updatedAtMicros'] as num?)?.toInt() ?? 0;
+      clock = clock > previous ? clock : previous + 1;
+      versions[key] = {'updatedAtMicros': clock, 'deviceId': deviceId};
+    }
+    await _prefs.setString(_settingsVersionsKey, jsonEncode(versions));
+    await cloudChanges.markSettings(changed);
+  }
+
+  Map<String, Map<String, dynamic>> settingsEntries(Iterable<String> keys) {
+    final versions = _settingsVersions();
+    return {
+      for (final key in keys)
+        if (settingsPreferenceKeys.contains(key) && versions[key] != null)
+          key: {
+            'value': _prefs.get(key),
+            ...versions[key]!,
+          },
+    };
+  }
+
+  /// Returns only fields that have not been edited since [entries] was
+  /// captured for an in-flight upload.
+  Set<String> unchangedSettingsKeys(
+    Map<String, Map<String, dynamic>> entries,
+  ) {
+    final versions = _settingsVersions();
+    return {
+      for (final entry in entries.entries)
+        if (versions[entry.key] != null &&
+            _compareSettingsVersion(versions[entry.key]!, entry.value) == 0)
+          entry.key,
+    };
+  }
+
+  /// Gives a pre-1.0.37 installation's explicitly stored local preferences a
+  /// version once, so an old profile cannot replace the user's current phone
+  /// settings during the first dedicated-settings sync.
+  Future<void> _bootstrapLegacySettingsForAccount(String uid) async {
+    final marker = '$_settingsBootstrapPrefix$uid';
+    if (_prefs.getBool(marker) ?? false) return;
+    final versions = _settingsVersions();
+    final legacyLocalKeys = settingsPreferenceKeys.where(
+      (key) => _prefs.containsKey(key) && !versions.containsKey(key),
+    );
+    await _markSettingsChanged(legacyLocalKeys);
+    await _prefs.setBool(marker, true);
+  }
+
+  /// Applies only cloud entries newer than this phone's per-setting version.
+  /// This never queues another upload, preventing a download loop.
+  Future<void> applySettingsEntries(
+    Map<String, dynamic> entries, {
+    Map<String, Map<String, dynamic>>? expectedVersions,
+  }) async {
+    final versions = _settingsVersions();
+    var changedVersions = false;
+    for (final entry in entries.entries) {
+      if (!settingsPreferenceKeys.contains(entry.key) || entry.value is! Map) {
+        continue;
+      }
+      final remote = Map<String, dynamic>.from(entry.value as Map);
+      final remoteVersion = {
+        'updatedAtMicros': (remote['updatedAtMicros'] as num?)?.toInt() ?? 0,
+        'deviceId': remote['deviceId']?.toString() ?? '',
+      };
+      final localVersion = versions[entry.key];
+      final expectedVersion = expectedVersions?[entry.key];
+      // The user changed this exact field while a cloud request was active.
+      // Leave the newer local edit untouched; it remains in the upload queue.
+      if (expectedVersion != null &&
+          (localVersion == null ||
+              _compareSettingsVersion(localVersion, expectedVersion) != 0)) {
+        continue;
+      }
+      if (localVersion != null &&
+          _compareSettingsVersion(remoteVersion, localVersion) <= 0) {
+        continue;
+      }
+      await _setSharedPreference(entry.key, remote['value']);
+      versions[entry.key] = remoteVersion;
+      changedVersions = true;
+    }
+    if (changedVersions) {
+      await _prefs.setString(_settingsVersionsKey, jsonEncode(versions));
+    }
+  }
+
   Future<void> selectQuickBook(String id) async {
     await _prefs.setString(_quickBookKey, id);
-    await cloudChanges.markProfile();
+    await _markSettingsChanged([_quickBookKey]);
   }
 
   Future<void> setSessionSize(int value) async {
@@ -1276,49 +1425,49 @@ class VocaStore {
     await _prefs.setInt(_sessionSizeKey, value.clamp(5, 100).toInt());
     await _projectCompletedMembership();
     await clearAllActiveStudies(markCloudChange: false);
-    await cloudChanges.markProfile();
+    await _markSettingsChanged([_sessionSizeKey]);
   }
 
   Future<void> setHorizontalSwipe(bool value) async {
     await _prefs.setBool(_horizontalSwipeKey, value);
-    await cloudChanges.markProfile();
+    await _markSettingsChanged([_horizontalSwipeKey]);
   }
 
   Future<void> setReverseSwipe(bool value) async {
     await _prefs.setBool(_reverseSwipeKey, value);
-    await cloudChanges.markProfile();
+    await _markSettingsChanged([_reverseSwipeKey]);
   }
 
   Future<void> setReadingAboveTerm(bool value) async {
     await _prefs.setBool(_readingAboveTermKey, value);
-    await cloudChanges.markProfile();
+    await _markSettingsChanged([_readingAboveTermKey]);
   }
 
   Future<void> setShowExamples(bool value) async {
     await _prefs.setBool(_showExamplesKey, value);
-    await cloudChanges.markProfile();
+    await _markSettingsChanged([_showExamplesKey]);
   }
 
   Future<void> setFlipCard(bool value) async {
     await _prefs.setBool(_flipCardKey, value);
-    await cloudChanges.markProfile();
+    await _markSettingsChanged([_flipCardKey]);
   }
 
   Future<void> setAutoPlayPronunciation(bool value) async {
     await _prefs.setBool(_autoPlayPronunciationKey, value);
-    await cloudChanges.markProfile();
+    await _markSettingsChanged([_autoPlayPronunciationKey]);
   }
 
   Future<void> setUndoHaptics(bool value) async {
     await _prefs.setBool(_undoHapticsKey, value);
-    await cloudChanges.markProfile();
+    await _markSettingsChanged([_undoHapticsKey]);
   }
 
   Future<void> setJapaneseFont(String value) async {
     const allowed = {'system', 'notoSerifJP', 'sourceHanSerifJP'};
     await _prefs.setString(
         _japaneseFontKey, allowed.contains(value) ? value : 'system');
-    await cloudChanges.markProfile();
+    await _markSettingsChanged([_japaneseFontKey]);
   }
 
   Future<void> setCardFontSizes({
@@ -1328,15 +1477,19 @@ class VocaStore {
     required double example,
     required double exampleMeaning,
   }) async {
-    await Future.wait([
-      _prefs.setDouble(_termFontSizeKey, term.clamp(20, 52).toDouble()),
-      _prefs.setDouble(_readingFontSizeKey, reading.clamp(10, 28).toDouble()),
-      _prefs.setDouble(_meaningFontSizeKey, meaning.clamp(14, 38).toDouble()),
-      _prefs.setDouble(_exampleFontSizeKey, example.clamp(11, 28).toDouble()),
-      _prefs.setDouble(
-          _exampleMeaningFontSizeKey, exampleMeaning.clamp(10, 26).toDouble()),
-    ]);
-    await cloudChanges.markProfile();
+    final next = <String, double>{
+      _termFontSizeKey: term.clamp(20, 52).toDouble(),
+      _readingFontSizeKey: reading.clamp(10, 28).toDouble(),
+      _meaningFontSizeKey: meaning.clamp(14, 38).toDouble(),
+      _exampleFontSizeKey: example.clamp(11, 28).toDouble(),
+      _exampleMeaningFontSizeKey: exampleMeaning.clamp(10, 26).toDouble(),
+    };
+    final changed = next.entries
+        .where((entry) => _prefs.getDouble(entry.key) != entry.value)
+        .toList();
+    await Future.wait(
+        changed.map((entry) => _prefs.setDouble(entry.key, entry.value)));
+    await _markSettingsChanged(changed.map((entry) => entry.key));
   }
 
   Future<void> setMeaningStyle({
@@ -1346,11 +1499,17 @@ class VocaStore {
     final normalizedWeight =
         (((fontWeight.clamp(400, 700) / 100).round() * 100).clamp(400, 700))
             .toInt();
-    await Future.wait([
-      _prefs.setInt(_meaningFontWeightKey, normalizedWeight),
-      _prefs.setDouble(_meaningOpacityKey, opacity.clamp(.45, 1).toDouble()),
-    ]);
-    await cloudChanges.markProfile();
+    final normalizedOpacity = opacity.clamp(.45, 1).toDouble();
+    final changed = <String>[];
+    if (meaningFontWeight != normalizedWeight) {
+      await _prefs.setInt(_meaningFontWeightKey, normalizedWeight);
+      changed.add(_meaningFontWeightKey);
+    }
+    if (meaningOpacity != normalizedOpacity) {
+      await _prefs.setDouble(_meaningOpacityKey, normalizedOpacity);
+      changed.add(_meaningOpacityKey);
+    }
+    await _markSettingsChanged(changed);
   }
 
   Future<bool> setChatGptConversationUrl(String value) async {
@@ -1368,8 +1527,7 @@ class VocaStore {
       _prefs.setString(
           _chatGptConversationUrlUpdatedAtKey, updated.toIso8601String()),
     ]);
-    await cloudChanges.markLearningState();
-    await cloudChanges.markProfile();
+    await _markSettingsChanged([_chatGptConversationUrlKey]);
     return true;
   }
 
@@ -1382,7 +1540,7 @@ class VocaStore {
         updatedAt.toIso8601String(),
       ),
     ]);
-    await cloudChanges.markDictionaryOpenSetting();
+    await _markSettingsChanged([_openDictionaryInAppKey]);
   }
 
   Future<void> applyOpenDictionaryInAppSettingFromCloud(
@@ -1412,7 +1570,6 @@ class VocaStore {
       _openDictionaryInAppUpdatedAtKey,
       DateTime.now().toUtc().toIso8601String(),
     );
-    await cloudChanges.markDictionaryOpenSetting();
   }
 
   Future<void> setTarget(String name, DateTime? date) async {
@@ -1422,7 +1579,7 @@ class VocaStore {
     } else {
       await _prefs.setString(_targetDateKey, date.toIso8601String());
     }
-    await cloudChanges.markProfile();
+    await _markSettingsChanged([_targetNameKey, _targetDateKey]);
   }
 
   Future<WordBook> addBook(String name, List<Word> words) async {
@@ -1476,6 +1633,7 @@ class VocaStore {
     _activeAccountId = uid;
     await _prefs.setString(_lastActiveAccountKey, uid);
     await cloudChanges.activateAccount(uid);
+    await _bootstrapLegacySettingsForAccount(uid);
     await _restoreSyncCheckpoint(uid);
     await _loadSyncReplica();
     await wordRelations.reload();
@@ -1501,7 +1659,8 @@ class VocaStore {
     _syncDailyBaseKey,
     _syncEventsKey,
     _syncCompletedKey,
-    ..._sharedPreferenceKeys,
+    ...settingsPreferenceKeys,
+    _settingsVersionsKey,
     'wordRelations.v1',
     'pronunciationSelections.v1',
   ];
@@ -2113,15 +2272,6 @@ class VocaStore {
           'ids': books.map((book) => book.id).toList(),
           'updatedAt': _prefs.getString(_bookOrderUpdatedAtKey),
         },
-        'chatGptConnection': {
-          'url': chatGptConversationUrl,
-          'updatedAt': _prefs.getString(_chatGptConversationUrlUpdatedAtKey),
-        },
-        'chatGptPrompts': {
-          'word': chatGptWordPromptTemplate,
-          'kanji': chatGptKanjiPromptTemplate,
-          'updatedAt': _prefs.getString('chatGptPromptsUpdatedAt'),
-        },
         'schema': 1,
         'wordStates': {
           for (final book in books)
@@ -2200,43 +2350,6 @@ class VocaStore {
       }
       await _prefs.setString(
           _bookOrderUpdatedAtKey, bookOrderDate!.toUtc().toIso8601String());
-    }
-    var connectionDate = DateTime.tryParse(
-        _prefs.getString(_chatGptConversationUrlUpdatedAtKey) ?? '');
-    for (final snapshot in snapshots) {
-      final connection = snapshot['chatGptConnection'];
-      if (connection is! Map || connection['url'] is! String) continue;
-      final date = DateTime.tryParse(connection['updatedAt']?.toString() ?? '');
-      if (date == null ||
-          (connectionDate != null && !date.isAfter(connectionDate))) {
-        continue;
-      }
-      final url = connection['url'] as String;
-      if (url.isNotEmpty && normalizeChatGptConversationUrl(url) == null) {
-        continue;
-      }
-      await _prefs.setString(_chatGptConversationUrlKey, url);
-      await _prefs.setString(
-          _chatGptConversationUrlUpdatedAtKey, date.toUtc().toIso8601String());
-      connectionDate = date;
-    }
-    var promptDate =
-        DateTime.tryParse(_prefs.getString('chatGptPromptsUpdatedAt') ?? '');
-    for (final snapshot in snapshots) {
-      final prompts = snapshot['chatGptPrompts'];
-      if (prompts is! Map ||
-          prompts['word'] is! String ||
-          prompts['kanji'] is! String) continue;
-      final date = DateTime.tryParse(prompts['updatedAt']?.toString() ?? '');
-      if (date == null || (promptDate != null && !date.isAfter(promptDate)))
-        continue;
-      await _prefs.setString(
-          'chatGptWordPromptTemplate', prompts['word'] as String);
-      await _prefs.setString(
-          'chatGptKanjiPromptTemplate', prompts['kanji'] as String);
-      await _prefs.setString(
-          'chatGptPromptsUpdatedAt', date.toUtc().toIso8601String());
-      promptDate = date;
     }
     final reset = <String, DateTime>{};
     final tombstones = <String, DateTime>{};

@@ -128,16 +128,12 @@ Future<bool> openExternalUrl(Uri uri) async {
 Future<bool> openChatGptWithPrompt({
   required Uri uri,
   required String prompt,
-  Duration warmupDelay = const Duration(milliseconds: 900),
   Future<bool> Function(Uri uri)? openUrl,
 }) async {
   if (uri.scheme != 'https' || prompt.trim().isEmpty) return false;
   final launcher = openUrl ?? openExternalUrl;
-  final openedConversation = await launcher(uri);
-  if (!openedConversation) return false;
-  if (!warmupDelay.isNegative && warmupDelay > Duration.zero) {
-    await Future<void>.delayed(warmupDelay);
-  }
+  // Opening the base conversation and then the prompt URL created two browser
+  // history entries. A single complete URL keeps the new draft on top.
   return launcher(chatGptPromptUri(uri: uri, prompt: prompt));
 }
 
@@ -226,9 +222,20 @@ String buildChatGptWordPrompt({
 발음: $reading
 뜻: $meaning
 
-이 단어를 한자 조합 단위로 쪼개서 각 한자의 역할, 단어 전체 의미가 만들어지는 방식, 비슷한 단어와 헷갈리기 쉬운 점, 기억하기 쉬운 암기법을 알려 줘.
+이 단어의 핵심 뉘앙스, 자연스러운 사용 상황, 비슷한 표현과의 차이, 기억하기 쉬운 암기법을 알려 줘.
 
 또한 이 단어를 자연스럽게 사용한 일본어 예문 1개와 한국어 뜻을 함께 보여 줘. 예문 안에서 학습 단어는 반드시 **$term**처럼 앞뒤에 별표 두 개씩을 붙여 강조해 줘.''';
+
+String buildChatGptMeaningOriginPrompt({
+  required String term,
+  required String reading,
+  required String meaning,
+}) =>
+    '''일본어 단어 "$term"(발음: $reading, 뜻: $meaning)이 왜 이런 뜻이 되었는지 한국어로 설명해 줘.
+
+한자어라면 각 한자의 뜻과 조합이 전체 의미로 이어지는 과정을 설명해 줘. 고유어·의태어·숙어라면 말의 구성, 어원 또는 관용적 배경을 설명해 줘. 억지 한자 풀이를 만들지는 말고, 확실하지 않은 어원은 불확실하다고 밝혀 줘.
+
+비슷하지만 뜻이 달라 헷갈리기 쉬운 표현이 있다면 함께 비교하고, 마지막에는 기억하기 쉬운 한 줄 암기법을 알려 줘.''';
 
 String buildChatGptExamplePrompt({
   required String term,

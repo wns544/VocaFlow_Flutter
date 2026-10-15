@@ -6,7 +6,8 @@ import 'package:vocaflow/sync_replica.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
-  test('independent fields merge, deletions persist, clock observes remote', () {
+  test('independent fields merge, deletions persist, clock observes remote',
+      () {
     final a = SyncReplica('a')..seed({'font': 20, 'url': 'old'});
     final b = SyncReplica('b')..seed({'font': 20, 'url': 'old'});
     a.capture({'font': 30, 'url': 'old'}, nowMicros: 100);
@@ -21,10 +22,28 @@ void main() {
   });
 
   test('conflicting queues converge and preserve losing branch', () {
-    final a = SyncReplica('a')..seed({'session/s': {'queue': [1, 2]}});
-    final b = SyncReplica('b')..seed({'session/s': {'queue': [1, 2]}});
-    a.capture({'session/s': {'queue': [2]}}, nowMicros: 100);
-    b.capture({'session/s': {'queue': [1]}}, nowMicros: 200);
+    final a = SyncReplica('a')
+      ..seed({
+        'session/s': {
+          'queue': [1, 2]
+        }
+      });
+    final b = SyncReplica('b')
+      ..seed({
+        'session/s': {
+          'queue': [1, 2]
+        }
+      });
+    a.capture({
+      'session/s': {
+        'queue': [2]
+      }
+    }, nowMicros: 100);
+    b.capture({
+      'session/s': {
+        'queue': [1]
+      }
+    }, nowMicros: 200);
     a.merge(b.toJson());
     b.merge(a.toJson());
     expect(a.values, b.values);
@@ -42,7 +61,8 @@ void main() {
     await store.applySyncV2([old]);
     expect(store.books.first.words.first.state, StudyState.fresh);
     expect(store.isSessionCompleted('default', 0), isFalse);
-    expect(store.dailyStudyStats.values.every((s) => s.studiedCards == 0), isTrue);
+    expect(
+        store.dailyStudyStats.values.every((s) => s.studiedCards == 0), isTrue);
   });
 
   test('undo reverses stats and survives stale cloud merge', () async {
@@ -54,14 +74,19 @@ void main() {
     await store.undoWordDecision(word, StudyState.fresh, bookId: 'default');
     await store.applySyncV2([old]);
     expect(store.books.first.words.first.state, StudyState.fresh);
-    expect(store.dailyStudyStats.values.fold<int>(0, (n, s) => n + s.studiedCards), 0);
+    expect(
+        store.dailyStudyStats.values.fold<int>(0, (n, s) => n + s.studiedCards),
+        0);
   });
 
-  test('completed membership survives resize without moving completion', () async {
+  test('completed membership survives resize without moving completion',
+      () async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();
-    final book = await store.addBook('test', List.generate(30, (i) =>
-      Word(id: i, term: '$i', reading: '$i', meaning: '$i')));
+    final book = await store.addBook(
+        'test',
+        List.generate(
+            30, (i) => Word(id: i, term: '$i', reading: '$i', meaning: '$i')));
     await store.completeSessions(book.id, [0]);
     await store.setSessionSize(20);
     expect(store.isSessionCompleted(book.id, 0), isFalse);
@@ -69,7 +94,8 @@ void main() {
     expect(store.isSessionCompleted(book.id, 0), isTrue);
   });
 
-  test('latest account checkpoint survives restart with progress and settings', () async {
+  test('latest account checkpoint survives restart without replacing settings',
+      () async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();
     await store.activateAccount('a');
@@ -81,7 +107,7 @@ void main() {
     expect(next.undoHaptics, isTrue);
   });
 
-  test('every shared preference and a favorite are represented separately',
+  test('learning snapshots exclude settings but retain word favorites',
       () async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();
@@ -92,8 +118,30 @@ void main() {
     await store.setWordFavorite(word, true, bookId: 'default');
     final snapshot = await store.syncV2Snapshot();
     final records = snapshot['records'] as Map;
-    expect(records['setting/termFontSize']['value'], 41.0);
-    expect(records['setting/autoPlayPronunciation']['value'], isFalse);
+    expect(records.keys.where((key) => key.startsWith('setting/')), isEmpty);
     expect(records['favorite/default/${word.id}']['value'], isTrue);
+  });
+
+  test('legacy setting records cannot overwrite current card settings',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    await store.setHorizontalSwipe(true);
+    final stale = {
+      'schema': 2,
+      'deviceId': 'old-phone',
+      'clock': 999999,
+      'records': {
+        'setting/horizontalSwipe': {
+          'clock': 999999,
+          'device': 'old-phone',
+          'value': false,
+        },
+      },
+      'recovery': <String, dynamic>{},
+    };
+
+    await store.applySyncV2([stale]);
+    expect(store.horizontalSwipe, isTrue);
   });
 }

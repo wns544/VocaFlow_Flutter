@@ -13,6 +13,7 @@ class CloudChangeSnapshot {
     required this.generation,
     required this.profileDirty,
     required this.dictionaryOpenSettingDirty,
+    required this.settingsKeys,
     required this.bookIds,
     required this.wordIdsByBook,
     required this.deletedWordIdsByBook,
@@ -26,6 +27,7 @@ class CloudChangeSnapshot {
   final int generation;
   final bool profileDirty;
   final bool dictionaryOpenSettingDirty;
+  final Set<String> settingsKeys;
   final Set<String> bookIds;
   final Map<String, Set<int>> wordIdsByBook;
   final Map<String, Set<int>> deletedWordIdsByBook;
@@ -42,6 +44,7 @@ class CloudChangeSnapshot {
   int get pendingCount =>
       (profileDirty ? 1 : 0) +
       (dictionaryOpenSettingDirty ? 1 : 0) +
+      settingsKeys.length +
       bookIds.length +
       wordIdsByBook.values.fold<int>(0, (sum, ids) => sum + ids.length) +
       deletedWordIdsByBook.values.fold<int>(0, (sum, ids) => sum + ids.length) +
@@ -78,6 +81,8 @@ class CloudChangeTracker {
   String? _activeAccountId;
   bool _profileDirty = false;
   bool _dictionaryOpenSettingDirty = false;
+  final Set<String> _settingsKeys = {};
+  String? _settingsLastError;
   final Set<String> _bookIds = {};
   final Map<String, Set<int>> _wordIdsByBook = {};
   final Map<String, Set<int>> _deletedWordIdsByBook = {};
@@ -95,6 +100,7 @@ class CloudChangeTracker {
         generation: _generation,
         profileDirty: _profileDirty,
         dictionaryOpenSettingDirty: _dictionaryOpenSettingDirty,
+        settingsKeys: Set.of(_settingsKeys),
         bookIds: Set.of(_bookIds),
         wordIdsByBook: _copyMap(_wordIdsByBook),
         deletedWordIdsByBook: _copyMap(_deletedWordIdsByBook),
@@ -104,6 +110,11 @@ class CloudChangeTracker {
         bookBaseRevisions: Map.of(_bookBaseRevisions),
         archiveIds: Set.of(_archiveIds),
       );
+
+  bool get profileDirty => _profileDirty;
+  bool get dictionaryOpenSettingDirty => _dictionaryOpenSettingDirty;
+  bool get settingsDirty => _settingsKeys.isNotEmpty;
+  String? get settingsLastError => _settingsLastError;
 
   /// Switches the durable upload queue to the signed-in account. Old builds
   /// had one unscoped queue; its pending work is adopted once by the first
@@ -134,6 +145,29 @@ class CloudChangeTracker {
       _deletedWordIdsByBook.isNotEmpty ||
       _deletedBookIds.isNotEmpty;
   bool get archiveContentDirty => _archiveIds.isNotEmpty;
+
+  Future<void> markSettings(Iterable<String> keys) => _mutate(() {
+        final before = _settingsKeys.length;
+        _settingsKeys.addAll(keys);
+        if (_settingsKeys.length != before) _settingsLastError = null;
+        return before != _settingsKeys.length;
+      });
+
+  Future<void> acknowledgeSettings(Iterable<String> keys) => _mutate(() {
+        var changed = false;
+        for (final key in keys) {
+          changed = _settingsKeys.remove(key) || changed;
+        }
+        if (_settingsKeys.isEmpty) _settingsLastError = null;
+        return changed;
+      });
+
+  Future<void> recordSettingsFailure(Object error) => _mutate(() {
+        final next = error.toString();
+        if (_settingsLastError == next) return false;
+        _settingsLastError = next;
+        return true;
+      });
 
   /// Clears only book content after it reaches the dedicated managedBooks
   /// collection. Profile and learning-state work remain queued separately.
@@ -219,6 +253,18 @@ class CloudChangeTracker {
     _generation++;
     await _persist();
     onChanged?.call();
+  }
+
+  /// Clears profile-only work after it has reached the cloud without touching
+  /// pending card edits or learning progress.
+  Future<void> acknowledgeProfileMetadata(CloudChangeSnapshot uploaded) async {
+    if (_generation != uploaded.generation) return;
+    await _mutate(() {
+      final changed = _profileDirty || _dictionaryOpenSettingDirty;
+      _profileDirty = false;
+      _dictionaryOpenSettingDirty = false;
+      return changed;
+    });
   }
 
   Future<void> markProfile() async {
@@ -314,6 +360,8 @@ class CloudChangeTracker {
     _generation++;
     _profileDirty = false;
     _dictionaryOpenSettingDirty = false;
+    _settingsKeys.clear();
+    _settingsLastError = null;
     _bookIds.clear();
     _wordIdsByBook.clear();
     _deletedWordIdsByBook.clear();
@@ -410,6 +458,9 @@ class CloudChangeTracker {
       _profileDirty = json['profileDirty'] as bool? ?? false;
       _dictionaryOpenSettingDirty =
           json['dictionaryOpenSettingDirty'] as bool? ?? false;
+      _settingsKeys.addAll(
+          (json['settingsKeys'] as List<dynamic>? ?? []).cast<String>());
+      _settingsLastError = json['settingsLastError'] as String?;
       _bookIds.addAll((json['bookIds'] as List<dynamic>? ?? []).cast<String>());
       _restoreMap(json['wordIdsByBook'], _wordIdsByBook);
       _restoreMap(json['deletedWordIdsByBook'], _deletedWordIdsByBook);
@@ -444,6 +495,8 @@ class CloudChangeTracker {
         'generation': _generation,
         'profileDirty': _profileDirty,
         'dictionaryOpenSettingDirty': _dictionaryOpenSettingDirty,
+        'settingsKeys': _settingsKeys.toList(),
+        'settingsLastError': _settingsLastError,
         'bookIds': _bookIds.toList(),
         'wordIdsByBook': _encodeMap(_wordIdsByBook),
         'deletedWordIdsByBook': _encodeMap(_deletedWordIdsByBook),
@@ -472,6 +525,8 @@ class CloudChangeTracker {
     _generation = 0;
     _profileDirty = false;
     _dictionaryOpenSettingDirty = false;
+    _settingsKeys.clear();
+    _settingsLastError = null;
     _bookIds.clear();
     _wordIdsByBook.clear();
     _deletedWordIdsByBook.clear();

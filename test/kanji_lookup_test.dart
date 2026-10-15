@@ -26,6 +26,15 @@ void main() {
     expect(
         buildChatGptExamplePrompt(term: '食べる', reading: 'たべる', meaning: '먹다'),
         allOf(contains('예문 10개'), contains('**食べる**'), contains('먹다')));
+    expect(
+        buildChatGptMeaningOriginPrompt(
+            term: '心地よい', reading: 'ここちよい', meaning: '기분 좋다'),
+        allOf(
+          contains('왜 이런 뜻'),
+          contains('고유어·의태어·숙어'),
+          contains('억지 한자 풀이'),
+          contains('불확실'),
+        ));
   });
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -138,13 +147,12 @@ void main() {
     expect(prompt, contains('뜻: 신문'));
   });
 
-  test('ChatGPT prompt opens conversation before prompt URL', () async {
+  test('ChatGPT prompt opens one complete prompt URL', () async {
     final opened = <Uri>[];
 
     final ok = await openChatGptWithPrompt(
       uri: Uri.parse('https://chatgpt.com/g/g-p-custom/c/conversation-id'),
       prompt: '질문 테스트',
-      warmupDelay: Duration.zero,
       openUrl: (uri) async {
         opened.add(uri);
         return true;
@@ -152,31 +160,23 @@ void main() {
     );
 
     expect(ok, isTrue);
-    expect(opened, hasLength(2));
-    expect(opened.first.toString(),
-        'https://chatgpt.com/g/g-p-custom/c/conversation-id');
-    expect(opened.last.toString(),
+    expect(opened, hasLength(1));
+    expect(opened.single.toString(),
         'https://chatgpt.com/g/g-p-custom/c/conversation-id?q=%EC%A7%88%EB%AC%B8+%ED%85%8C%EC%8A%A4%ED%8A%B8');
   });
 
-  test('ChatGPT prompt reports failure when either deep link fails', () async {
-    final firstFail = await openChatGptWithPrompt(
-      uri: Uri.parse('https://chatgpt.com/c/conversation-id'),
-      prompt: '질문',
-      warmupDelay: Duration.zero,
-      openUrl: (_) async => false,
-    );
-
+  test('ChatGPT prompt reports failure when the prompt link fails', () async {
     var calls = 0;
-    final secondFail = await openChatGptWithPrompt(
+    final failed = await openChatGptWithPrompt(
       uri: Uri.parse('https://chatgpt.com/c/conversation-id'),
       prompt: '질문',
-      warmupDelay: Duration.zero,
-      openUrl: (_) async => calls++ == 0,
+      openUrl: (_) async {
+        calls++;
+        return false;
+      },
     );
 
-    expect(firstFail, isFalse);
-    expect(secondFail, isFalse);
-    expect(calls, 2);
+    expect(failed, isFalse);
+    expect(calls, 1);
   });
 }

@@ -33,6 +33,19 @@ class CloudSyncTimeoutException implements Exception {
   String toString() => 'CloudSyncTimeoutException';
 }
 
+/// The exact local values captured before a settings upload, plus the merged
+/// document returned by Firestore. Keeping the captured values lets callers
+/// preserve a newer on-device edit made while the request was in flight.
+class SettingsSyncResult {
+  const SettingsSyncResult({
+    required this.fields,
+    required this.submitted,
+  });
+
+  final Map<String, dynamic> fields;
+  final Map<String, Map<String, dynamic>> submitted;
+}
+
 /// The book changed on another device after this phone began its edit. The
 /// caller must keep the local edit intact and show it as a conflict rather
 /// than silently replacing either copy.
@@ -164,6 +177,12 @@ class CloudBackup {
       .collection('users')
       .doc(_user.uid)
       .collection('profile')
+      .doc('main');
+
+  DocumentReference<Map<String, dynamic>> get _settingsRef => firestore
+      .collection('users')
+      .doc(_user.uid)
+      .collection('settings')
       .doc('main');
 
   CollectionReference<Map<String, dynamic>> get _booksRef =>
@@ -396,6 +415,7 @@ class CloudBackup {
     CloudChangeSnapshot changes,
   ) =>
       _runCloudOperation(() async {
+        await _uploadIncremental(store, changes, forceProfile: false);
         final deviceId = await store.cloudChanges.deviceId();
         final payload = await store.syncV2Snapshot();
         final bytes = await compute(_encodeSyncPayload, payload);
@@ -523,6 +543,108 @@ class CloudBackup {
       });
   Future<bool> hasBackup() =>
       _runCloudOperation(() async => (await _profileRef.get()).exists);
+
+  int _compareSettingsVersion(Map<String, dynamic> a, Map<String, dynamic> b) {
+    final clock = ((a['updatedAtMicros'] as num?)?.toInt() ?? 0)
+        .compareTo((b['updatedAtMicros'] as num?)?.toInt() ?? 0);
+    return clock != 0
+        ? clock
+        : '${a['deviceId'] ?? ''}'.compareTo('${b['deviceId'] ?? ''}');
+  }
+
+  Map<String, dynamic> _legacySettingsFields(Map<String, dynamic> profile) {
+    final updatedAt = profile['updatedAt'];
+    final micros =
+        updatedAt is Timestamp ? updatedAt.microsecondsSinceEpoch : 0;
+    Map<String, dynamic> entry(dynamic value) => {
+          'value': value,
+          'updatedAtMicros': micros,
+          'deviceId': 'legacy-profile',
+        };
+    final fields = <String, dynamic>{};
+    void copy(String key, [dynamic value]) {
+      final source = value ?? profile[key];
+      if (source != null) fields[key] = entry(source);
+    }
+
+    for (final key in VocaStore.settingsPreferenceKeys) copy(key);
+    final sizes = profile['cardFontSizes'];
+    if (sizes is Map) {
+      for (final key in const [
+        'termFontSize',
+        'readingFontSize',
+        'meaningFontSize',
+        'exampleFontSize',
+        'exampleMeaningFontSize',
+      ]) {
+        final legacyKey = switch (key) {
+          'termFontSize' => 'term',
+          'readingFontSize' => 'reading',
+          'meaningFontSize' => 'meaning',
+          'exampleFontSize' => 'example',
+          _ => 'exampleMeaning',
+        };
+        if (sizes[legacyKey] != null) copy(key, sizes[legacyKey]);
+      }
+    }
+    final style = profile['cardMeaningStyle'];
+    if (style is Map) {
+      copy('meaningFontWeight', style['fontWeight']);
+      copy('meaningOpacity', style['opacity']);
+    }
+    final dictionary = profile['openDictionaryInAppSetting'];
+    if (dictionary is Map) copy('openDictionaryInApp', dictionary['value']);
+    return fields;
+  }
+
+  Future<Map<String, dynamic>> _loadOrMigrateSettings() async {
+    final existing = await _settingsRef.get();
+    if (existing.exists) return existing.data()!;
+    final legacy = await _profileRef.get();
+    final seed = legacy.exists ? _legacySettingsFields(legacy.data()!) : {};
+    await firestore.runTransaction((transaction) async {
+      final current = await transaction.get(_settingsRef);
+      if (current.exists) return;
+      transaction.set(_settingsRef, {
+        'schema': 1,
+        'fields': seed,
+        'migratedFromProfile': legacy.exists,
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+    });
+    return (await _settingsRef.get()).data() ?? {'schema': 1, 'fields': seed};
+  }
+
+  /// Merges only changed preference fields. It never reads or writes card,
+  /// vocabulary, session, or learning-state documents.
+  Future<SettingsSyncResult> syncSettings(
+    Map<String, Map<String, dynamic>> local,
+  ) =>
+      _runCloudOperation(() async {
+        final document = await _loadOrMigrateSettings();
+        final remote =
+            Map<String, dynamic>.from(document['fields'] as Map? ?? {});
+        final outgoing = <String, dynamic>{};
+        final resolved = <String, dynamic>{...remote};
+        for (final entry in local.entries) {
+          final remoteEntry = remote[entry.key];
+          if (remoteEntry is! Map ||
+              _compareSettingsVersion(
+                      entry.value, Map<String, dynamic>.from(remoteEntry)) >=
+                  0) {
+            outgoing[entry.key] = entry.value;
+            resolved[entry.key] = entry.value;
+          }
+        }
+        if (outgoing.isNotEmpty) {
+          await _settingsRef.set({
+            'schema': 1,
+            'fields': outgoing,
+            'updatedAt': FieldValue.serverTimestamp(),
+          }, SetOptions(merge: true));
+        }
+        return SettingsSyncResult(fields: resolved, submitted: local);
+      });
 
   Future<void> uploadIncremental(
     VocaStore store,
@@ -939,16 +1061,6 @@ class CloudBackup {
         'studyEventLog': backup['studyEventLog'],
         'targetName': backup['targetName'],
         'targetDate': backup['targetDate'],
-        'horizontalSwipe': backup['horizontalSwipe'],
-        'reverseSwipe': backup['reverseSwipe'],
-        'readingAboveTerm': backup['readingAboveTerm'],
-        'showExamples': backup['showExamples'],
-        'flipCard': backup['flipCard'],
-        'autoPlayPronunciation': backup['autoPlayPronunciation'],
-        'japaneseFont': backup['japaneseFont'],
-        'cardFontSizes': backup['cardFontSizes'],
-        'cardMeaningStyle': backup['cardMeaningStyle'],
-        'chatGptConversationUrl': backup['chatGptConversationUrl'],
         'activeStudy': backup['activeStudy'],
         'activeStudies': backup['activeStudies'],
         'activeStudyTombstones': backup['activeStudyTombstones'],

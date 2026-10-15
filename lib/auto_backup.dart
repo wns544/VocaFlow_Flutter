@@ -77,6 +77,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       user != null && store.cloudChanges.isInitialized(user!.uid);
   int get pendingCount =>
       (store.cloudChanges.learningStateDirty ? 1 : 0) +
+      store.cloudChanges.snapshot.settingsKeys.length +
       (store.cloudChanges.managedBookContentDirty ? 1 : 0) +
       (store.cloudChanges.archiveContentDirty ? 1 : 0);
   DateTime? get lastSuccess =>
@@ -95,6 +96,18 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     if (lastError != null) return '재시도 필요';
     if (pendingCount > 0) return '전송 대기';
     return learningStateVerified ? '최신 상태' : '클라우드 확인 대기';
+  }
+
+  /// Settings have their own queue, so their status stays useful even when a
+  /// study-progress upload is also waiting.
+  String get settingsSyncStatus {
+    if (user == null) return '로그인 필요';
+    if (store.cloudChanges.settingsDirty) {
+      if (isUploading) return '설정 저장 중';
+      if (store.cloudChanges.settingsLastError != null) return '설정 전송 실패';
+      return '설정 전송 대기';
+    }
+    return '설정 저장됨';
   }
 
   Future<void> _prepareAccount() {
@@ -151,6 +164,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       if (current != null) {
         unawaited(() async {
           await _prepareAccount();
+          await _syncSettings(reason: '계정 연결');
           // A web browser has its own local cache. It must select that
           // account's cache before it reads cloud state; otherwise the later
           // account activation can restore stale browser data over the merge.
@@ -421,6 +435,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         _syncing ||
         !accountBookSyncEnabled ||
         (!store.cloudChanges.learningStateDirty &&
+            !store.cloudChanges.settingsDirty &&
             !store.cloudChanges.managedBookContentDirty &&
             !store.cloudChanges.archiveContentDirty)) return;
     _flushingForBackground = true;
@@ -445,10 +460,17 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     onChanged?.call();
     if (accountBookSyncEnabled &&
         ((enabled && store.cloudChanges.learningStateDirty) ||
+            store.cloudChanges.settingsDirty ||
+            store.cloudChanges.profileDirty ||
+            store.cloudChanges.dictionaryOpenSettingDirty ||
             store.cloudChanges.managedBookContentDirty ||
             store.cloudChanges.archiveContentDirty) &&
         !_syncing) {
-      _schedule(idleDelay, reason: '학습 변경 후 대기');
+      _schedule(
+        store.cloudChanges.settingsDirty ? Duration.zero : idleDelay,
+        ignoreMinimumInterval: store.cloudChanges.settingsDirty,
+        reason: store.cloudChanges.settingsDirty ? '설정 저장' : '학습 변경 후 대기',
+      );
     }
   }
 
@@ -461,6 +483,9 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     if ((!isRetry && _syncing) ||
         !accountBookSyncEnabled ||
         ((!enabled || !initialized || !store.cloudChanges.learningStateDirty) &&
+            !store.cloudChanges.settingsDirty &&
+            !store.cloudChanges.profileDirty &&
+            !store.cloudChanges.dictionaryOpenSettingDirty &&
             !store.cloudChanges.managedBookContentDirty &&
             !store.cloudChanges.archiveContentDirty)) return;
     final generation = store.cloudChanges.snapshot.learningStateGeneration;
@@ -519,9 +544,19 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     if (_syncing ||
         !enabled ||
         (!store.cloudChanges.learningStateDirty &&
+            !store.cloudChanges.settingsDirty &&
+            !store.cloudChanges.profileDirty &&
+            !store.cloudChanges.dictionaryOpenSettingDirty &&
             !store.cloudChanges.managedBookContentDirty)) return;
     // This lock is intentionally set before checkConnectivity awaits.
     _syncing = true;
+    final settingsWerePending = store.cloudChanges.settingsDirty;
+    final onlySettingsWerePending = settingsWerePending &&
+        !store.cloudChanges.learningStateDirty &&
+        !store.cloudChanges.profileDirty &&
+        !store.cloudChanges.dictionaryOpenSettingDirty &&
+        !store.cloudChanges.managedBookContentDirty &&
+        !store.cloudChanges.archiveContentDirty;
     final generationAtStart =
         store.cloudChanges.snapshot.learningStateGeneration;
     var failed = false;
@@ -540,6 +575,10 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       if (!networkAllowed) {
         throw StateError('선택한 네트워크에 연결되어 있지 않습니다.');
       }
+      await _syncSettings(reason: reason);
+      // A settings-only edit must stay small and must never wake the learning
+      // merge path. Card state, sessions and books are unrelated documents.
+      if (onlySettingsWerePending) return;
       // Only a pending book edit needs a fresh whole-book read. Study progress
       // is stored separately, so fetching every card before each 15-second
       // learning-state backup causes avoidable card-navigation jank.
@@ -562,6 +601,9 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       _retryBudgetExhausted = false;
     } catch (error, stackTrace) {
       failed = true;
+      if (settingsWerePending && store.cloudChanges.settingsDirty) {
+        await store.cloudChanges.recordSettingsFailure(error);
+      }
       await _recordFailure(error, reason, stackTrace: stackTrace);
     } finally {
       _syncing = false;
@@ -569,6 +611,9 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       if (!failed &&
           enabled &&
           (store.cloudChanges.learningStateDirty ||
+              store.cloudChanges.settingsDirty ||
+              store.cloudChanges.profileDirty ||
+              store.cloudChanges.dictionaryOpenSettingDirty ||
               store.cloudChanges.managedBookContentDirty ||
               store.cloudChanges.archiveContentDirty)) {
         _schedule(idleDelay, reason: '전송 중 새 학습 변경');
@@ -624,6 +669,29 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     } finally {
       _downloading = false;
       if (!ownsGate) _syncing = false;
+    }
+  }
+
+  Future<void> _syncSettings({required String reason}) async {
+    final current = user;
+    if (current == null) return;
+    final snapshot = store.cloudChanges.snapshot;
+    final captured = store.settingsEntries(snapshot.settingsKeys);
+    final result = await cloud.syncSettings(captured);
+    // A tap made during the request keeps its pending marker. A cloud value
+    // may only replace a field that is still exactly the captured local value.
+    final unchanged = store.unchangedSettingsKeys(result.submitted);
+    if (unchanged.isNotEmpty) {
+      await store.cloudChanges.acknowledgeSettings(unchanged);
+    }
+    await store.applySettingsEntries(
+      result.fields,
+      expectedVersions: result.submitted,
+    );
+    if (captured.isNotEmpty) {
+      await store.cloudChanges.recordSuccess(current.uid, _now());
+      _lastSuccessAt = _now();
+      await store.cloudChanges.recordLog('$reason · 설정 저장 완료');
     }
   }
 
@@ -792,6 +860,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       ...metrics,
     });
     await cloud.uploadLearningState(store, snapshot);
+    await store.cloudChanges.acknowledgeProfileMetadata(snapshot);
     await store.cloudChanges.acknowledgeLearningState(snapshot);
     await store.cloudChanges.recordSuccess(current.uid, _now());
     _lastSuccessAt = _now();
