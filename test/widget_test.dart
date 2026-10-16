@@ -584,6 +584,48 @@ void main() {
     expect(decisions, [StudyState.review]);
   });
 
+  testWidgets('next-round dialog does not wait for queued card persistence',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final write = Completer<void>();
+    final words = [
+      Word(id: 9263, term: 'first', reading: '', meaning: 'one'),
+      Word(id: 9264, term: 'second', reading: '', meaning: 'two'),
+    ];
+    await tester.pumpWidget(MaterialApp(
+      home: CardStudyPage(
+        store: store,
+        words: words,
+        decisionWriter: (_, __) => write.future,
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    Future<void> markForReview() async {
+      final card = find.byKey(const ValueKey('study-card'));
+      final gesture = await tester.startGesture(tester.getCenter(card));
+      await gesture.moveBy(const Offset(0, 120));
+      await gesture.moveBy(const Offset(0, 120));
+      await gesture.up();
+      await tester.pumpAndSettle();
+    }
+
+    await markForReview();
+    expect(find.text('second'), findsOneWidget);
+    expect(write.isCompleted, isFalse);
+    await markForReview();
+    await tester.pumpAndSettle();
+
+    expect(find.text('이번 학습을 모두 확인했어요'), findsOneWidget);
+    expect(find.textContaining('보류 2개'), findsOneWidget);
+    expect(find.text('다음 회차를 준비하고 있어요'), findsOneWidget);
+
+    write.complete();
+    await tester.tap(find.text('보류 단어 다시 보기'));
+    await tester.pumpAndSettle();
+  });
+
   testWidgets('a failed final-card write restores the card instead of spinning',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({});

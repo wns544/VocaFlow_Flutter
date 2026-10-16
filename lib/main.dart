@@ -2621,7 +2621,19 @@ class _CardStudyPageState extends State<CardStudyPage>
     showingExplanation = false;
     if (queue.isEmpty && !finishingStudy) {
       finishingStudy = true;
-      roundTransitionPending = roundUnknown.isNotEmpty;
+      final remaining = List<Word>.of(roundUnknown);
+      if (remaining.isNotEmpty) {
+        // Do not make the learner wait for every queued card write before the
+        // next-round dialog appears. Prepare the queue synchronously, keep its
+        // first card covered by the transition screen, and let persistence
+        // drain in the background.
+        roundTransitionPending = true;
+        _prepareNextRound(remaining);
+        finishingStudy = false;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) unawaited(_showNextRoundDialog(remaining.length));
+        });
+      }
       _persistenceChain = _persistenceChain.then((_) async {
         try {
           await (widget.decisionWriter?.call(word, state) ??
@@ -2631,7 +2643,11 @@ class _CardStudyPageState extends State<CardStudyPage>
                 bookId: _bookIdForWord(word),
                 sessionIndexes: _sessionIndexesForWord(word),
               ));
-          await _finishRound();
+          if (remaining.isEmpty) {
+            await _finishRound();
+          } else {
+            await persistStudy();
+          }
         } catch (error, stackTrace) {
           await _recoverFailedRoundTransition(
             error,
@@ -2651,39 +2667,6 @@ class _CardStudyPageState extends State<CardStudyPage>
   }
 
   Future<void> _finishRound() async {
-    if (roundUnknown.isNotEmpty) {
-      final remaining = List<Word>.of(roundUnknown);
-      _prepareNextRound(remaining);
-      final saved = await _persistRoundTransitionWithRetry();
-      finishingStudy = false;
-      if (!mounted) return;
-      if (!saved) {
-        setState(() => roundTransitionPending = false);
-        scheduleResumeSnapshotCapture('study');
-        return;
-      }
-      await showDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => AlertDialog(
-          icon: const Icon(Icons.refresh_rounded, color: sea, size: 32),
-          title: const Text('이번 학습을 모두 확인했어요'),
-          content: Text(
-            '보류 ${remaining.length}개를 순서를 섞어\n다시 확인합니다.',
-          ),
-          actions: [
-            FilledButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('보류 단어 다시 보기'),
-            ),
-          ],
-        ),
-      );
-      if (!mounted) return;
-      setState(() => roundTransitionPending = false);
-      return;
-    }
-
     if (isRangeCourse) {
       await widget.store.completeRangeCourse(
           activeBookId!, activeRangeStart!, activeRangeEnd!);
@@ -2721,43 +2704,26 @@ class _CardStudyPageState extends State<CardStudyPage>
     showingExplanation = false;
   }
 
-  Future<bool> _persistRoundTransitionWithRetry() async {
-    while (mounted) {
-      try {
-        await persistStudy();
-        return true;
-      } catch (error, stackTrace) {
-        unawaited(widget.store.cloudChanges.recordDiagnostic(
-          'round_transition_save_failed',
-          data: {
-            'error': error.toString(),
-            'stackTrace': stackTrace.toString()
-          },
-        ));
-        if (!mounted) return false;
-        final retry = await showDialog<bool>(
-          context: context,
-          barrierDismissible: false,
-          builder: (context) => AlertDialog(
-            icon: const Icon(Icons.sync_problem_outlined, color: coral),
-            title: const Text('다음 회차를 저장하지 못했어요'),
-            content: const Text('다시 저장하거나 카드 화면으로 돌아갈 수 있어요.'),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('카드 화면으로'),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.pop(context, true),
-                child: const Text('다시 저장'),
-              ),
-            ],
+  Future<void> _showNextRoundDialog(int remainingCount) async {
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        icon: const Icon(Icons.refresh_rounded, color: sea, size: 32),
+        title: const Text('이번 학습을 모두 확인했어요'),
+        content: Text(
+          '보류 $remainingCount개를 순서를 섞어\n다시 확인합니다.',
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('보류 단어 다시 보기'),
           ),
-        );
-        if (retry != true) return false;
-      }
-    }
-    return false;
+        ],
+      ),
+    );
+    if (!mounted) return;
+    setState(() => roundTransitionPending = false);
   }
 
   Future<void> _recoverFailedRoundTransition(
