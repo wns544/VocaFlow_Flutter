@@ -67,6 +67,7 @@ class CloudChangeTracker {
   static const _lastSuccessPrefix = 'autoBackup.lastSuccess.';
   static const _lastDownloadPrefix = 'autoBackup.lastDownload.';
   static const _lastErrorPrefix = 'autoBackup.lastError.';
+  static const _managedBookFullCheckPrefix = 'managedBooks.fullCheck.v1.';
   static const _logKey = 'autoBackup.logs.v1';
   static const _deviceIdKey = 'learningState.deviceId.v1';
   static const _diagnosticSequenceKey = 'syncDiagnostics.sequence.v1';
@@ -145,6 +146,8 @@ class CloudChangeTracker {
       _deletedWordIdsByBook.isNotEmpty ||
       _deletedBookIds.isNotEmpty;
   bool get archiveContentDirty => _archiveIds.isNotEmpty;
+  Map<String, int> get remoteBookRevisions =>
+      Map.unmodifiable(_remoteBookRevisions);
 
   Future<void> markSettings(Iterable<String> keys) => _mutate(() {
         final before = _settingsKeys.length;
@@ -383,6 +386,8 @@ class CloudChangeTracker {
       DateTime.tryParse(_prefs.getString('$_lastSuccessPrefix$uid') ?? '');
   DateTime? lastDownload(String uid) =>
       DateTime.tryParse(_prefs.getString('$_lastDownloadPrefix$uid') ?? '');
+  bool hasCompletedManagedBookFullCheck(String uid) =>
+      _prefs.getBool('$_managedBookFullCheckPrefix$uid') ?? false;
   List<String> get logs => _prefs.getStringList(_logKey) ?? <String>[];
 
   Future<void> recordLog(String message) async {
@@ -426,6 +431,10 @@ class CloudChangeTracker {
   Future<void> recordDownload(String uid, DateTime time) async {
     await _prefs.setString('$_lastDownloadPrefix$uid', time.toIso8601String());
     onChanged?.call();
+  }
+
+  Future<void> markManagedBookFullCheckCompleted(String uid) async {
+    await _prefs.setBool('$_managedBookFullCheckPrefix$uid', true);
   }
 
   Future<void> recordError(String uid, Object error) async {

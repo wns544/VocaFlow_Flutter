@@ -66,6 +66,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   StreamSubscription<Map<String, dynamic>?>? _signalSubscription;
   bool _foreground = true;
   bool _remotePending = false;
+  bool _forceFullManagedBookPull = false;
   String? _lastSignal;
 
   bool get isUploading => _syncing && !_downloading;
@@ -132,7 +133,14 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     final deviceId = await store.cloudChanges.deviceId();
     _signalSubscription = cloud.watchSyncSignal().listen((signal) {
       if (signal == null || signal['deviceId'] == deviceId) return;
-      final token = '${signal['deviceId']}/${signal['revision']}';
+      // Builds predating the managed-book manifest did not publish a book
+      // revision. A full pull on those remote signals keeps mixed-version
+      // devices correct while current builds stay incremental.
+      if (!signal.containsKey('bookRevision')) {
+        _forceFullManagedBookPull = true;
+      }
+      final token =
+          '${signal['deviceId']}/${signal['revision']}/${signal['bookRevision']}';
       if (_lastSignal == token) return;
       _lastSignal = token;
       _remotePending = true;
@@ -380,6 +388,31 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     final current = user;
     if (current == null) throw StateError('Google login is required.');
     await _pullLearningState(reason: '클라우드 데이터 가져오기');
+  }
+
+  Future<void> manualManagedBookRefresh() async {
+    await _prepareAccount();
+    final current = user;
+    if (current == null) throw StateError('Google login is required.');
+    if (_syncing) {
+      throw StateError('다른 동기화가 진행 중입니다. 잠시 후 다시 시도해 주세요.');
+    }
+    _syncing = true;
+    _downloading = true;
+    try {
+      await _pullManagedBooks(reason: '수동 단어장 전체 확인', forceFull: true);
+      await store.cloudChanges.recordDownload(current.uid, _now());
+      await store.cloudChanges.recordSuccess(current.uid, _now());
+      _lastSuccessAt = _now();
+    } catch (error, stackTrace) {
+      await _recordFailure(error, '수동 단어장 전체 확인', stackTrace: stackTrace);
+      rethrow;
+    } finally {
+      _downloading = false;
+      _syncing = false;
+      onChanged?.call();
+      if (_remotePending) unawaited(_drainRemoteChanges());
+    }
   }
 
   Future<void> mergeFromCloud({
@@ -774,15 +807,60 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _pullManagedBooks({required String reason}) async {
-    final remote = await cloud.downloadManagedBooks();
-    final revisions = <String, int>{
-      for (final document in remote)
-        if (document['id'] != null)
-          document['id'].toString():
-              (document['revision'] as num?)?.toInt() ?? 0,
-    };
-    await store.cloudChanges.recordRemoteBookRevisions(revisions);
+  Future<void> _pullManagedBooks({
+    required String reason,
+    bool forceFull = false,
+  }) async {
+    final current = user;
+    final manifest = await cloud.downloadManagedBookManifest();
+    late final List<Map<String, dynamic>> remote;
+    late final Map<String, int> revisions;
+    var fullDownload = false;
+    final firstFullCheck = current != null &&
+        !store.cloudChanges.hasCompletedManagedBookFullCheck(current.uid);
+    if (forceFull ||
+        firstFullCheck ||
+        _forceFullManagedBookPull ||
+        manifest == null ||
+        !manifest.complete) {
+      fullDownload = true;
+      remote = await cloud.downloadManagedBooks();
+      revisions = <String, int>{
+        for (final document in remote)
+          if (document['id'] != null)
+            document['id'].toString():
+                (document['revision'] as num?)?.toInt() ?? 0,
+      };
+      await cloud.reconcileManagedBookManifest(
+        revisions,
+        deviceId: await store.cloudChanges.deviceId(),
+      );
+      _forceFullManagedBookPull = false;
+    } else {
+      revisions = manifest.revisions;
+      final changedIds = managedBookIdsNeedingDownload(
+        localRevisions: store.cloudChanges.remoteBookRevisions,
+        remoteRevisions: revisions,
+      );
+      if (changedIds.isEmpty) {
+        await store.cloudChanges
+            .recordDiagnostic('managed_books_download_skipped', data: {
+          'reason': reason,
+          'manifestGeneration': manifest.generation,
+          'remoteBookCount': revisions.length,
+        });
+        return;
+      }
+      remote = await cloud.downloadManagedBooksByIds(changedIds);
+      final downloadedIds = remote
+          .map((document) => document['id']?.toString())
+          .whereType<String>()
+          .toSet();
+      final missingIds = changedIds.difference(downloadedIds);
+      if (missingIds.isNotEmpty) {
+        throw StateError('서버 단어장 일부를 찾을 수 없습니다: ${missingIds.join(', ')}');
+      }
+    }
     final localSnapshot = store.cloudChanges.snapshot;
     final dirty = <String>{
       ...localSnapshot.bookIds,
@@ -794,9 +872,22 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       remote,
       locallyDirtyBookIds: dirty,
     );
+    final observedRevisions = Map<String, int>.of(revisions);
+    for (final document in remote) {
+      final id = document['id']?.toString();
+      final revision = (document['revision'] as num?)?.toInt();
+      if (id != null && revision != null) observedRevisions[id] = revision;
+    }
+    // Only acknowledge revisions after the downloaded card content has been
+    // durably merged. A crash or storage failure must cause a retry next time.
+    await store.cloudChanges.recordRemoteBookRevisions(observedRevisions);
+    if (fullDownload && current != null) {
+      await store.cloudChanges.markManagedBookFullCheckCompleted(current.uid);
+    }
     await store.cloudChanges
         .recordDiagnostic('managed_books_download_succeeded', data: {
       'reason': reason,
+      'fullDownload': fullDownload,
       'remoteBookCount': remote.length,
       'mergedBookCount': changed,
     });

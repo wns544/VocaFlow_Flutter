@@ -119,37 +119,47 @@ class WordRelationStore extends ChangeNotifier {
   SharedPreferences? _prefs;
   final Map<String, WordRelation> _relations = {};
   bool _loaded = false;
+  Future<void>? _loading;
 
   bool get isLoaded => _loaded;
   List<WordRelation> get all => _relations.values
       .where((relation) => !relation.deleted)
       .toList(growable: false);
 
-  Future<void> load() async {
-    if (_loaded) return;
-    _prefs = await SharedPreferences.getInstance();
-    final saved = _prefs!.getString(_storageKey);
-    if (saved != null) {
-      try {
-        final rows = jsonDecode(saved) as List<dynamic>;
-        for (final raw in rows) {
-          final relation = WordRelation.fromJson(
-              Map<String, dynamic>.from(raw as Map<dynamic, dynamic>));
-          if (relation.first.bookId.isNotEmpty &&
-              relation.second.bookId.isNotEmpty &&
-              relation.first != relation.second) {
-            _relations[relation.id] = relation;
+  Future<void> load() {
+    if (_loaded) return Future<void>.value();
+    return _loading ??= _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      _prefs = await SharedPreferences.getInstance();
+      final saved = _prefs!.getString(_storageKey);
+      if (saved != null) {
+        try {
+          final rows = jsonDecode(saved) as List<dynamic>;
+          for (final raw in rows) {
+            final relation = WordRelation.fromJson(
+                Map<String, dynamic>.from(raw as Map<dynamic, dynamic>));
+            if (relation.first.bookId.isNotEmpty &&
+                relation.second.bookId.isNotEmpty &&
+                relation.first != relation.second) {
+              _relations[relation.id] = relation;
+            }
           }
+        } catch (_) {
+          // A malformed local relation cache should not affect vocab cards.
         }
-      } catch (_) {
-        // A malformed local relation cache should not affect vocab cards.
       }
+      _loaded = true;
+      notifyListeners();
+    } finally {
+      _loading = null;
     }
-    _loaded = true;
-    notifyListeners();
   }
 
   Future<void> reload() async {
+    await _loading;
     _loaded = false;
     _relations.clear();
     await load();
@@ -158,6 +168,15 @@ class WordRelationStore extends ChangeNotifier {
   List<WordRelation> forWord(RelatedWordRef reference) => all
       .where((relation) => relation.involves(reference))
       .toList(growable: false);
+
+  /// Every card in the same connected component belongs to one relation
+  /// group. This keeps an imported or legacy A-B / A-C graph symmetric from
+  /// every card: opening B also exposes both A and C.
+  Set<RelatedWordRef> relatedWordsFor(RelatedWordRef reference) {
+    final component = _componentFor(reference);
+    component.remove(reference);
+    return component;
+  }
 
   List<Map<String, dynamic>> snapshotForBook(String bookId) => _relations.values
       .where((relation) =>
@@ -189,12 +208,16 @@ class WordRelationStore extends ChangeNotifier {
 
   bool isRelated(RelatedWordRef first, RelatedWordRef second) {
     if (first == second) return false;
-    return _relations[relationIdFor(first, second)]?.deleted == false;
+    return _componentFor(first).contains(second);
   }
 
   Future<void> toggle(RelatedWordRef first, RelatedWordRef second) async {
     if (first == second) return;
     await load();
+    if (isRelated(first, second)) {
+      await _removeGroupMember(anchor: first, member: second);
+      return;
+    }
     final id = relationIdFor(first, second);
     final existing = _relations[id];
     final now = DateTime.now().toUtc();
@@ -214,6 +237,67 @@ class WordRelationStore extends ChangeNotifier {
     unawaited(_uploadOne(next));
   }
 
+  Set<RelatedWordRef> _componentFor(RelatedWordRef start) {
+    final active = all;
+    final found = <RelatedWordRef>{start};
+    final pending = <RelatedWordRef>[start];
+    while (pending.isNotEmpty) {
+      final current = pending.removeLast();
+      for (final relation in active) {
+        if (!relation.involves(current)) continue;
+        final other = relation.otherThan(current);
+        if (found.add(other)) pending.add(other);
+      }
+    }
+    return found;
+  }
+
+  Future<void> _removeGroupMember({
+    required RelatedWordRef anchor,
+    required RelatedWordRef member,
+  }) async {
+    final component = _componentFor(anchor);
+    if (!component.contains(member)) return;
+    final now = DateTime.now().toUtc();
+    final changed = <String, WordRelation>{};
+
+    // Removing a bridge must not split the cards that remain in the group.
+    // A small star is enough to keep the remainder connected without storing
+    // every possible pair.
+    final remaining = component.where((item) => item != member).toList()
+      ..sort();
+    if (remaining.length > 1) {
+      final root = remaining.first;
+      for (final other in remaining.skip(1)) {
+        final id = relationIdFor(root, other);
+        final existing = _relations[id];
+        if (existing?.deleted == false) continue;
+        final ordered = [root, other]..sort();
+        changed[id] = existing == null
+            ? WordRelation(
+                id: id,
+                first: ordered[0],
+                second: ordered[1],
+                createdAt: now,
+                updatedAt: now,
+              )
+            : existing.copyWith(updatedAt: now, deleted: false);
+      }
+    }
+
+    for (final relation in all) {
+      if (!relation.involves(member)) continue;
+      changed[relation.id] = relation.copyWith(updatedAt: now, deleted: true);
+    }
+    if (changed.isEmpty) return;
+    _relations.addAll(changed);
+    await _persist();
+    notifyListeners();
+    for (final relation in changed.values) {
+      unawaited(_uploadOne(relation));
+    }
+  }
+
   Future<int> addAll(Iterable<WordRelationPair> pairs) async {
     await load();
     final now = DateTime.now().toUtc();
@@ -221,6 +305,7 @@ class WordRelationStore extends ChangeNotifier {
     var changed = 0;
     for (final pair in pairs) {
       if (pair.first == pair.second) continue;
+      if (isRelated(pair.first, pair.second)) continue;
       final id = relationIdFor(pair.first, pair.second);
       final existing = _relations[id];
       if (existing?.deleted == false) continue;

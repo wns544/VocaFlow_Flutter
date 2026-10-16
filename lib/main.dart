@@ -1888,6 +1888,7 @@ class _CardStudyPageState extends State<CardStudyPage>
   var _relatedCurrentScopeOnly = false;
   var exiting = false;
   var finishingStudy = false;
+  var roundTransitionPending = false;
   var completionValidated = false;
   var _undoTransitionRevision = 0;
   Offset? _undoEntryDirection;
@@ -2062,7 +2063,10 @@ class _CardStudyPageState extends State<CardStudyPage>
       roundCompleted = resume.roundCompleted.clamp(0, roundTotal);
       roundUnknown.addAll(_resolveStoredWords(
           resume.roundUnknownIds, resume.roundUnknownBookIds));
-      revealed = resume.revealed;
+      // Restoring a session must not reveal the answer before the learner has
+      // interacted with the card in this visit. The queue and progress resume
+      // exactly, but every reopened study route starts on the question face.
+      revealed = false;
       lastState = resume.lastState;
       undoHistory.addAll(resume.undoHistory);
       if (undoHistory.isEmpty &&
@@ -2163,6 +2167,11 @@ class _CardStudyPageState extends State<CardStudyPage>
   void _applyMergedActiveStudy(ActiveStudy latest) {
     final latestQueue = widget.store.resolveActiveWords(latest);
     if (latestQueue.isEmpty || !mounted) return;
+    final currentWord = queue.firstOrNull;
+    final nextWord = latestQueue.first;
+    final visibleCardChanged = currentWord == null ||
+        currentWord.id != nextWord.id ||
+        _bookIdForWord(currentWord) != _bookIdForWord(nextWord);
     setState(() {
       queue
         ..clear()
@@ -2181,7 +2190,10 @@ class _CardStudyPageState extends State<CardStudyPage>
       seenWordIds
         ..clear()
         ..addAll(latest.seenWordIds);
-      revealed = latest.revealed;
+      if (visibleCardChanged) {
+        revealed = false;
+        showingExplanation = false;
+      }
       lastState = latest.lastState;
       lastWord = null;
       if (latest.lastWordId != null) {
@@ -2589,14 +2601,15 @@ class _CardStudyPageState extends State<CardStudyPage>
     final previousState = word.state;
     lastWord = word;
     lastState = state;
-    undoHistory.add(StudyDecision(
+    final decision = StudyDecision(
       wordId: word.id,
       previousState: previousState,
       decision: state,
       bookId: _bookIdForWord(word),
       dismissedPositive: dismissedPositive,
       usedHorizontalSwipe: dismissedPositive == null ? null : horizontalSwipe,
-    ));
+    );
+    undoHistory.add(decision);
     if (state == StudyState.memorized) {
       memorized++;
     } else {
@@ -2608,15 +2621,25 @@ class _CardStudyPageState extends State<CardStudyPage>
     showingExplanation = false;
     if (queue.isEmpty && !finishingStudy) {
       finishingStudy = true;
+      roundTransitionPending = roundUnknown.isNotEmpty;
       _persistenceChain = _persistenceChain.then((_) async {
-        await (widget.decisionWriter?.call(word, state) ??
-            widget.store.mark(
-              word,
-              state,
-              bookId: _bookIdForWord(word),
-              sessionIndexes: _sessionIndexesForWord(word),
-            ));
-        await _finishRound();
+        try {
+          await (widget.decisionWriter?.call(word, state) ??
+              widget.store.mark(
+                word,
+                state,
+                bookId: _bookIdForWord(word),
+                sessionIndexes: _sessionIndexesForWord(word),
+              ));
+          await _finishRound();
+        } catch (error, stackTrace) {
+          await _recoverFailedRoundTransition(
+            error,
+            stackTrace,
+            word: word,
+            decision: decision,
+          );
+        }
       });
     } else {
       _scheduleDecisionPersistence(word, state);
@@ -2630,20 +2653,15 @@ class _CardStudyPageState extends State<CardStudyPage>
   Future<void> _finishRound() async {
     if (roundUnknown.isNotEmpty) {
       final remaining = List<Word>.of(roundUnknown);
-      queue.addAll(shuffledNextRound(remaining, lastWord));
-      roundUnknown.clear();
-      roundNumber++;
-      roundTotal = queue.length;
-      roundCompleted = 0;
-      seenWordIds.clear();
-      undoHistory.clear();
-      lastWord = null;
-      lastState = null;
-      revealed = false;
-      await persistStudy();
+      _prepareNextRound(remaining);
+      final saved = await _persistRoundTransitionWithRetry();
       finishingStudy = false;
-      if (mounted) setState(() {});
       if (!mounted) return;
+      if (!saved) {
+        setState(() => roundTransitionPending = false);
+        scheduleResumeSnapshotCapture('study');
+        return;
+      }
       await showDialog<void>(
         context: context,
         barrierDismissible: false,
@@ -2661,6 +2679,8 @@ class _CardStudyPageState extends State<CardStudyPage>
           ],
         ),
       );
+      if (!mounted) return;
+      setState(() => roundTransitionPending = false);
       return;
     }
 
@@ -2685,6 +2705,145 @@ class _CardStudyPageState extends State<CardStudyPage>
     unawaited(deleteResumeSnapshot());
     AutoBackupCoordinator.activeInstance
         ?.requestImmediateBackup(ignoreMinimumInterval: true);
+  }
+
+  void _prepareNextRound(List<Word> remaining) {
+    queue.addAll(shuffledNextRound(remaining, lastWord));
+    roundUnknown.clear();
+    roundNumber++;
+    roundTotal = queue.length;
+    roundCompleted = 0;
+    seenWordIds.clear();
+    undoHistory.clear();
+    lastWord = null;
+    lastState = null;
+    revealed = false;
+    showingExplanation = false;
+  }
+
+  Future<bool> _persistRoundTransitionWithRetry() async {
+    while (mounted) {
+      try {
+        await persistStudy();
+        return true;
+      } catch (error, stackTrace) {
+        unawaited(widget.store.cloudChanges.recordDiagnostic(
+          'round_transition_save_failed',
+          data: {
+            'error': error.toString(),
+            'stackTrace': stackTrace.toString()
+          },
+        ));
+        if (!mounted) return false;
+        final retry = await showDialog<bool>(
+          context: context,
+          barrierDismissible: false,
+          builder: (context) => AlertDialog(
+            icon: const Icon(Icons.sync_problem_outlined, color: coral),
+            title: const Text('다음 회차를 저장하지 못했어요'),
+            content: const Text('다시 저장하거나 카드 화면으로 돌아갈 수 있어요.'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('카드 화면으로'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('다시 저장'),
+              ),
+            ],
+          ),
+        );
+        if (retry != true) return false;
+      }
+    }
+    return false;
+  }
+
+  Future<void> _recoverFailedRoundTransition(
+    Object error,
+    StackTrace stackTrace, {
+    required Word word,
+    required StudyDecision decision,
+  }) async {
+    finishingStudy = false;
+    roundTransitionPending = false;
+    // A failure on the last card used to leave an all-memorized round with an
+    // empty queue and completionValidated=false, which rendered an endless
+    // spinner. Put the final decision back when possible so the learner can
+    // retry it without losing the session. The store rollback also reverses a
+    // partially committed attempt when the failure happened after the local
+    // word counters were updated.
+    final canRestoreLastCard = queue.isEmpty;
+    if (canRestoreLastCard) {
+      queue.insert(0, word);
+      word.state = decision.previousState;
+      if (roundCompleted > 0) roundCompleted--;
+      if (decision.decision == StudyState.memorized && memorized > 0) {
+        memorized--;
+      }
+      roundUnknown.removeWhere((candidate) =>
+          candidate.id == word.id &&
+          _bookIdForWord(candidate) == decision.bookId);
+      undoHistory.removeWhere((candidate) => identical(candidate, decision));
+      if (!undoHistory.any((candidate) => candidate.wordId == word.id)) {
+        seenWordIds.remove(word.id);
+      }
+      if (decision.decision == StudyState.review &&
+          !undoHistory.any((candidate) =>
+              candidate.wordId == word.id &&
+              candidate.decision == StudyState.review)) {
+        reviewed.remove(word.term);
+      }
+      final previous = undoHistory.lastOrNull;
+      lastWord = previous == null
+          ? null
+          : widget.store.books
+              .where((book) =>
+                  previous.bookId == null || book.id == previous.bookId)
+              .expand((book) => book.words)
+              .where((candidate) => candidate.id == previous.wordId)
+              .firstOrNull;
+      lastState = previous?.decision;
+      revealed = false;
+      showingExplanation = false;
+      if (mounted) setState(() => _undoEntryDirection = null);
+      try {
+        // The production writer can fail after it has updated local counters.
+        // Reverse that partial attempt before allowing the card to be judged
+        // again. Injected writers are used by tests and own their persistence.
+        if (widget.decisionWriter == null) {
+          await widget.store.undoWordDecision(
+            word,
+            decision.previousState,
+            bookId: decision.bookId ?? activeBookId,
+          );
+        }
+        await persistStudy();
+      } catch (rollbackError, rollbackStackTrace) {
+        unawaited(widget.store.cloudChanges.recordDiagnostic(
+          'round_transition_rollback_failed',
+          data: {
+            'error': rollbackError.toString(),
+            'stackTrace': rollbackStackTrace.toString(),
+          },
+        ));
+      }
+    }
+    unawaited(widget.store.cloudChanges.recordDiagnostic(
+      'round_transition_failed',
+      data: {'error': error.toString(), 'stackTrace': stackTrace.toString()},
+    ));
+    if (!mounted) return;
+    setState(() {});
+    scheduleResumeSnapshotCapture('study');
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(canRestoreLastCard
+            ? '마지막 카드 저장에 실패해 카드를 되돌렸어요. 다시 선택해 주세요.'
+            : '학습 저장이 지연되고 있어요. 다음 카드에서 다시 저장합니다.'),
+      ),
+    );
   }
 
   Future<void> toggleFavorite(Word word) async {
@@ -3195,6 +3354,22 @@ class _CardStudyPageState extends State<CardStudyPage>
 
   @override
   Widget build(BuildContext context) {
+    if (roundTransitionPending) {
+      return const Scaffold(
+        body: ColoredBox(
+          color: Color(0xFFF7F8FA),
+          child: Center(
+            child: Text(
+              '다음 회차를 준비하고 있어요',
+              style: TextStyle(
+                color: Color(0xFF8E8E93),
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
     if (queue.isEmpty && !completionValidated) {
       return const Scaffold(
         body: Center(child: CircularProgressIndicator()),
@@ -7313,6 +7488,25 @@ class _SettingsPageState extends State<SettingsPage> {
     });
   }
 
+  Future<void> refreshManagedBooksFromCloud() async {
+    final confirmed = await _confirm(
+      title: '서버 단어장을 전체 확인할까요?',
+      message:
+          '서버의 단어장 본문을 모두 다시 확인합니다. 학습 기록, 오답과 앱 설정은 유지됩니다. 서버에서 삭제된 단어장이 있으면 그 단어장의 진행 중인 세션도 함께 정리됩니다.',
+      action: '전체 확인',
+    );
+    if (!confirmed) return;
+    await _runCloudTask(() async {
+      final coordinator = widget.autoBackup;
+      if (coordinator == null) {
+        throw StateError('동기화 준비가 끝나지 않았습니다. 잠시 후 다시 시도해 주세요.');
+      }
+      await coordinator.manualManagedBookRefresh();
+      widget.refresh();
+      _showSnack('서버 단어장 전체 확인을 완료했습니다.');
+    });
+  }
+
   Future<void> viewCloudContents() async {
     if (!firebaseReady || FirebaseAuth.instance.currentUser == null) {
       _showSnack('먼저 Google로 로그인해 주세요.');
@@ -7857,6 +8051,26 @@ class _SettingsPageState extends State<SettingsPage> {
                         : restorePresentationSettingsFromCloud,
                     icon: const Icon(Icons.tune, size: 18),
                     label: const Text('클라우드 설정 확인'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: ink,
+                      side: const BorderSide(color: Color(0xFFDADCE0)),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  height: 44,
+                  child: OutlinedButton.icon(
+                    key: const ValueKey('refresh-managed-books'),
+                    onPressed: syncing || user == null || auto == null
+                        ? null
+                        : refreshManagedBooksFromCloud,
+                    icon: const Icon(Icons.library_books_outlined, size: 18),
+                    label: const Text('서버 단어장 전체 다시 확인'),
                     style: OutlinedButton.styleFrom(
                       foregroundColor: ink,
                       side: const BorderSide(color: Color(0xFFDADCE0)),
@@ -9602,20 +9816,36 @@ class RelatedWordsPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (wordRelations.isLoaded) return _buildLoaded(context);
+    return FutureBuilder<void>(
+      future: wordRelations.load(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) {
+          return compact
+              ? const SizedBox.shrink()
+              : const Padding(
+                  padding: EdgeInsets.only(top: 20),
+                  child: _InlineLoading(),
+                );
+        }
+        return _buildLoaded(context);
+      },
+    );
+  }
+
+  Widget _buildLoaded(BuildContext context) {
     final reference = source;
     if (reference == null) return const SizedBox.shrink();
     return ListenableBuilder(
       listenable: wordRelations,
       builder: (context, _) {
-        var relations = wordRelations.forWord(reference);
+        var relatedReferences = wordRelations.relatedWordsFor(reference);
         if (scopeOnly && currentScope != null) {
-          relations = relations
-              .where((relation) =>
-                  currentScope!.contains(relation.otherThan(reference)))
-              .toList(growable: false);
+          relatedReferences =
+              relatedReferences.where(currentScope!.contains).toSet();
         }
-        final rows = relations
-            .map((relation) => _lookup(relation.otherThan(reference)))
+        final rows = relatedReferences
+            .map(_lookup)
             .whereType<(Word, WordBook)>()
             .toList(growable: false);
         if (rows.isEmpty && compact) return const SizedBox.shrink();
@@ -9743,31 +9973,45 @@ class _RelatedWordPickerSheetState extends State<_RelatedWordPickerSheet> {
                   onSelected: (value) => setState(() => scopeOnly = value),
                 ),
               ),
+            const Padding(
+              padding: EdgeInsets.only(bottom: 6),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  '연결된 단어를 다시 누르면 그 단어가 그룹 전체에서 제외됩니다.',
+                  style: TextStyle(color: Color(0xFF8E8E93), fontSize: 11),
+                ),
+              ),
+            ),
             Expanded(
               child: ListenableBuilder(
                 listenable: wordRelations,
-                builder: (context, _) => ListView.builder(
-                  itemCount: _results.length,
-                  itemBuilder: (context, index) {
-                    final row = _results[index];
-                    final target =
-                        RelatedWordRef(bookId: row.$2.id, wordId: row.$1.id);
-                    final related =
-                        wordRelations.isRelated(widget.source, target);
-                    return ListTile(
-                      leading: Icon(related ? Icons.link : Icons.add_link,
-                          color: related ? sea : Colors.black54),
-                      title: Text(row.$1.term),
-                      subtitle: Text(
-                          '${row.$1.reading} · ${row.$1.meaning}\n${row.$2.name}'),
-                      isThreeLine: true,
-                      onTap: () async {
-                        await wordRelations.toggle(widget.source, target);
-                        if (mounted) setState(() {});
-                      },
-                    );
-                  },
-                ),
+                builder: (context, _) {
+                  final results = _results;
+                  final relatedWords =
+                      wordRelations.relatedWordsFor(widget.source);
+                  return ListView.builder(
+                    itemCount: results.length,
+                    itemBuilder: (context, index) {
+                      final row = results[index];
+                      final target =
+                          RelatedWordRef(bookId: row.$2.id, wordId: row.$1.id);
+                      final related = relatedWords.contains(target);
+                      return ListTile(
+                        leading: Icon(related ? Icons.link : Icons.add_link,
+                            color: related ? sea : Colors.black54),
+                        title: Text(row.$1.term),
+                        subtitle: Text(
+                            '${row.$1.reading} · ${row.$1.meaning}\n${row.$2.name}'),
+                        isThreeLine: true,
+                        onTap: () async {
+                          await wordRelations.toggle(widget.source, target);
+                          if (mounted) setState(() {});
+                        },
+                      );
+                    },
+                  );
+                },
               ),
             ),
           ]),

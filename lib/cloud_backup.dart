@@ -19,6 +19,26 @@ Uint8List _encodeSyncPayload(Map<String, dynamic> payload) =>
 Map<String, dynamic> _decodeSyncPayload(List<int> bytes) =>
     Map<String, dynamic>.from(jsonDecode(utf8.decode(bytes)));
 
+Map<String, int> _manifestRevisions(Map<String, dynamic>? data) {
+  final revisions = <String, int>{};
+  final entries = data?['entries'];
+  if (entries is! List) return revisions;
+  for (final raw in entries) {
+    if (raw is! Map) continue;
+    final id = raw['id']?.toString() ?? '';
+    final revision = (raw['revision'] as num?)?.toInt();
+    if (id.isNotEmpty && revision != null) revisions[id] = revision;
+  }
+  return revisions;
+}
+
+List<Map<String, Object>> _manifestEntries(Map<String, int> revisions) {
+  final ids = revisions.keys.toList()..sort();
+  return [
+    for (final id in ids) {'id': id, 'revision': revisions[id]!},
+  ];
+}
+
 class CloudQuotaExceededException implements Exception {
   const CloudQuotaExceededException();
 
@@ -60,6 +80,27 @@ class ManagedBookConflictException implements Exception {
   String toString() =>
       'ManagedBookConflictException(book: $bookId, expected: $expected, actual: $actual)';
 }
+
+class ManagedBookManifest {
+  const ManagedBookManifest({
+    required this.generation,
+    required this.complete,
+    required this.revisions,
+  });
+
+  final int generation;
+  final bool complete;
+  final Map<String, int> revisions;
+}
+
+Set<String> managedBookIdsNeedingDownload({
+  required Map<String, int> localRevisions,
+  required Map<String, int> remoteRevisions,
+}) =>
+    remoteRevisions.entries
+        .where((entry) => localRevisions[entry.key] != entry.value)
+        .map((entry) => entry.key)
+        .toSet();
 
 class CloudBookOverview {
   const CloudBookOverview({
@@ -202,6 +243,11 @@ class CloudBackup {
       .doc(_user.uid)
       .collection('syncSignals')
       .doc('main');
+  DocumentReference<Map<String, dynamic>> get _managedBookManifest => firestore
+      .collection('users')
+      .doc(_user.uid)
+      .collection('syncSignals')
+      .doc('managedBooks');
   final Map<String, Map<String, dynamic>> _syncPayloadCache = {};
 
   Stream<Map<String, dynamic>?> watchSyncSignal() =>
@@ -212,7 +258,7 @@ class CloudBackup {
         'deviceId': deviceId,
         'revision': revision,
         'updatedAt': FieldValue.serverTimestamp()
-      });
+      }, SetOptions(merge: true));
 
   /// Imported/user-authored card content. This deliberately never writes the
   /// legacy vocabBooks/*/words documents.
@@ -360,6 +406,7 @@ class CloudBackup {
           ...changes.deletedBookIds,
         }..remove('default');
         if (touched.isEmpty) return;
+        final deviceId = await store.cloudChanges.deviceId();
         final byId = {for (final book in store.books) book.id: book};
         for (final id in touched) {
           final book = byId[id];
@@ -367,17 +414,19 @@ class CloudBackup {
           final expected = changes.bookBaseRevisions[id] ?? 0;
           await firestore.runTransaction((transaction) async {
             final current = await transaction.get(ref);
+            final currentManifest = await transaction.get(_managedBookManifest);
             final rawRevision = current.data()?['revision'];
             final actual = rawRevision is num ? rawRevision.toInt() : 0;
             if (actual != expected) {
               throw ManagedBookConflictException(id, expected, actual);
             }
+            final nextRevision = actual + 1;
             transaction.set(
               ref,
               {
                 'schema': 2,
                 'id': id,
-                'revision': actual + 1,
+                'revision': nextRevision,
                 'deleted': book == null,
                 if (book != null) 'content': store.toManagedBookJson(book),
                 'clientUpdatedAt': DateTime.now().toUtc().toIso8601String(),
@@ -385,8 +434,80 @@ class CloudBackup {
               },
               SetOptions(merge: true),
             );
+            final manifestData = currentManifest.data();
+            final revisions = _manifestRevisions(manifestData);
+            revisions[id] = nextRevision;
+            final nextGeneration =
+                ((manifestData?['generation'] as num?)?.toInt() ?? 0) + 1;
+            transaction.set(_managedBookManifest, {
+              'schema': 1,
+              'complete': manifestData?['complete'] == true,
+              'generation': nextGeneration,
+              'entries': _manifestEntries(revisions),
+              'updatedAt': FieldValue.serverTimestamp(),
+            });
+            transaction.set(
+              _syncSignal,
+              {
+                'deviceId': deviceId,
+                'bookRevision': nextGeneration,
+                'updatedAt': FieldValue.serverTimestamp(),
+              },
+              SetOptions(merge: true),
+            );
           });
         }
+      });
+
+  Future<ManagedBookManifest?> downloadManagedBookManifest() =>
+      _runCloudOperation(() async {
+        final snapshot = await _managedBookManifest.get();
+        final data = snapshot.data();
+        if (!snapshot.exists || data == null) return null;
+        return ManagedBookManifest(
+          generation: (data['generation'] as num?)?.toInt() ?? 0,
+          complete: data['complete'] == true,
+          revisions: _manifestRevisions(data),
+        );
+      });
+
+  Future<void> reconcileManagedBookManifest(
+    Map<String, int> revisions, {
+    required String deviceId,
+  }) =>
+      _runCloudOperation(() async {
+        await firestore.runTransaction((transaction) async {
+          final current = await transaction.get(_managedBookManifest);
+          final data = current.data();
+          final merged = Map<String, int>.of(revisions);
+          for (final entry in _manifestRevisions(data).entries) {
+            if ((merged[entry.key] ?? -1) < entry.value) {
+              merged[entry.key] = entry.value;
+            }
+          }
+          final unchanged = data?['complete'] == true &&
+              mapEquals(_manifestRevisions(data), merged);
+          var generation = (data?['generation'] as num?)?.toInt() ?? 0;
+          if (!unchanged) {
+            generation++;
+            transaction.set(_managedBookManifest, {
+              'schema': 1,
+              'complete': true,
+              'generation': generation,
+              'entries': _manifestEntries(merged),
+              'updatedAt': FieldValue.serverTimestamp(),
+            });
+          }
+          transaction.set(
+            _syncSignal,
+            {
+              'deviceId': deviceId,
+              'bookRevision': generation,
+              'updatedAt': FieldValue.serverTimestamp(),
+            },
+            SetOptions(merge: true),
+          );
+        });
       });
 
   Future<List<Map<String, dynamic>>> downloadManagedBooks() =>
@@ -396,6 +517,21 @@ class CloudBackup {
         final snapshot = await _managedBooksRef.get();
         return snapshot.docs
             .map((doc) => Map<String, dynamic>.from(doc.data()))
+            .toList(growable: false);
+      });
+
+  Future<List<Map<String, dynamic>>> downloadManagedBooksByIds(
+          Iterable<String> ids) =>
+      _runCloudOperation(() async {
+        final documents = await Future.wait(
+          ids.map((id) => _managedBooksRef.doc(id).get()),
+        );
+        return documents
+            .where((document) => document.exists)
+            .map((document) => <String, dynamic>{
+                  ...document.data()!,
+                  'id': document.data()!['id'] ?? document.id,
+                })
             .toList(growable: false);
       });
 
@@ -447,11 +583,15 @@ class CloudBackup {
         // leaves the previous complete version readable.
         final batch = firestore.batch();
         batch.set(head, metadata);
-        batch.set(_syncSignal, {
-          'deviceId': deviceId,
-          'revision': revision,
-          'updatedAt': FieldValue.serverTimestamp()
-        });
+        batch.set(
+          _syncSignal,
+          {
+            'deviceId': deviceId,
+            'revision': revision,
+            'updatedAt': FieldValue.serverTimestamp()
+          },
+          SetOptions(merge: true),
+        );
         await batch.commit();
       });
 

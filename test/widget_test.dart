@@ -123,7 +123,7 @@ void main() {
         explanation: '연결 버튼이 가려지면 안 됩니다.',
       ),
     ]);
-    await store.addBook('other book', [
+    final other = await store.addBook('other book', [
       Word(id: 89102, term: 'targetword', reading: '', meaning: '검색단서'),
     ]);
     await tester.pumpWidget(MaterialApp(
@@ -139,12 +139,28 @@ void main() {
     expect(find.byTooltip('단어 연결'), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('card-related-words')));
     await tester.pumpAndSettle();
+    expect(find.textContaining('그룹 전체에서 제외'), findsOneWidget);
     await tester.enterText(find.byType(TextField), '검색단서');
     await tester.pumpAndSettle();
     expect(find.text('targetword'), findsOneWidget);
     await tester.tap(find.text('targetword'));
     await tester.pumpAndSettle();
     expect(find.byIcon(Icons.link), findsOneWidget);
+
+    Navigator.of(tester.element(find.text('관련 단어 연결'))).pop();
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(MaterialApp(
+      home: CardStudyPage(
+        store: store,
+        words: other.words,
+        bookId: other.id,
+        useSavedResume: false,
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('study-card')));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('sourceword'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -556,12 +572,50 @@ void main() {
 
     expect(find.text('이번 학습을 모두 확인했어요'), findsOneWidget);
     expect(find.textContaining('보류 1개'), findsOneWidget);
-    expect(find.byKey(const ValueKey('study-card')), findsOneWidget);
+    expect(find.text('다음 회차를 준비하고 있어요'), findsOneWidget);
+    // The next round must not expose its first card before the learner closes
+    // the transition dialog.
+    expect(find.byKey(const ValueKey('study-card')), findsNothing);
+    expect(find.text('final'), findsNothing);
     await tester.tap(find.text('보류 단어 다시 보기'));
     await tester.pumpAndSettle();
     expect(find.text('final'), findsOneWidget);
     expect(find.text('0 / 1'), findsOneWidget);
     expect(decisions, [StudyState.review]);
+  });
+
+  testWidgets('a failed final-card write restores the card instead of spinning',
+      (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final word = Word(id: 9262, term: 'retry', reading: '', meaning: 'again');
+    await tester.pumpWidget(MaterialApp(
+      home: CardStudyPage(
+        store: store,
+        words: [word],
+        decisionWriter: (_, __) async => throw StateError('write failed'),
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    final card = find.byKey(const ValueKey('study-card'));
+    final gesture = await tester.startGesture(tester.getCenter(card));
+    await gesture.moveBy(const Offset(0, -120));
+    await gesture.moveBy(const Offset(0, -120));
+    await gesture.up();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester
+        .runAsync(() => Future<void>.delayed(const Duration(milliseconds: 20)));
+    await tester.pump(const Duration(milliseconds: 400));
+
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+    expect(find.text('retry'), findsOneWidget);
+    expect(find.text('0 / 1'), findsOneWidget);
+    expect(
+      find.text('마지막 카드 저장에 실패해 카드를 되돌렸어요. 다시 선택해 주세요.'),
+      findsOneWidget,
+    );
+    expect(word.state, StudyState.fresh);
   });
 
   testWidgets('the waiting card stays fixed while it becomes the front card',
@@ -1669,7 +1723,7 @@ void main() {
     expect(find.text('ephemeral'), findsOneWidget);
   });
 
-  testWidgets('restores the exact study card after an app restart',
+  testWidgets('restores the exact study card face-down after an app restart',
       (WidgetTester tester) async {
     SharedPreferences.setMockInitialValues({});
     await tester.pumpWidget(const VocaFlowApp());
@@ -1696,7 +1750,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('resilience'), findsOneWidget);
-    expect(find.text('회복력, 탄력성'), findsOneWidget);
+    expect(find.text('회복력, 탄력성'), findsNothing);
   });
 
   testWidgets('searches and edits a word from a word book',

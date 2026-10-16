@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vocaflow/backup_merge.dart';
 import 'package:vocaflow/cloud_change_tracker.dart';
+import 'package:vocaflow/cloud_backup.dart';
 import 'package:vocaflow/models.dart';
 import 'package:vocaflow/store.dart';
 
@@ -12,6 +13,35 @@ void main() {
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
+  });
+
+  test('managed-book manifest downloads only new or revised books', () {
+    final changed = managedBookIdsNeedingDownload(
+      localRevisions: const {'same': 3, 'changed': 2},
+      remoteRevisions: const {'same': 3, 'changed': 4, 'new': 1},
+    );
+
+    expect(changed, {'changed', 'new'});
+  });
+
+  test('matching managed-book manifest skips every book body', () {
+    final changed = managedBookIdsNeedingDownload(
+      localRevisions: const {'a': 2, 'b': 7},
+      remoteRevisions: const {'a': 2, 'b': 7},
+    );
+
+    expect(changed, isEmpty);
+  });
+
+  test('first full managed-book check is remembered per account', () async {
+    final tracker = await CloudChangeTracker.load();
+
+    expect(tracker.hasCompletedManagedBookFullCheck('account-a'), isFalse);
+    await tracker.markManagedBookFullCheckCompleted('account-a');
+
+    final restored = await CloudChangeTracker.load();
+    expect(restored.hasCompletedManagedBookFullCheck('account-a'), isTrue);
+    expect(restored.hasCompletedManagedBookFullCheck('account-b'), isFalse);
   });
 
   test('incremental snapshot includes only changed documents', () async {
