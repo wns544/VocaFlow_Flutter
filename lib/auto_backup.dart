@@ -18,6 +18,33 @@ enum InitialSyncChoice { cloudReplace, merge }
 int _encodedPayloadSize(Map<String, dynamic> payload) =>
     utf8.encode(jsonEncode(payload)).length;
 
+/// Runs a non-learning sync channel without allowing its failure to skip the
+/// learning-state channel. Callers can continue their learning-state work
+/// when this returns false.
+@visibleForTesting
+Future<bool> isolateNonLearningSyncFailure({
+  required Future<void> Function() operation,
+  required Future<void> Function(Object error, StackTrace stackTrace) onFailure,
+}) async {
+  try {
+    await operation();
+    return true;
+  } catch (error, stackTrace) {
+    await onFailure(error, stackTrace);
+    return false;
+  }
+}
+
+@visibleForTesting
+Future<bool> isolateSettingsSyncFailure({
+  required Future<void> Function() operation,
+  required Future<void> Function(Object error, StackTrace stackTrace) onFailure,
+}) =>
+    isolateNonLearningSyncFailure(
+      operation: operation,
+      onFailure: onFailure,
+    );
+
 /// Learning progress follows the user's backup preference. Account-owned
 /// vocabulary books are different: while signed in, their add/edit/delete
 /// queue always syncs between that account's devices. Neither channel writes
@@ -49,6 +76,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   final BookArchiveStore _archiveStore = BookArchiveStore();
 
   Timer? _timer;
+  Timer? _remoteRetryTimer;
   int? _scheduledGeneration;
   bool _scheduledIsRetry = false;
   int? _failedGeneration;
@@ -63,11 +91,23 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   Future<void>? _webInitialSync;
   Future<void>? _accountPreparation;
   String? _preparedAccountId;
-  StreamSubscription<Map<String, dynamic>?>? _signalSubscription;
+  StreamSubscription<Map<String, dynamic>?>? _learningSignalSubscription;
+  StreamSubscription<Map<String, dynamic>?>? _bookSignalSubscription;
+  StreamSubscription<Map<String, dynamic>?>? _settingsSignalSubscription;
   bool _foreground = true;
-  bool _remotePending = false;
+  bool _drainingRemote = false;
+  String? _pendingLearningSignal;
+  String? _pendingBookSignal;
+  String? _pendingSettingsSignal;
+  String? _handledLearningSignal;
+  String? _handledBookSignal;
+  String? _handledSettingsSignal;
   bool _forceFullManagedBookPull = false;
-  String? _lastSignal;
+
+  bool get _hasRemotePending =>
+      _pendingLearningSignal != null ||
+      _pendingBookSignal != null ||
+      _pendingSettingsSignal != null;
 
   bool get isUploading => _syncing && !_downloading;
   bool get isDownloading => _downloading;
@@ -128,32 +168,129 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   }
 
   Future<void> _watchRemoteChanges() async {
-    await _signalSubscription?.cancel();
+    await Future.wait([
+      if (_learningSignalSubscription != null)
+        _learningSignalSubscription!.cancel(),
+      if (_bookSignalSubscription != null) _bookSignalSubscription!.cancel(),
+      if (_settingsSignalSubscription != null)
+        _settingsSignalSubscription!.cancel(),
+    ]);
     if (!_foreground || user == null) return;
     final deviceId = await store.cloudChanges.deviceId();
-    _signalSubscription = cloud.watchSyncSignal().listen((signal) {
+    _learningSignalSubscription =
+        cloud.watchLearningSyncSignal().listen((signal) {
       if (signal == null || signal['deviceId'] == deviceId) return;
-      // Builds predating the managed-book manifest did not publish a book
-      // revision. A full pull on those remote signals keeps mixed-version
-      // devices correct while current builds stay incremental.
-      if (!signal.containsKey('bookRevision')) {
-        _forceFullManagedBookPull = true;
+      final token = '${signal['deviceId']}/${signal['revision']}';
+      if (_handledLearningSignal == token || _pendingLearningSignal == token) {
+        return;
       }
-      final token =
-          '${signal['deviceId']}/${signal['revision']}/${signal['bookRevision']}';
-      if (_lastSignal == token) return;
-      _lastSignal = token;
-      _remotePending = true;
+      _pendingLearningSignal = token;
       unawaited(_drainRemoteChanges());
     }, onError: (Object error) {
-      unawaited(_recordFailure(error, '실시간 변경 확인'));
+      unawaited(_recordFailure(error, '학습 변경 확인'));
     });
+    _bookSignalSubscription =
+        cloud.watchManagedBookSyncSignal().listen((signal) {
+      if (signal == null || signal['deviceId'] == deviceId) return;
+      final token = '${signal['deviceId']}/${signal['bookRevision']}';
+      if (_handledBookSignal == token || _pendingBookSignal == token) return;
+      _pendingBookSignal = token;
+      unawaited(_drainRemoteChanges());
+    }, onError: (Object error) {
+      unawaited(_recordFailure(error, '단어장 변경 확인'));
+    });
+    _settingsSignalSubscription =
+        cloud.watchSettingsSyncSignal().listen((signal) {
+      if (signal == null || signal['deviceId'] == deviceId) return;
+      final token = '${signal['deviceId']}/${signal['revision']}';
+      if (_handledSettingsSignal == token || _pendingSettingsSignal == token) {
+        return;
+      }
+      _pendingSettingsSignal = token;
+      unawaited(_drainRemoteChanges());
+    }, onError: (Object error) {
+      unawaited(store.cloudChanges.recordSettingsFailure(error));
+    });
+    if (_hasRemotePending) unawaited(_drainRemoteChanges());
   }
 
   Future<void> _drainRemoteChanges() async {
-    if (!_remotePending || _syncing || !_foreground) return;
-    _remotePending = false;
-    await mergeFromCloud(uploadMerged: false, reason: '다른 기기의 변경');
+    if (_drainingRemote || _syncing || !_foreground) return;
+    _drainingRemote = true;
+    try {
+      while (_foreground && !_syncing) {
+        final learning = _pendingLearningSignal;
+        if (learning != null) {
+          final succeeded = await mergeFromCloud(
+            uploadMerged: false,
+            pullManagedBooks: false,
+            reason: '다른 기기의 학습 변경',
+          );
+          if (!succeeded) {
+            _scheduleRemoteRetry();
+            return;
+          }
+          _handledLearningSignal = learning;
+          if (_pendingLearningSignal == learning) {
+            _pendingLearningSignal = null;
+          }
+          continue;
+        }
+        final settings = _pendingSettingsSignal;
+        if (settings != null) {
+          final succeeded = await _pullRemoteSettings();
+          if (!succeeded) {
+            _scheduleRemoteRetry();
+            return;
+          }
+          _handledSettingsSignal = settings;
+          if (_pendingSettingsSignal == settings) {
+            _pendingSettingsSignal = null;
+          }
+          continue;
+        }
+        final books = _pendingBookSignal;
+        if (books != null) {
+          final succeeded = await mergeFromCloud(
+            uploadMerged: false,
+            pullManagedBooks: true,
+            pullLearningState: false,
+            reason: '다른 기기의 단어장 변경',
+          );
+          if (!succeeded) {
+            _scheduleRemoteRetry();
+            return;
+          }
+          _handledBookSignal = books;
+          if (_pendingBookSignal == books) _pendingBookSignal = null;
+          continue;
+        }
+        return;
+      }
+    } finally {
+      _drainingRemote = false;
+    }
+  }
+
+  void _scheduleRemoteRetry() {
+    _remoteRetryTimer?.cancel();
+    _remoteRetryTimer = Timer(const Duration(minutes: 1), () {
+      _remoteRetryTimer = null;
+      unawaited(_drainRemoteChanges());
+    });
+  }
+
+  Future<bool> _pullRemoteSettings() async {
+    if (_syncing || !_foreground) return false;
+    _syncing = true;
+    try {
+      return await _syncSettingsWithoutBlockingLearning(
+        reason: '다른 기기의 설정 변경',
+      );
+    } finally {
+      _syncing = false;
+      onChanged?.call();
+    }
   }
 
   void start() {
@@ -166,13 +303,25 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         FirebaseAuth.instance.authStateChanges().listen((current) {
       learningStateVerified = false;
       _cancelScheduledUpload();
-      _lastSignal = null;
+      _remoteRetryTimer?.cancel();
+      _remoteRetryTimer = null;
+      _pendingLearningSignal = null;
+      _pendingBookSignal = null;
+      _pendingSettingsSignal = null;
+      _handledLearningSignal = null;
+      _handledBookSignal = null;
+      _handledSettingsSignal = null;
       _webInitialSync = null;
-      unawaited(_signalSubscription?.cancel());
+      unawaited(_learningSignalSubscription?.cancel());
+      unawaited(_bookSignalSubscription?.cancel());
+      unawaited(_settingsSignalSubscription?.cancel());
       if (current != null) {
         unawaited(() async {
           await _prepareAccount();
-          await _syncSettings(reason: '계정 연결');
+          // Settings are an independent channel. A missing rule, temporary
+          // permission failure, or malformed settings document must never
+          // prevent the user's learning progress from being merged/uploaded.
+          await _syncSettingsWithoutBlockingLearning(reason: '계정 연결');
           // A web browser has its own local cache. It must select that
           // account's cache before it reads cloud state; otherwise the later
           // account activation can restore stale browser data over the merge.
@@ -223,8 +372,11 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       store.onBeforeBookMutation = null;
     }
     _cancelScheduledUpload();
+    _remoteRetryTimer?.cancel();
     _authSubscription?.cancel();
-    _signalSubscription?.cancel();
+    _learningSignalSubscription?.cancel();
+    _bookSignalSubscription?.cancel();
+    _settingsSignalSubscription?.cancel();
   }
 
   Future<bool> hasCloudBackup() => cloud.hasLearningState();
@@ -366,28 +518,67 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   }
 
   Future<void> manualFullUpload() async {
+    await _prepareAccount();
     final current = user;
     if (current == null) throw StateError('Google login is required.');
     if (_syncing) {
       throw StateError('다른 동기화가 진행 중입니다. 잠시 후 다시 시도해 주세요.');
     }
-    await store.cloudChanges.markAll({
-      for (final book in store.books.where((book) => book.id != 'default'))
-        book.id: book.words.map((word) => word.id),
-    });
+    // This action is deliberately learning-state-only. Marking every book as
+    // edited here made a harmless stale book revision block session backup,
+    // despite the settings screen promising that card data was untouched.
+    _cancelScheduledUpload();
     await store.cloudChanges.markLearningState();
-    await _uploadPending(reason: '이 기기 데이터 내보내기');
-    if (store.cloudChanges.learningStateDirty ||
-        store.cloudChanges.managedBookContentDirty ||
-        store.cloudChanges.archiveContentDirty) {
-      throw StateError('클라우드 업로드가 완료되지 않았습니다. 네트워크를 확인한 뒤 다시 시도해 주세요.');
+    _syncing = true;
+    try {
+      if (!await _networkAllowed()) {
+        throw StateError('선택한 네트워크에 연결되어 있지 않습니다.');
+      }
+      // This is the explicit emergency-safe learning upload. It deliberately
+      // bypasses settings, managed-book and archive queues so an unrelated
+      // conflict can never strand the current card/session state.
+      await _pullLearningState(
+        reason: '이 기기 학습 데이터 선행 병합',
+        ownsGate: true,
+        pullManagedBooks: false,
+      );
+      await _sendLearningState(reason: '이 기기 학습 데이터 업로드');
+      if (store.cloudChanges.learningStateDirty) {
+        throw StateError('클라우드 업로드가 완료되지 않았습니다. 네트워크를 확인한 뒤 다시 시도해 주세요.');
+      }
+    } finally {
+      _syncing = false;
+      onChanged?.call();
+      if (_hasRemotePending) unawaited(_drainRemoteChanges());
     }
   }
 
   Future<void> manualRestore() async {
+    await _prepareAccount();
     final current = user;
     if (current == null) throw StateError('Google login is required.');
-    await _pullLearningState(reason: '클라우드 데이터 가져오기');
+    if (_syncing) {
+      throw StateError('다른 동기화가 진행 중입니다. 잠시 후 다시 시도해 주세요.');
+    }
+    // This action promises to merge learning progress only. A pending
+    // managed-book edit can conflict independently and must never prevent a
+    // user from recovering a newer session/tombstone from another device.
+    _cancelScheduledUpload();
+    _syncing = true;
+    try {
+      if (!await _networkAllowed()) {
+        throw StateError('선택한 네트워크에 연결되어 있지 않습니다.');
+      }
+      await _pullLearningState(
+        reason: '클라우드 학습 데이터 가져오기',
+        ownsGate: true,
+        pullManagedBooks: false,
+      );
+    } finally {
+      _syncing = false;
+      onChanged?.call();
+      if (_hasRemotePending) unawaited(_drainRemoteChanges());
+    }
   }
 
   Future<void> manualManagedBookRefresh() async {
@@ -411,19 +602,79 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       _downloading = false;
       _syncing = false;
       onChanged?.call();
-      if (_remotePending) unawaited(_drainRemoteChanges());
+      if (_hasRemotePending) unawaited(_drainRemoteChanges());
     }
   }
 
-  Future<void> mergeFromCloud({
+  Future<void> discardPendingManagedBookChangesAndRefresh() async {
+    await _prepareAccount();
+    final current = user;
+    if (current == null) throw StateError('Google login is required.');
+    if (_syncing) {
+      throw StateError('다른 동기화가 진행 중입니다. 잠시 후 다시 시도해 주세요.');
+    }
+    final discarded = store.cloudChanges.snapshot;
+    if (!store.cloudChanges.managedBookContentDirty) return;
+    _cancelScheduledUpload();
+    _syncing = true;
+    _downloading = true;
+    try {
+      if (!await _networkAllowed()) {
+        throw StateError('선택한 네트워크에 연결되어 있지 않습니다.');
+      }
+      final dirtyBookIds = <String>{
+        ...discarded.bookIds,
+        ...discarded.wordIdsByBook.keys,
+        ...discarded.deletedWordIdsByBook.keys,
+        ...discarded.deletedBookIds,
+      }..remove('default');
+      // "Discard" must never mean "destroy the only copy". Preserve every
+      // locally dirty book on the server before its journal is cleared and the
+      // account copy is downloaded. If this archive upload fails, the discard
+      // is aborted and the local edit queue remains intact.
+      for (final bookId in dirtyBookIds) {
+        await _archiveBeforeBookMutation(bookId, 'discard_pending');
+      }
+      await _sendPendingArchives(reason: '로컬 단어장 대기 폐기 전 복원본 보관');
+      // The user explicitly chose the server copy. Clear only the managed-book
+      // journal; settings, learning state and restore archives remain queued.
+      await store.cloudChanges.acknowledgeManagedBookContent(discarded);
+      if (store.cloudChanges.managedBookContentDirty) {
+        throw StateError('단어장이 다시 변경되어 폐기하지 않았습니다. 다시 시도해 주세요.');
+      }
+      await _pullManagedBooks(
+        reason: '로컬 단어장 대기 폐기 후 서버본 복원',
+        forceFull: true,
+      );
+      await store.cloudChanges.recordDownload(current.uid, _now());
+      await store.cloudChanges.recordSuccess(current.uid, _now());
+      _lastSuccessAt = _now();
+    } catch (error, stackTrace) {
+      await _recordFailure(
+        error,
+        '로컬 단어장 대기 폐기',
+        stackTrace: stackTrace,
+      );
+      rethrow;
+    } finally {
+      _downloading = false;
+      _syncing = false;
+      onChanged?.call();
+      if (_hasRemotePending) unawaited(_drainRemoteChanges());
+    }
+  }
+
+  Future<bool> mergeFromCloud({
     bool uploadMerged = true,
     bool pullManagedBooks = true,
+    bool pullLearningState = true,
     String reason = '클라우드 확인',
   }) async {
     await _prepareAccount();
-    if (!accountBookSyncEnabled || _syncing) return;
+    if (!accountBookSyncEnabled || _syncing) return false;
     learningStateVerified = false;
     _syncing = true;
+    var succeeded = false;
     try {
       final current = user;
       if (current != null)
@@ -441,23 +692,28 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       if (store.cloudChanges.managedBookContentDirty) {
         await _sendManagedBookContent(reason: '$reason · 로컬 단어장 반영');
       }
-      if (enabled && initialized) {
+      if (pullLearningState && enabled && initialized) {
         await _pullLearningState(
             reason: reason, ownsGate: true, pullManagedBooks: false);
       }
-      if (enabled &&
+      if (pullLearningState &&
+          enabled &&
           initialized &&
           uploadMerged &&
           store.cloudChanges.learningStateDirty) {
         await _sendLearningState(reason: '$reason · 병합 반영');
       }
-    } catch (error) {
-      await _recordFailure(error, reason);
+      succeeded = true;
+    } catch (error, stackTrace) {
+      await _recordFailure(error, reason, stackTrace: stackTrace);
     } finally {
       _syncing = false;
       onChanged?.call();
-      if (_remotePending) unawaited(_drainRemoteChanges());
+      if (_hasRemotePending && !_drainingRemote) {
+        unawaited(_drainRemoteChanges());
+      }
     }
+    return succeeded;
   }
 
   void requestImmediateBackup({bool ignoreMinimumInterval = false}) =>
@@ -580,7 +836,8 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
             !store.cloudChanges.settingsDirty &&
             !store.cloudChanges.profileDirty &&
             !store.cloudChanges.dictionaryOpenSettingDirty &&
-            !store.cloudChanges.managedBookContentDirty)) return;
+            !store.cloudChanges.managedBookContentDirty &&
+            !store.cloudChanges.archiveContentDirty)) return;
     // This lock is intentionally set before checkConnectivity awaits.
     _syncing = true;
     final settingsWerePending = store.cloudChanges.settingsDirty;
@@ -608,19 +865,51 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       if (!networkAllowed) {
         throw StateError('선택한 네트워크에 연결되어 있지 않습니다.');
       }
-      await _syncSettings(reason: reason);
+      var settingsSucceeded = true;
+      if (settingsWerePending) {
+        settingsSucceeded =
+            await _syncSettingsWithoutBlockingLearning(reason: reason);
+      }
       // A settings-only edit must stay small and must never wake the learning
       // merge path. Card state, sessions and books are unrelated documents.
-      if (onlySettingsWerePending) return;
-      // Only a pending book edit needs a fresh whole-book read. Study progress
-      // is stored separately, so fetching every card before each 15-second
-      // learning-state backup causes avoidable card-navigation jank.
-      if (store.cloudChanges.managedBookContentDirty) {
-        await _pullManagedBooks(reason: '$reason · 선행 단어장 확인');
+      if (onlySettingsWerePending) {
+        if (!settingsSucceeded) {
+          throw StateError('설정 동기화에 실패했습니다. 학습 기록에는 영향이 없습니다.');
+        }
+        return;
       }
-      await _sendPendingArchives(reason: '$reason · 복원본 보관');
-      if (store.cloudChanges.managedBookContentDirty) {
-        await _sendManagedBookContent(reason: reason);
+      Object? contentSyncError;
+      StackTrace? contentSyncStackTrace;
+      final contentWasPending = store.cloudChanges.managedBookContentDirty ||
+          store.cloudChanges.archiveContentDirty;
+      if (contentWasPending) {
+        await isolateNonLearningSyncFailure(
+          operation: () async {
+            // Only a pending book edit needs a fresh whole-book read. Study
+            // progress is stored separately, so a book conflict must not skip
+            // the independent learning-state upload below.
+            if (store.cloudChanges.managedBookContentDirty) {
+              await _pullManagedBooks(reason: '$reason · 선행 단어장 확인');
+            }
+            await _sendPendingArchives(reason: '$reason · 복원본 보관');
+            if (store.cloudChanges.managedBookContentDirty) {
+              await _sendManagedBookContent(reason: reason);
+            }
+          },
+          onFailure: (error, stackTrace) async {
+            contentSyncError = error;
+            contentSyncStackTrace = stackTrace;
+            await store.cloudChanges.recordLog(
+              '$reason · 단어장/복원본 동기화 실패 · 학습 기록 동기화는 계속 진행',
+            );
+            await store.cloudChanges
+                .recordDiagnostic('content_sync_failed', data: {
+              'reason': reason,
+              'error': error.toString(),
+              'learningContinues': true,
+            });
+          },
+        );
       }
       if (enabled && initialized) {
         await _pullLearningState(
@@ -629,12 +918,20 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       if (enabled && initialized && store.cloudChanges.learningStateDirty) {
         await _sendLearningState(reason: reason);
       }
+      if (contentSyncError != null) {
+        Error.throwWithStackTrace(
+          contentSyncError!,
+          contentSyncStackTrace ?? StackTrace.current,
+        );
+      }
       _failureCount = 0;
       _failedGeneration = null;
       _retryBudgetExhausted = false;
     } catch (error, stackTrace) {
       failed = true;
-      if (settingsWerePending && store.cloudChanges.settingsDirty) {
+      if (settingsWerePending &&
+          store.cloudChanges.settingsDirty &&
+          store.cloudChanges.settingsLastError == null) {
         await store.cloudChanges.recordSettingsFailure(error);
       }
       await _recordFailure(error, reason, stackTrace: stackTrace);
@@ -661,7 +958,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         });
       }
       onChanged?.call();
-      if (_remotePending) unawaited(_drainRemoteChanges());
+      if (_hasRemotePending) unawaited(_drainRemoteChanges());
     }
   }
 
@@ -727,6 +1024,29 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       await store.cloudChanges.recordLog('$reason · 설정 저장 완료');
     }
   }
+
+  /// Settings failures are recorded on the settings queue but do not escape
+  /// into the learning-state channel. This is deliberately used during login
+  /// and mixed uploads so a settings outage cannot strand card/session data.
+  Future<bool> _syncSettingsWithoutBlockingLearning({
+    required String reason,
+  }) =>
+      isolateSettingsSyncFailure(
+        operation: () => _syncSettings(reason: reason),
+        onFailure: (error, stackTrace) async {
+          await store.cloudChanges.recordSettingsFailure(error);
+          await store.cloudChanges.recordLog(
+            '$reason · 설정 동기화 실패 · 학습 기록 동기화는 계속 진행',
+          );
+          await store.cloudChanges
+              .recordDiagnostic('settings_sync_failed', data: {
+            'reason': reason,
+            'error': error.toString(),
+            'learningContinues': true,
+            'stackTrace': stackTrace.toString(),
+          });
+        },
+      );
 
   Future<void> _sendManagedBookContent({required String reason}) async {
     if (!store.cloudChanges.managedBookContentDirty) return;
@@ -1001,6 +1321,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     ];
     _failureCount++;
     final retryable = store.cloudChanges.learningStateDirty ||
+        store.cloudChanges.settingsDirty ||
         store.cloudChanges.archiveContentDirty ||
         (store.cloudChanges.managedBookContentDirty &&
             error is! ManagedBookConflictException);
@@ -1060,7 +1381,9 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     } else if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
       _foreground = false;
-      unawaited(_signalSubscription?.cancel());
+      unawaited(_learningSignalSubscription?.cancel());
+      unawaited(_bookSignalSubscription?.cancel());
+      unawaited(_settingsSignalSubscription?.cancel());
       unawaited(
           store.cloudChanges.recordLog('앱 백그라운드 · learningState 즉시 전송 시도'));
       unawaited(flushPendingBackup());

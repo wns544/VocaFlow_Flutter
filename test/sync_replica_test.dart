@@ -50,6 +50,35 @@ void main() {
     expect(a.recovery.values.any((r) => r['clock'] == 100), isTrue);
   });
 
+  test('two phones keep study progress made on different cards', () {
+    final initial = {
+      'word/book/1': {'state': 'fresh'},
+      'word/book/2': {'state': 'fresh'},
+    };
+    final a = SyncReplica('a')..seed(initial);
+    final b = SyncReplica('b')..seed(initial);
+
+    a.capture({
+      'word/book/1': {'state': 'memorized'},
+      'word/book/2': {'state': 'fresh'},
+      'completed/["book",[1]]': true,
+    }, nowMicros: 100);
+    b.capture({
+      'word/book/1': {'state': 'fresh'},
+      'word/book/2': {'state': 'review'},
+      'completed/["book",[2]]': true,
+    }, nowMicros: 200);
+
+    a.merge(b.toJson());
+    b.merge(a.toJson());
+
+    expect(a.values['word/book/1'], {'state': 'memorized'});
+    expect(a.values['word/book/2'], {'state': 'review'});
+    expect(a.values['completed/["book",[1]]'], isTrue);
+    expect(a.values['completed/["book",[2]]'], isTrue);
+    expect(b.values, a.values);
+  });
+
   test('remote memorized state cannot resurrect after reset', () async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();

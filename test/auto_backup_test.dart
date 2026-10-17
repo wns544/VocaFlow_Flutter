@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:vocaflow/auto_backup.dart';
 import 'package:vocaflow/backup_merge.dart';
 import 'package:vocaflow/cloud_change_tracker.dart';
 import 'package:vocaflow/cloud_backup.dart';
@@ -31,6 +32,48 @@ void main() {
     );
 
     expect(changed, isEmpty);
+  });
+
+  test('settings failure is isolated so learning sync can continue', () async {
+    Object? recordedError;
+    final succeeded = await isolateSettingsSyncFailure(
+      operation: () async => throw StateError('permission-denied'),
+      onFailure: (error, _) async => recordedError = error,
+    );
+
+    expect(succeeded, isFalse);
+    expect(recordedError, isA<StateError>());
+  });
+
+  test('successful settings sync reports success to the learning caller',
+      () async {
+    var failureCalled = false;
+    final succeeded = await isolateSettingsSyncFailure(
+      operation: () async {},
+      onFailure: (_, __) async => failureCalled = true,
+    );
+
+    expect(succeeded, isTrue);
+    expect(failureCalled, isFalse);
+  });
+
+  test('managed-book failure can be isolated from learning sync', () async {
+    Object? recordedError;
+    var learningUploadRan = false;
+
+    final contentSucceeded = await isolateNonLearningSyncFailure(
+      operation: () async => throw const ManagedBookConflictException(
+        'book',
+        31,
+        32,
+      ),
+      onFailure: (error, _) async => recordedError = error,
+    );
+    if (!contentSucceeded) learningUploadRan = true;
+
+    expect(contentSucceeded, isFalse);
+    expect(recordedError, isA<ManagedBookConflictException>());
+    expect(learningUploadRan, isTrue);
   });
 
   test('first full managed-book check is remembered per account', () async {
@@ -127,6 +170,23 @@ void main() {
     final restored = await CloudChangeTracker.load();
 
     expect(restored.pendingCount, 0);
+  });
+
+  test('discarding managed-book work preserves independent sync queues',
+      () async {
+    final tracker = await CloudChangeTracker.load();
+    await tracker.markBook('stale-book');
+    await tracker.markWord('stale-book', 7);
+    await tracker.markSettings({'card.wordFontSize'});
+    await tracker.markArchive('recovery-point');
+    await tracker.markLearningState();
+
+    await tracker.acknowledgeManagedBookContent(tracker.snapshot);
+
+    expect(tracker.managedBookContentDirty, isFalse);
+    expect(tracker.settingsDirty, isTrue);
+    expect(tracker.archiveContentDirty, isTrue);
+    expect(tracker.learningStateDirty, isTrue);
   });
 
   test('merge keeps cloud conflicts and appends local-only words', () {

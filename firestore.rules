@@ -45,5 +45,8 @@ service cloud.firestore {
     match /users/{uid}/profile/{documentId} {
       allow read, write: if owner(uid);
     }
+    match /users/{uid}/settings/{documentId} {
+      allow read, write: if owner(uid);
+    }
   }
 }

@@ -1323,6 +1323,19 @@ void main() {
 
     await tester
         .ensureVisible(find.byKey(const ValueKey('open-chatgpt-kanji')));
+    final wordQuestionCenter =
+        tester.getCenter(find.byKey(const ValueKey('open-chatgpt-word')));
+    final meaningQuestionCenter = tester
+        .getCenter(find.byKey(const ValueKey('open-chatgpt-meaning-origin')));
+    final examplesQuestionCenter =
+        tester.getCenter(find.byKey(const ValueKey('open-chatgpt-examples')));
+    final kanjiQuestionCenter =
+        tester.getCenter(find.byKey(const ValueKey('open-chatgpt-kanji')));
+    expect(wordQuestionCenter.dx, lessThan(meaningQuestionCenter.dx));
+    expect(wordQuestionCenter.dy, closeTo(meaningQuestionCenter.dy, 1));
+    expect(examplesQuestionCenter.dx, lessThan(kanjiQuestionCenter.dx));
+    expect(examplesQuestionCenter.dy, closeTo(kanjiQuestionCenter.dy, 1));
+    expect(wordQuestionCenter.dy, lessThan(examplesQuestionCenter.dy));
     final callsBeforeKanjiQuestion = externalCalls.length;
     await tester.tap(find.byKey(const ValueKey('open-chatgpt-kanji')));
     await tester.pump(const Duration(milliseconds: 100));
@@ -1397,6 +1410,21 @@ void main() {
     expect(find.byKey(const ValueKey('open-chatgpt-meaning-origin')),
         findsOneWidget);
     expect(find.byKey(const ValueKey('open-chatgpt-kanji')), findsNothing);
+    expect(find.byKey(const ValueKey('open-chatgpt-kanji-placeholder')),
+        findsOneWidget);
+    final wordQuestionCenter =
+        tester.getCenter(find.byKey(const ValueKey('open-chatgpt-word')));
+    final meaningQuestionCenter = tester
+        .getCenter(find.byKey(const ValueKey('open-chatgpt-meaning-origin')));
+    final examplesQuestionCenter =
+        tester.getCenter(find.byKey(const ValueKey('open-chatgpt-examples')));
+    final placeholderCenter = tester.getCenter(
+        find.byKey(const ValueKey('open-chatgpt-kanji-placeholder')));
+    expect(wordQuestionCenter.dx, lessThan(meaningQuestionCenter.dx));
+    expect(wordQuestionCenter.dy, closeTo(meaningQuestionCenter.dy, 1));
+    expect(examplesQuestionCenter.dx, lessThan(placeholderCenter.dx));
+    expect(examplesQuestionCenter.dy, closeTo(placeholderCenter.dy, 1));
+    expect(wordQuestionCenter.dy, lessThan(examplesQuestionCenter.dy));
     expect(find.byKey(const ValueKey('open-naver-hanja')), findsNothing);
   });
 

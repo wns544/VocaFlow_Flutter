@@ -4781,13 +4781,6 @@ class _ChatGptQuestionSection extends StatelessWidget {
             crossAxisSpacing: 8,
             childAspectRatio: 2.45,
             children: [
-              if (showKanjiQuestion)
-                _ChatGptQuestionButton(
-                  key: const ValueKey('open-chatgpt-kanji'),
-                  icon: Icons.translate,
-                  label: '이 한자를 질문',
-                  onPressed: onKanjiQuestion,
-                ),
               _ChatGptQuestionButton(
                 key: const ValueKey('open-chatgpt-word'),
                 icon: Icons.auto_awesome,
@@ -4806,6 +4799,17 @@ class _ChatGptQuestionSection extends StatelessWidget {
                 label: '예문 10개',
                 onPressed: onExamplesQuestion,
               ),
+              if (showKanjiQuestion)
+                _ChatGptQuestionButton(
+                  key: const ValueKey('open-chatgpt-kanji'),
+                  icon: Icons.translate,
+                  label: '이 한자를 질문',
+                  onPressed: onKanjiQuestion,
+                )
+              else
+                const SizedBox(
+                  key: ValueKey('open-chatgpt-kanji-placeholder'),
+                ),
             ],
           ),
         ],
@@ -7381,7 +7385,7 @@ class _SettingsPageState extends State<SettingsPage> {
     try {
       final path = await FilePicker.platform.saveFile(
         dialogTitle: '단어장 Excel로 내보내기',
-        fileName: '.xlsx',
+        fileName: '${safeName.isEmpty ? '단어장' : safeName}.xlsx',
         type: FileType.custom,
         allowedExtensions: const ['xlsx'],
         bytes: createWordBookXlsx(book),
@@ -7470,6 +7474,26 @@ class _SettingsPageState extends State<SettingsPage> {
       await coordinator.manualManagedBookRefresh();
       widget.refresh();
       _showSnack('서버 단어장 전체 확인을 완료했습니다.');
+    });
+  }
+
+  Future<void> discardPendingManagedBookChanges() async {
+    final confirmed = await _confirm(
+      title: '로컬 단어장 전송 대기를 버릴까요?',
+      message:
+          '이 기기의 낡은 단어장 수정 대기만 삭제하고 현재 서버 단어장을 다시 가져옵니다. 학습 진도, 오답, 진행 중 세션과 사용자 설정은 유지됩니다.',
+      action: '대기 버리기',
+      destructive: true,
+    );
+    if (!confirmed) return;
+    await _runCloudTask(() async {
+      final coordinator = widget.autoBackup;
+      if (coordinator == null) {
+        throw StateError('동기화 준비가 끝나지 않았습니다. 잠시 후 다시 시도해 주세요.');
+      }
+      await coordinator.discardPendingManagedBookChangesAndRefresh();
+      widget.refresh();
+      _showSnack('낡은 단어장 전송 대기를 버리고 서버본을 가져왔습니다.');
     });
   }
 
@@ -7942,7 +7966,7 @@ class _SettingsPageState extends State<SettingsPage> {
                       onPressed:
                           user == null || syncing ? null : _uploadSyncLog,
                       icon: const Icon(Icons.cloud_upload_outlined, size: 17),
-                      label: const Text('수동 서버 전송'),
+                      label: const Text('진단 로그 전송'),
                     ),
                   ),
                 ]),
@@ -8006,6 +8030,29 @@ class _SettingsPageState extends State<SettingsPage> {
                     ),
                   ),
                 ),
+                if (auto?.store.cloudChanges.managedBookContentDirty ==
+                    true) ...[
+                  const SizedBox(height: 10),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 44,
+                    child: OutlinedButton.icon(
+                      key: const ValueKey('discard-managed-book-changes'),
+                      onPressed: syncing || user == null
+                          ? null
+                          : discardPendingManagedBookChanges,
+                      icon: const Icon(Icons.delete_sweep_outlined, size: 18),
+                      label: const Text('낡은 단어장 전송 대기 버리기'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.redAccent,
+                        side: const BorderSide(color: Color(0xFFFFCDD2)),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 10),
                 SizedBox(
                   width: double.infinity,

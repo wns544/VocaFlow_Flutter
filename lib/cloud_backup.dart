@@ -1,7 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
-
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
@@ -238,11 +236,30 @@ class CloudBackup {
       .collection('users')
       .doc(_user.uid)
       .collection('learningStateV2');
-  DocumentReference<Map<String, dynamic>> get _syncSignal => firestore
+  // Keep each sync channel on its own document. A shared document used to let
+  // a book notification replace the device id attached to a learning
+  // revision, which could make another phone ignore that revision.
+  DocumentReference<Map<String, dynamic>> get _legacySyncSignal => firestore
       .collection('users')
       .doc(_user.uid)
       .collection('syncSignals')
       .doc('main');
+  DocumentReference<Map<String, dynamic>> get _learningSyncSignal => firestore
+      .collection('users')
+      .doc(_user.uid)
+      .collection('syncSignals')
+      .doc('learning');
+  DocumentReference<Map<String, dynamic>> get _managedBookSyncSignal =>
+      firestore
+          .collection('users')
+          .doc(_user.uid)
+          .collection('syncSignals')
+          .doc('managedBookChanges');
+  DocumentReference<Map<String, dynamic>> get _settingsSyncSignal => firestore
+      .collection('users')
+      .doc(_user.uid)
+      .collection('syncSignals')
+      .doc('settings');
   DocumentReference<Map<String, dynamic>> get _managedBookManifest => firestore
       .collection('users')
       .doc(_user.uid)
@@ -250,15 +267,24 @@ class CloudBackup {
       .doc('managedBooks');
   final Map<String, Map<String, dynamic>> _syncPayloadCache = {};
 
-  Stream<Map<String, dynamic>?> watchSyncSignal() =>
-      _syncSignal.snapshots().map((event) => event.data());
+  Stream<Map<String, dynamic>?> watchLegacySyncSignal() =>
+      _legacySyncSignal.snapshots().map((event) => event.data());
+
+  Stream<Map<String, dynamic>?> watchLearningSyncSignal() =>
+      _learningSyncSignal.snapshots().map((event) => event.data());
+
+  Stream<Map<String, dynamic>?> watchManagedBookSyncSignal() =>
+      _managedBookSyncSignal.snapshots().map((event) => event.data());
+
+  Stream<Map<String, dynamic>?> watchSettingsSyncSignal() =>
+      _settingsSyncSignal.snapshots().map((event) => event.data());
 
   Future<void> publishSyncSignal(String deviceId, String revision) =>
-      _syncSignal.set({
+      _learningSyncSignal.set({
         'deviceId': deviceId,
         'revision': revision,
         'updatedAt': FieldValue.serverTimestamp()
-      }, SetOptions(merge: true));
+      });
 
   /// Imported/user-authored card content. This deliberately never writes the
   /// legacy vocabBooks/*/words documents.
@@ -447,13 +473,12 @@ class CloudBackup {
               'updatedAt': FieldValue.serverTimestamp(),
             });
             transaction.set(
-              _syncSignal,
+              _managedBookSyncSignal,
               {
                 'deviceId': deviceId,
                 'bookRevision': nextGeneration,
                 'updatedAt': FieldValue.serverTimestamp(),
               },
-              SetOptions(merge: true),
             );
           });
         }
@@ -499,13 +524,12 @@ class CloudBackup {
             });
           }
           transaction.set(
-            _syncSignal,
+            _managedBookSyncSignal,
             {
               'deviceId': deviceId,
               'bookRevision': generation,
               'updatedAt': FieldValue.serverTimestamp(),
             },
-            SetOptions(merge: true),
           );
         });
       });
@@ -551,7 +575,10 @@ class CloudBackup {
     CloudChangeSnapshot changes,
   ) =>
       _runCloudOperation(() async {
-        await _uploadIncremental(store, changes, forceProfile: false);
+        // Learning progress belongs exclusively to learningStateV2. The
+        // legacy incremental writer targets the now read-only vocabBooks and
+        // words collections; keeping it here made a permission failure there
+        // abort the independent session upload before V2 was even captured.
         final deviceId = await store.cloudChanges.deviceId();
         final payload = await store.syncV2Snapshot();
         final bytes = await compute(_encodeSyncPayload, payload);
@@ -584,7 +611,18 @@ class CloudBackup {
         final batch = firestore.batch();
         batch.set(head, metadata);
         batch.set(
-          _syncSignal,
+          _learningSyncSignal,
+          {
+            'deviceId': deviceId,
+            'revision': revision,
+            'updatedAt': FieldValue.serverTimestamp()
+          },
+        );
+        // Temporary compatibility signal for phones still running a build
+        // from before the channels were split. Current builds do not use this
+        // mixed document as their source of truth.
+        batch.set(
+          _legacySyncSignal,
           {
             'deviceId': deviceId,
             'revision': revision,
@@ -777,11 +815,31 @@ class CloudBackup {
           }
         }
         if (outgoing.isNotEmpty) {
-          await _settingsRef.set({
-            'schema': 1,
-            'fields': outgoing,
+          final deviceIds = outgoing.values
+              .whereType<Map>()
+              .map((value) => '${value['deviceId'] ?? ''}')
+              .where((value) => value.isNotEmpty)
+              .toSet();
+          final batch = firestore.batch();
+          batch.set(
+              _settingsRef,
+              {
+                'schema': 1,
+                'fields': outgoing,
+                'updatedAt': FieldValue.serverTimestamp(),
+              },
+              SetOptions(merge: true));
+          batch.set(_settingsSyncSignal, {
+            'deviceId': deviceIds.length == 1 ? deviceIds.single : '',
+            'revision': outgoing.values
+                .whereType<Map>()
+                .map(
+                    (value) => (value['updatedAtMicros'] as num?)?.toInt() ?? 0)
+                .fold<int>(
+                    0, (latest, value) => value > latest ? value : latest),
             'updatedAt': FieldValue.serverTimestamp(),
-          }, SetOptions(merge: true));
+          });
+          await batch.commit();
         }
         return SettingsSyncResult(fields: resolved, submitted: local);
       });
@@ -793,151 +851,9 @@ class CloudBackup {
   }) =>
       uploadLearningState(store, changes);
 
-  Future<void> _uploadIncremental(
-    VocaStore store,
-    CloudChangeSnapshot changes, {
-    required bool forceProfile,
-  }) async {
-    if (changes.isEmpty && !forceProfile) return;
-    final backup = store.toBackupJson();
-    if (changes.profileDirty || forceProfile) {
-      await _profileRef.set(
-        _profileData(store, backup),
-        SetOptions(merge: true),
-      );
-    }
-    if (changes.dictionaryOpenSettingDirty) {
-      await _syncDictionaryOpenSetting(store);
-    }
-
-    var operationCount = 0;
-    var batch = firestore.batch();
-    Future<void> commitIfNeeded({bool force = false}) async {
-      if (operationCount == 0 || (!force && operationCount < 450)) return;
-      await batch.commit();
-      batch = firestore.batch();
-      operationCount = 0;
-    }
-
-    final booksById = {for (final book in store.books) book.id: book};
-    for (final bookId in changes.bookIds) {
-      final book = booksById[bookId];
-      if (book == null) continue;
-      batch.set(_booksRef.doc(book.id), _bookData(store, book));
-      operationCount++;
-      await commitIfNeeded();
-    }
-
-    for (final entry in changes.wordIdsByBook.entries) {
-      final book = booksById[entry.key];
-      if (book == null) continue;
-      final wordsById = {for (final word in book.words) word.id: word};
-      for (final wordId in entry.value) {
-        final word = wordsById[wordId];
-        if (word == null) continue;
-        batch.set(
-          _booksRef.doc(book.id).collection('words').doc(word.id.toString()),
-          {
-            ...word.toJson(),
-            'order': book.words.indexOf(word),
-            'updatedAt': FieldValue.serverTimestamp(),
-          },
-        );
-        operationCount++;
-        await commitIfNeeded();
-      }
-    }
-
-    for (final entry in changes.deletedWordIdsByBook.entries) {
-      for (final wordId in entry.value) {
-        batch.delete(
-            _booksRef.doc(entry.key).collection('words').doc('$wordId'));
-        operationCount++;
-        await commitIfNeeded();
-      }
-    }
-    for (final bookId in changes.deletedBookIds) {
-      batch.delete(_booksRef.doc(bookId));
-      operationCount++;
-      await commitIfNeeded();
-    }
-    await commitIfNeeded(force: true);
-  }
-
   Future<void> upload(VocaStore store) async {
     await store.cloudChanges.markLearningState();
     await uploadLearningState(store, store.cloudChanges.snapshot);
-  }
-
-  Future<void> _upload(VocaStore store) async {
-    final backup = store.toBackupJson();
-    final remoteBooks = await _booksRef.get();
-    await _profileRef.set(
-      _profileData(store, backup),
-      SetOptions(merge: true),
-    );
-    await _syncDictionaryOpenSetting(store);
-
-    var operationCount = 0;
-    var batch = firestore.batch();
-    Future<void> commitIfNeeded({bool force = false}) async {
-      if (operationCount == 0 || (!force && operationCount < 450)) return;
-      await batch.commit();
-      batch = firestore.batch();
-      operationCount = 0;
-    }
-
-    for (var bookIndex = 0; bookIndex < store.books.length; bookIndex++) {
-      final book = store.books[bookIndex];
-      final bookRef = _booksRef.doc(book.id);
-      final remoteWords = await bookRef.collection('words').get();
-      final localWordIds = book.words.map((word) => word.id.toString()).toSet();
-      batch.set(bookRef, {
-        'id': book.id,
-        'name': book.name,
-        'isFavorite': book.isFavorite,
-        'order': bookIndex,
-        'sessionOverrides': book.sessionOverrides.map(
-          (key, value) => MapEntry(key.toString(), value.toJson()),
-        ),
-        'wordCount': book.words.length,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
-      operationCount++;
-
-      for (var wordIndex = 0; wordIndex < book.words.length; wordIndex++) {
-        final word = book.words[wordIndex];
-        batch.set(bookRef.collection('words').doc(word.id.toString()), {
-          ...word.toJson(),
-          'order': wordIndex,
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
-        operationCount++;
-        await commitIfNeeded();
-      }
-      for (final remoteWord in remoteWords.docs) {
-        if (localWordIds.contains(remoteWord.id)) continue;
-        batch.delete(remoteWord.reference);
-        operationCount++;
-        await commitIfNeeded();
-      }
-      await commitIfNeeded();
-    }
-
-    final localBookIds = store.books.map((book) => book.id).toSet();
-    for (final remoteBook in remoteBooks.docs) {
-      if (localBookIds.contains(remoteBook.id)) continue;
-      final remoteWords = await remoteBook.reference.collection('words').get();
-      for (final remoteWord in remoteWords.docs) {
-        batch.delete(remoteWord.reference);
-        operationCount++;
-        await commitIfNeeded();
-      }
-      batch.delete(remoteBook.reference);
-      operationCount++;
-      await commitIfNeeded();
-    }
-    await commitIfNeeded(force: true);
   }
 
   Future<Map<String, dynamic>> downloadBackupJson() =>
@@ -1138,38 +1054,6 @@ class CloudBackup {
         'favoriteUpdatedAt': data['favoriteUpdatedAt'] as String?,
       };
 
-  Future<void> _syncDictionaryOpenSetting(VocaStore store) async {
-    final local = store.openDictionaryInAppSettingJson;
-    if (local == null) return;
-    final localUpdatedAt = _dictionaryOpenSettingUpdatedAt(local);
-    if (localUpdatedAt == null) return;
-
-    Map<String, dynamic>? newerRemote;
-    await firestore.runTransaction<void>((transaction) async {
-      final snapshot = await transaction.get(_profileRef);
-      final remote = _validDictionaryOpenSetting(
-        snapshot.data()?['openDictionaryInAppSetting'],
-      );
-      final remoteUpdatedAt =
-          remote == null ? null : _dictionaryOpenSettingUpdatedAt(remote);
-      if (remote != null &&
-          remoteUpdatedAt != null &&
-          remoteUpdatedAt.isAfter(localUpdatedAt)) {
-        newerRemote = remote;
-        return;
-      }
-      if (remoteUpdatedAt != null && remoteUpdatedAt == localUpdatedAt) return;
-      transaction.set(
-        _profileRef,
-        {'openDictionaryInAppSetting': local},
-        SetOptions(merge: true),
-      );
-    });
-    if (newerRemote != null) {
-      await store.applyOpenDictionaryInAppSettingFromCloud(newerRemote!);
-    }
-  }
-
   Map<String, dynamic>? _validDictionaryOpenSetting(dynamic raw) {
     if (raw is! Map) return null;
     final setting = Map<String, dynamic>.from(raw);
@@ -1180,44 +1064,4 @@ class CloudBackup {
     if (parsed == null) return null;
     return {'value': value, 'updatedAt': parsed.toIso8601String()};
   }
-
-  DateTime? _dictionaryOpenSettingUpdatedAt(Map<String, dynamic> setting) {
-    final raw = setting['updatedAt'];
-    return raw is String ? DateTime.tryParse(raw)?.toUtc() : null;
-  }
-
-  Map<String, dynamic> _profileData(
-          VocaStore store, Map<String, dynamic> backup) =>
-      {
-        'version': backup['version'],
-        'rangeCourseSchema': backup['rangeCourseSchema'],
-        'rangeCoursePasses': backup['rangeCoursePasses'],
-        'quickBook': backup['quickBook'],
-        'sessionSize': backup['sessionSize'],
-        'completed': backup['completed'],
-        'completedAt': backup['completedAt'],
-        'studyDays': backup['studyDays'],
-        'dailyStudyStats': backup['dailyStudyStats'],
-        'studyEventLog': backup['studyEventLog'],
-        'targetName': backup['targetName'],
-        'targetDate': backup['targetDate'],
-        'activeStudy': backup['activeStudy'],
-        'activeStudies': backup['activeStudies'],
-        'activeStudyTombstones': backup['activeStudyTombstones'],
-        'resetMarkers': backup['resetMarkers'],
-        'bookOrder': store.books.map((book) => book.id).toList(),
-        'updatedAt': FieldValue.serverTimestamp(),
-      };
-
-  Map<String, dynamic> _bookData(VocaStore store, WordBook book) => {
-        'id': book.id,
-        'name': book.name,
-        'isFavorite': book.isFavorite,
-        'order': store.books.indexOf(book),
-        'sessionOverrides': book.sessionOverrides.map(
-          (key, value) => MapEntry(key.toString(), value.toJson()),
-        ),
-        'wordCount': book.words.length,
-        'updatedAt': FieldValue.serverTimestamp(),
-      };
 }
