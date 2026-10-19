@@ -19,12 +19,14 @@ class Word {
   }) : id = id ?? Object.hash(term, meaning, reading);
 
   final int id;
-  final String term;
-  final String meaning;
-  final String reading;
-  final String example;
-  final String exampleMeaning;
-  final String explanation;
+  // The store preserves the canonical card object across content updates;
+  // routes keep its stable identity while learning fields remain independent.
+  String term;
+  String meaning;
+  String reading;
+  String example;
+  String exampleMeaning;
+  String explanation;
   StudyState state;
   int correctCount;
   int wrongCount;

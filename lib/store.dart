@@ -5,7 +5,9 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'cloud_change_tracker.dart';
+import 'card_sync.dart';
 import 'kanji_lookup.dart';
+import 'large_local_store.dart';
 import 'local_word_search.dart';
 import 'models.dart';
 import 'sync_replica.dart';
@@ -402,7 +404,46 @@ class VocaStore {
   String? _activeAccountId;
   late List<WordBook> books;
   late CloudChangeTracker cloudChanges;
+  late CardChangeTracker cardChanges;
   late LocalWordSearchIndex wordSearch;
+  Future<void> _localWrites = Future<void>.value();
+  final Object _mutationZone = Object();
+  String? _decisionEventPrefix;
+  int _decisionEventSequence = 0;
+  final ValueNotifier<int> cardContentRevision = ValueNotifier<int>(0);
+
+  /// A single local writer prevents a remote merge from interleaving with a
+  /// decision's read/modify/write steps. Nested store helpers remain reentrant.
+  Future<T> runLocalMutation<T>(Future<T> Function() action) {
+    if (Zone.current[_mutationZone] == true) return action();
+    final task = _localWrites
+        .then((_) => runZoned(action, zoneValues: {_mutationZone: true}));
+    _localWrites =
+        task.then<void>((_) {}, onError: (Object _, StackTrace __) {});
+    return task;
+  }
+
+  Word? resolveCard(String bookId, int wordId) => books
+      .where((book) => book.id == bookId)
+      .expand((book) => book.words)
+      .where((word) => word.id == wordId)
+      .firstOrNull;
+
+  void _overlayPendingCardFields(Word word, String bookId) {
+    final fields = cardChanges.pendingFields(bookId, word.id);
+    if (fields.containsKey('term')) word.term = fields['term'] as String;
+    if (fields.containsKey('reading'))
+      word.reading = fields['reading'] as String;
+    if (fields.containsKey('meaning'))
+      word.meaning = fields['meaning'] as String;
+    if (fields.containsKey('example'))
+      word.example = fields['example'] as String;
+    if (fields.containsKey('exampleMeaning'))
+      word.exampleMeaning = fields['exampleMeaning'] as String;
+    if (fields.containsKey('explanation'))
+      word.explanation = fields['explanation'] as String;
+  }
+
   void Function()? onSessionCompleted;
 
   /// Installed by the account-sync coordinator. It records a restoration
@@ -427,16 +468,29 @@ class VocaStore {
     final store = VocaStore._(await SharedPreferences.getInstance());
     store.books = store._loadBooks();
     store.cloudChanges = await CloudChangeTracker.load();
-    if (store._activeAccountId != null) {
-      await store.cloudChanges.activateAccount(store._activeAccountId!);
+    store.cardChanges = await CardChangeTracker.load();
+    final savedOwner = store._prefs.getString(_lastActiveAccountKey);
+    if (savedOwner != null) {
+      await store.cloudChanges.activateAccount(savedOwner);
+      await store.cardChanges.activateAccount(savedOwner);
     }
+    // The coordinator already owns the cloud-change callback. Card edits use
+    // the same scheduler but a completely separate durable outbox.
+    store.cardChanges.onChanged = () => store.cloudChanges.onChanged?.call();
     await store._migrateOpenDictionaryInAppSetting();
     await store._migrateMainTab();
     store.wordSearch = LocalWordSearchIndex(() => store.books);
+    for (final book in store.books) {
+      for (final word in book.words) {
+        store._overlayPendingCardFields(word, book.id);
+      }
+    }
+    if (store.cardChanges.isDirty) await store._saveBooks();
     await store._migrateRangeCourses();
     await store._repairSwappedJapaneseFields();
     await store._repairPlaceholderReadingMeaningFields();
     await store._applyVerifiedTextCorrections();
+    await store._recoverLocalDecision();
     await store._loadSyncReplica();
     // A learning-state change must be cheap: card decisions and card flips
     // happen on the UI path.  The replica captures the current local state
@@ -491,14 +545,19 @@ class VocaStore {
   bool get autoPlayPronunciation =>
       _prefs.getBool(_autoPlayPronunciationKey) ?? true;
   String get japaneseFont => _prefs.getString(_japaneseFontKey) ?? 'system';
-  double get termFontSize => _prefs.getDouble(_termFontSizeKey) ?? 32;
-  double get readingFontSize => _prefs.getDouble(_readingFontSizeKey) ?? 14;
-  double get meaningFontSize => _prefs.getDouble(_meaningFontSizeKey) ?? 22;
+  double _doublePreference(String key, double fallback) {
+    final value = _prefs.get(key);
+    return value is num ? value.toDouble() : fallback;
+  }
+
+  double get termFontSize => _doublePreference(_termFontSizeKey, 32);
+  double get readingFontSize => _doublePreference(_readingFontSizeKey, 14);
+  double get meaningFontSize => _doublePreference(_meaningFontSizeKey, 22);
   int get meaningFontWeight => _prefs.getInt(_meaningFontWeightKey) ?? 500;
-  double get meaningOpacity => _prefs.getDouble(_meaningOpacityKey) ?? .70;
-  double get exampleFontSize => _prefs.getDouble(_exampleFontSizeKey) ?? 16;
+  double get meaningOpacity => _doublePreference(_meaningOpacityKey, .70);
+  double get exampleFontSize => _doublePreference(_exampleFontSizeKey, 16);
   double get exampleMeaningFontSize =>
-      _prefs.getDouble(_exampleMeaningFontSizeKey) ?? 14;
+      _doublePreference(_exampleMeaningFontSizeKey, 14);
   String get chatGptConversationUrl =>
       _prefs.getString(_chatGptConversationUrlKey) ?? '';
   String get chatGptWordPromptTemplate =>
@@ -764,6 +823,7 @@ class VocaStore {
     required int previousWrongCount,
     required DateTime? previousLastStudiedAt,
     required DateTime? previousLastWrongAt,
+    String? operationId,
   }) async {
     final day = _dayKey(now);
     final stats = Map<String, DailyStudyStats>.from(dailyStudyStats);
@@ -777,7 +837,8 @@ class VocaStore {
     await _saveDailyStudyStats(stats);
 
     final event = StudyEventLog(
-      id: '${now.microsecondsSinceEpoch}:${bookId ?? 'unknown'}:${word.id}:${decision.name}',
+      id: operationId ??
+          '${now.microsecondsSinceEpoch}:${bookId ?? 'unknown'}:${word.id}:${decision.name}',
       date: day,
       timestamp: now,
       bookId: bookId,
@@ -800,7 +861,8 @@ class VocaStore {
           'wrongCount': decision == StudyState.review ? 1 : 0,
         },
         bookId: bookId,
-        wordId: word.id);
+        wordId: word.id,
+        eventId: operationId);
   }
 
   Future<void> _recordCompletedSessions(
@@ -996,6 +1058,12 @@ class VocaStore {
   }
 
   Future<ActiveStudy?> saveActiveStudyFor(String key, ActiveStudy active,
+          {bool markCloudChange = true, DateTime? expectedUpdatedAt}) =>
+      runLocalMutation(() => _saveActiveStudyFor(key, active,
+          markCloudChange: markCloudChange,
+          expectedUpdatedAt: expectedUpdatedAt));
+
+  Future<ActiveStudy?> _saveActiveStudyFor(String key, ActiveStudy active,
       {bool markCloudChange = true, DateTime? expectedUpdatedAt}) async {
     final studies = Map<String, ActiveStudy>.from(activeStudies);
     final resolvedKey = active.isRangeCourse && active.bookId != null
@@ -1018,6 +1086,43 @@ class VocaStore {
         'memorizedStored': previousActive.memorized,
       }));
       return null;
+    }
+    Map<String, dynamic> progress(ActiveStudy study) {
+      final raw = study.toJson();
+      return {
+        for (final key in [
+          'queueIds',
+          'queueBookIds',
+          'total',
+          'memorized',
+          'reviewed',
+          'sessionIndexes',
+          'bookId',
+          'seenWordIds',
+          'roundNumber',
+          'roundTotal',
+          'roundCompleted',
+          'roundUnknownIds',
+          'roundUnknownBookIds',
+          'sessionSelections',
+          'rangeStart',
+          'rangeEnd',
+          'sourceMode'
+        ])
+          key: raw[key]
+      };
+    }
+
+    if (previousActive != null &&
+        SyncReplica.canonical(progress(previousActive)) ==
+            SyncReplica.canonical(progress(active))) {
+      // Pausing, flipping, or leaving a restored route is a local view save,
+      // not a new learning action. Never give stale progress a fresh clock.
+      final view = ActiveStudy.fromJson(
+          {...previousActive.toJson(), 'revealed': active.revealed});
+      studies[resolvedKey] = view;
+      await _saveActiveStudies(studies);
+      return view;
     }
     final startedAt = active.startedAt ??
         previousActive?.startedAt ??
@@ -1485,7 +1590,8 @@ class VocaStore {
       _exampleMeaningFontSizeKey: exampleMeaning.clamp(10, 26).toDouble(),
     };
     final changed = next.entries
-        .where((entry) => _prefs.getDouble(entry.key) != entry.value)
+        .where(
+            (entry) => _doublePreference(entry.key, double.nan) != entry.value)
         .toList();
     await Future.wait(
         changed.map((entry) => _prefs.setDouble(entry.key, entry.value)));
@@ -1602,13 +1708,16 @@ class VocaStore {
   /// first account adopts the pre-account legacy library once; another account
   /// never inherits it. Progress itself remains account-scoped in Firebase's
   /// dedicated learningState documents.
-  Future<void> activateAccount(String uid) async {
+  Future<void> activateAccount(String uid) =>
+      runLocalMutation(() => _activateAccount(uid));
+
+  Future<void> _activateAccount(String uid) async {
     if (_activeAccountId == uid) return;
     // Persist everything that determines what a user can resume on this
     // device before switching to a different account's local cache.
     if (_activeAccountId != null) await _saveAccountState(_activeAccountId!);
     final key = '$_accountStatePrefix$uid';
-    final saved = _prefs.getString(key);
+    final saved = await readLargeLocalValue(_prefs, key);
     final previousOwner = _prefs.getString(_lastActiveAccountKey);
     // On an ordinary restart, the root preferences are already this
     // account's newest local state.  Restoring `accountState` here used to
@@ -1633,8 +1742,17 @@ class VocaStore {
     _activeAccountId = uid;
     await _prefs.setString(_lastActiveAccountKey, uid);
     await cloudChanges.activateAccount(uid);
+    await cardChanges.activateAccount(uid);
     await _bootstrapLegacySettingsForAccount(uid);
-    await _restoreSyncCheckpoint(uid);
+    // A checkpoint is a recovery fallback, never a replacement for the live
+    // preferences from the just-finished learning session on this device.
+    if (!keepLiveCache && saved == null) await _restoreSyncCheckpoint(uid);
+    for (final book in books) {
+      for (final word in book.words) {
+        _overlayPendingCardFields(word, book.id);
+      }
+    }
+    await _recoverLocalDecision();
     await _loadSyncReplica();
     await wordRelations.reload();
     wordSearch.invalidate();
@@ -1675,7 +1793,11 @@ class VocaStore {
     // caller is midway through a change.
     state[_booksKey] = _encodeBooks();
     final encoded = await compute(_encodeAccountSnapshot, state);
-    await _prefs.setString('$_accountStatePrefix$uid', encoded);
+    await writeLargeLocalValue(
+      _prefs,
+      '$_accountStatePrefix$uid',
+      encoded,
+    );
   }
 
   Future<void> _restoreAccountState(String encoded) async {
@@ -1736,23 +1858,61 @@ class VocaStore {
     }
   }
 
-  Future<void> updateWord(Word updated) async {
-    for (final book in books) {
+  /// Persists a card locally first, then queues only its changed text fields.
+  /// New callers should always pass [bookId]; retaining the narrow fallback
+  /// keeps old deep links usable while refusing ambiguous duplicate IDs.
+  Future<CardChange?> updateWord(Word updated, {required String bookId}) =>
+      runLocalMutation(() => _updateWord(updated, bookId: bookId));
+
+  Future<CardChange?> _updateWord(Word updated,
+      {required String bookId}) async {
+    final matches = books.where((book) =>
+        book.id == bookId && book.words.any((word) => word.id == updated.id));
+    for (final book in matches) {
       final index = book.words.indexWhere((word) => word.id == updated.id);
       if (index < 0) continue;
       await onBeforeBookMutation?.call(book.id, 'edit');
       final previous = book.words[index];
+      final favoriteChanged = previous.isFavorite != updated.isFavorite;
       if (previous.isFavorite != updated.isFavorite &&
           previous.favoriteUpdatedAt == updated.favoriteUpdatedAt) {
         updated.favoriteUpdatedAt = DateTime.now().toUtc();
       }
-      book.words[index] = updated;
+      final change = await cardChanges.enqueue(
+        bookId: book.id,
+        wordId: updated.id,
+        before: _cardTextFields(previous),
+        after: _cardTextFields(updated),
+        notify: false,
+      );
+      // The durable operation is written first. A crash before _saveBooks is
+      // repaired by the pending-field overlay on the next launch.
+      previous.term = updated.term;
+      previous.reading = updated.reading;
+      previous.meaning = updated.meaning;
+      previous.example = updated.example;
+      previous.exampleMeaning = updated.exampleMeaning;
+      previous.explanation = updated.explanation;
+      previous.isFavorite = updated.isFavorite;
+      previous.favoriteUpdatedAt = updated.favoriteUpdatedAt;
       await _saveBooks();
       wordSearch.invalidate();
-      await cloudChanges.markWord(book.id, updated.id);
-      return;
+      if (favoriteChanged) await cloudChanges.markLearningState();
+      cardContentRevision.value++;
+      cardChanges.notifyChanged();
+      return change;
     }
+    throw StateError('수정할 카드를 찾지 못했습니다: $bookId/${updated.id}');
   }
+
+  Map<String, dynamic> _cardTextFields(Word word) => {
+        'term': word.term,
+        'reading': word.reading,
+        'meaning': word.meaning,
+        'example': word.example,
+        'exampleMeaning': word.exampleMeaning,
+        'explanation': word.explanation,
+      };
 
   Future<void> setWordFavorite(Word word, bool value, {String? bookId}) async {
     final now = DateTime.now().toUtc();
@@ -2101,6 +2261,150 @@ class VocaStore {
     return changed;
   }
 
+  /// Applies the new per-card source without touching study counters, current
+  /// card side, session position, or active-study queues.  The parent keeps
+  /// ordering while every card document supplies only card content.
+  Future<int> mergeCardBooks(Iterable<CardBookSnapshot> remote) =>
+      runLocalMutation(() => _mergeCardBooks(remote));
+
+  Future<int> _mergeCardBooks(Iterable<CardBookSnapshot> remote) async {
+    // Capture genuine edits before adding server-owned content. A newly
+    // downloaded card's default state is not a new learning action.
+    await _captureSyncReplica();
+    var changed = 0;
+    for (final snapshot in remote) {
+      final bookData = snapshot.book;
+      final id = bookData['id']?.toString() ?? '';
+      if (id.isEmpty || id == 'default') continue;
+      final cardById = <int, Map<String, dynamic>>{
+        for (final card in snapshot.cards)
+          if ((card['id'] as num?)?.toInt() != null)
+            (card['id'] as num).toInt(): card,
+      };
+      final order = (bookData['wordOrder'] as List? ?? const [])
+          .whereType<num>()
+          .map((value) => value.toInt())
+          .toList();
+      final orderedCards = order.isEmpty
+          ? (cardById.keys.toList()..sort())
+          : order.where(cardById.containsKey).toList();
+      final index = books.indexWhere((book) => book.id == id);
+      final oldStates = index < 0
+          ? const <int, Word>{}
+          : <int, Word>{for (final word in books[index].words) word.id: word};
+      final words = <Word>[];
+      for (final wordId in orderedCards) {
+        final card = cardById[wordId]!;
+        final old = oldStates[wordId];
+        final word = Word(
+          id: wordId,
+          term: card['term']?.toString() ?? '',
+          reading: card['reading']?.toString() ?? '',
+          meaning: card['meaning']?.toString() ?? '',
+          example: card['example']?.toString() ?? '',
+          exampleMeaning: card['exampleMeaning']?.toString() ?? '',
+          explanation: card['explanation']?.toString() ?? '',
+          isFavorite: card['isFavorite'] == true,
+          favoriteUpdatedAt: old?.favoriteUpdatedAt,
+        );
+        if (old != null) {
+          word.state = old.state;
+          word.correctCount = old.correctCount;
+          word.wrongCount = old.wrongCount;
+          word.lastStudiedAt = old.lastStudiedAt;
+          word.lastWrongAt = old.lastWrongAt;
+          word.isFavorite = old.isFavorite;
+        }
+        if (old == null) _restoreDownloadedCardLearning(word, id);
+        _overlayPendingCardFields(word, id);
+        // Keep a live route's references attached to the canonical card.
+        if (old != null) {
+          old.term = word.term;
+          old.reading = word.reading;
+          old.meaning = word.meaning;
+          old.example = word.example;
+          old.exampleMeaning = word.exampleMeaning;
+          old.explanation = word.explanation;
+        }
+        words.add(old ?? word);
+      }
+      final overrides = <int, SessionOverride>{};
+      final rawOverrides = bookData['sessionOverrides'];
+      if (rawOverrides is Map) {
+        rawOverrides.forEach((key, value) {
+          final parsed = int.tryParse(key.toString());
+          if (parsed != null && value is Map) {
+            overrides[parsed] = SessionOverride.fromJson(
+              Map<String, dynamic>.from(value),
+            );
+          }
+        });
+      }
+      final decoded = WordBook(
+        id: id,
+        name: bookData['name']?.toString() ?? '단어장',
+        isFavorite: bookData['isFavorite'] == true,
+        words: words,
+        sessionOverrides: overrides,
+      );
+      if (index < 0) {
+        books.add(decoded);
+      } else {
+        books[index] = decoded;
+      }
+      changed++;
+    }
+    if (changed > 0) {
+      await _saveBooks();
+      // Seed previously unseen cards at clock zero, and accept the hydrated
+      // view without re-authoring existing server learning records.
+      _replica?.seed(_syncValues());
+      await _captureSyncReplica();
+      wordSearch.invalidate();
+      cardContentRevision.value++;
+    }
+    return changed;
+  }
+
+  /// Incremental changes from another device.  They never enter the local
+  /// outgoing queue, so simply opening a second phone cannot echo a server
+  /// update back as a new user edit.
+  Future<int> applyCardBookChanges(
+    String bookId,
+    Iterable<CardBookChange> changes,
+  ) =>
+      runLocalMutation(() => _applyCardBookChanges(bookId, changes));
+
+  Future<int> _applyCardBookChanges(
+      String bookId, Iterable<CardBookChange> changes) async {
+    final bookIndex = books.indexWhere((book) => book.id == bookId);
+    if (bookIndex < 0) return 0;
+    final book = books[bookIndex];
+    var applied = 0;
+    for (final change in changes) {
+      final index = book.words.indexWhere((word) => word.id == change.wordId);
+      if (index < 0) continue;
+      final old = book.words[index];
+      final data = change.fields;
+      if (data.containsKey('term')) old.term = data['term'].toString();
+      if (data.containsKey('reading')) old.reading = data['reading'].toString();
+      if (data.containsKey('meaning')) old.meaning = data['meaning'].toString();
+      if (data.containsKey('example')) old.example = data['example'].toString();
+      if (data.containsKey('exampleMeaning'))
+        old.exampleMeaning = data['exampleMeaning'].toString();
+      if (data.containsKey('explanation'))
+        old.explanation = data['explanation'].toString();
+      _overlayPendingCardFields(old, bookId);
+      applied++;
+    }
+    if (applied > 0) {
+      await _saveBooks();
+      wordSearch.invalidate();
+      cardContentRevision.value++;
+    }
+    return applied;
+  }
+
   /// Applies an account-level tombstone without putting a competing write back
   /// into the book-content queue. The active study is tombstoned as well, so a
   /// deleted book cannot reopen from an old local queue.
@@ -2130,28 +2434,95 @@ class VocaStore {
     bool recordAttempt = true,
     String? bookId,
     List<int> sessionIndexes = const [],
-  }) async {
+    String? decisionId,
+    ActiveStudy? activeStudy,
+  }) =>
+      runLocalMutation(() async {
+        if (_prefs.containsKey(_localDecisionKey))
+          await _recoverLocalDecision();
+        try {
+          await _mark(word, state,
+              recordAttempt: recordAttempt,
+              bookId: bookId,
+              sessionIndexes: sessionIndexes,
+              decisionId: decisionId,
+              activeStudy: activeStudy);
+        } finally {
+          _decisionEventPrefix = null;
+        }
+      });
+
+  Future<void> _mark(Word word, StudyState state,
+      {bool recordAttempt = true,
+      String? bookId,
+      List<int> sessionIndexes = const [],
+      String? decisionId,
+      ActiveStudy? activeStudy,
+      DateTime? decisionTime}) async {
+    final candidates = books
+        .where((book) =>
+            (bookId == null || book.id == bookId) &&
+            book.words.any((item) => item.id == word.id))
+        .toList();
+    if (candidates.length != 1) throw StateError('학습할 카드를 정확히 찾을 수 없습니다.');
+    bookId = candidates.single.id;
+    word = resolveCard(bookId, word.id)!;
+    final now = decisionTime ?? DateTime.now();
+    decisionId ??= '${now.microsecondsSinceEpoch}:$bookId:${word.id}';
+    final receiptKey =
+        'localDecisionReceipts.${_activeAccountId ?? _prefs.getString(_lastActiveAccountKey) ?? 'local'}';
+    final receipts = _prefs.getStringList(receiptKey) ?? [];
+    if (recordAttempt && receipts.contains(decisionId)) return;
+    final journalKey = _localDecisionKey;
+    final attemptId = '${await cloudChanges.deviceId()}:$decisionId';
+    _decisionEventPrefix = recordAttempt ? attemptId : null;
+    _decisionEventSequence = 0;
+    if (recordAttempt) {
+      final before = <String, dynamic>{
+        for (final key in [
+          _studyDaysKey,
+          _activeStudiesKey,
+          _activeStudyKey,
+          _activeStudyTombstonesKey,
+          _completedKey,
+          _completedAtKey,
+          _coursePassesKey,
+          _syncCompletedKey,
+          receiptKey
+        ])
+          key: _prefs.get(key),
+      };
+      final journal = {
+        'bookId': bookId,
+        'word': word.toJson(),
+        'state': state.name,
+        'id': decisionId,
+        'at': now.toIso8601String(),
+        'sessions': sessionIndexes,
+        'active': activeStudy?.toJson(),
+        'before': before,
+        'attempt': {
+          'id': attemptId,
+          'day': _dayKey(now),
+          'dailyBefore': dailyStudyStats[_dayKey(now)]?.toJson(),
+        }
+      };
+      if (!await _prefs.setString(journalKey, jsonEncode(journal))) {
+        throw StateError('학습 판정을 기기에 보관하지 못했습니다.');
+      }
+    }
     final beforeState = word.state;
     final beforeCorrect = word.correctCount;
     final beforeWrong = word.wrongCount;
     final beforeLastStudiedAt = word.lastStudiedAt;
     final beforeLastWrongAt = word.lastWrongAt;
-    final now = DateTime.now();
-    WordBook? book;
-    for (final candidate in books) {
-      if (candidate.words.any((item) => item.id == word.id)) {
-        book = candidate;
-        break;
-      }
-    }
-    final recoveryId =
-        '${now.microsecondsSinceEpoch}:${bookId ?? book?.id ?? 'unknown'}:${word.id}';
+    final recoveryId = decisionId;
     if (recordAttempt) {
       // Write the inverse data before mutating the word. If the process dies
       // during this decision, this record is enough to restore the card.
       await cloudChanges.recordDiagnostic('study_decision_prepared', data: {
         'recoveryId': recoveryId,
-        'bookId': bookId ?? book?.id,
+        'bookId': bookId,
         'wordId': word.id,
         'term': word.term,
         'reading': word.reading,
@@ -2176,7 +2547,7 @@ class VocaStore {
       await _recordStudyAttempt(
         word: word,
         decision: state,
-        bookId: bookId ?? book?.id,
+        bookId: bookId,
         sessionIndexes: sessionIndexes,
         now: now,
         previousState: beforeState,
@@ -2184,14 +2555,37 @@ class VocaStore {
         previousWrongCount: beforeWrong,
         previousLastStudiedAt: beforeLastStudiedAt,
         previousLastWrongAt: beforeLastWrongAt,
+        operationId: attemptId,
       );
     }
     await _saveBooks();
+    if (recordAttempt && activeStudy != null) {
+      await saveActiveStudyFor(activeStudyKey(activeStudy), activeStudy,
+          markCloudChange: false);
+      if (activeStudy.queueIds.isEmpty &&
+          activeStudy.memorized >= activeStudy.total) {
+        if (activeStudy.isRangeCourse && activeStudy.bookId != null) {
+          await completeRangeCourse(activeStudy.bookId!,
+              activeStudy.rangeStart!, activeStudy.rangeEnd!);
+        } else if (activeStudy.sessionSelections.isNotEmpty) {
+          for (final selection in activeStudy.sessionSelections.entries) {
+            await completeSessions(selection.key, selection.value);
+          }
+        } else if (activeStudy.bookId != null &&
+            activeStudy.sessionIndexes.isNotEmpty) {
+          await completeSessions(
+              activeStudy.bookId!, activeStudy.sessionIndexes);
+        } else {
+          await completeCurrentSession();
+        }
+        await clearActiveStudyFor(activeStudyKey(activeStudy));
+      }
+    }
     if (recordAttempt) {
       await cloudChanges.markLearningState();
       await cloudChanges.recordDiagnostic('card_decision_committed', data: {
         'recoveryId': recoveryId,
-        'bookId': bookId ?? book?.id,
+        'bookId': bookId,
         'wordId': word.id,
         'term': word.term,
         'reading': word.reading,
@@ -2204,8 +2598,80 @@ class VocaStore {
         'afterWrongCount': word.wrongCount,
         'sessionIndexes': sessionIndexes,
       });
+      await _prefs.setStringList(
+          receiptKey,
+          [...receipts, decisionId]
+              .reversed
+              .take(256)
+              .toList()
+              .reversed
+              .toList());
+      await _prefs.remove(journalKey);
     }
   }
+
+  String get _localDecisionKey =>
+      'learning.localDecision.${_activeAccountId ?? _prefs.getString(_lastActiveAccountKey) ?? 'local'}';
+
+  Future<void> _recoverLocalDecision() async {
+    final encoded = _prefs.getString(_localDecisionKey);
+    if (encoded == null) return;
+    final request = Map<String, dynamic>.from(jsonDecode(encoded));
+    final bookId = request['bookId'] as String;
+    final beforeWord =
+        Word.fromJson(Map<String, dynamic>.from(request['word']));
+    final canonical = resolveCard(bookId, beforeWord.id);
+    if (canonical == null) throw StateError('미완료 학습 기록의 카드를 찾을 수 없습니다.');
+    final before = Map<String, dynamic>.from(request['before']);
+    for (final entry in before.entries) {
+      await _setSharedPreference(entry.key, entry.value);
+    }
+    canonical.state = beforeWord.state;
+    canonical.correctCount = beforeWord.correctCount;
+    canonical.wrongCount = beforeWord.wrongCount;
+    canonical.lastStudiedAt = beforeWord.lastStudiedAt;
+    canonical.lastWrongAt = beforeWord.lastWrongAt;
+    _dailyStudyStatsCache = null;
+    _studyEventLogCache = null;
+    _activeStudiesCache = null;
+    _activeStudyTombstonesCache = null;
+    _completedAtCache = null;
+    final attempt = request['attempt'];
+    if (attempt is Map) {
+      final day = attempt['day'] as String;
+      final stats = Map<String, DailyStudyStats>.from(dailyStudyStats);
+      if (attempt['dailyBefore'] == null) {
+        stats.remove(day);
+      } else {
+        stats[day] = DailyStudyStats.fromJson(
+            Map<String, dynamic>.from(attempt['dailyBefore']));
+      }
+      await _saveDailyStudyStats(stats);
+      await _saveStudyEventLog(
+          studyEventLog.where((entry) => entry.id != attempt['id']).toList());
+      final events = _readSyncMap(_syncEventsKey)
+        ..removeWhere((key, value) =>
+            key == attempt['id'] || key.startsWith('${attempt['id']}:side:'));
+      await _prefs.setString(_syncEventsKey, jsonEncode(events));
+    }
+    try {
+      await _mark(
+          canonical, StudyState.values.byName(request['state'] as String),
+          bookId: bookId,
+          decisionId: request['id'] as String,
+          decisionTime: DateTime.parse(request['at'] as String),
+          sessionIndexes: (request['sessions'] as List).cast<int>(),
+          activeStudy: request['active'] == null
+              ? null
+              : ActiveStudy.fromJson(
+                  Map<String, dynamic>.from(request['active'])));
+    } finally {
+      _decisionEventPrefix = null;
+    }
+  }
+
+  Future<void> recoverLocalDecision() =>
+      runLocalMutation(_recoverLocalDecision);
 
   Future<void> completeCurrentSession() async {
     final completedIndex = nextSessionIndex(quickBook);
@@ -2734,7 +3200,9 @@ class VocaStore {
 
   Future<void> _saveBooks() async {
     final encoded = _encodeBooks();
-    await _prefs.setString(_booksKey, encoded);
+    if (!await _prefs.setString(_booksKey, encoded)) {
+      throw StateError('기기에 단어장과 학습 상태를 저장하지 못했습니다.');
+    }
     // The root preference is already the durable, live account state.  Its
     // account snapshot is refreshed before an account switch and before a
     // cloud sync checkpoint; doing it for every card decision created a full

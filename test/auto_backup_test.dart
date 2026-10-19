@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -14,6 +15,18 @@ void main() {
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
+  });
+
+  test('device id generation stays inside the web secure-random bound', () {
+    final random = _BrowserBoundRandom();
+
+    final id = createLearningStateDeviceId(
+      now: DateTime.fromMicrosecondsSinceEpoch(123456789),
+      random: random,
+    );
+
+    expect(id, startsWith('device-21i3v9-'));
+    expect(random.requestedBounds, [1 << 16, 1 << 16]);
   });
 
   test('managed-book manifest downloads only new or revised books', () {
@@ -187,6 +200,24 @@ void main() {
     expect(tracker.settingsDirty, isTrue);
     expect(tracker.archiveContentDirty, isTrue);
     expect(tracker.learningStateDirty, isTrue);
+  });
+
+  test('safety archive generation does not prevent a later book discard',
+      () async {
+    final tracker = await CloudChangeTracker.load();
+    await tracker.markBook('stale-book');
+    await tracker.markWord('stale-book', 7);
+
+    // The discard flow creates and uploads a recovery archive first. Both
+    // operations advance the shared journal generation.
+    await tracker.markArchive('recovery-point');
+    await tracker.acknowledgeArchives({'recovery-point'});
+    final readyToDiscard = tracker.snapshot;
+
+    await tracker.acknowledgeManagedBookContent(readyToDiscard);
+
+    expect(tracker.managedBookContentDirty, isFalse);
+    expect(tracker.archiveContentDirty, isFalse);
   });
 
   test('merge keeps cloud conflicts and appends local-only words', () {
@@ -580,6 +611,25 @@ void main() {
     expect(store.cloudChanges.managedBookContentDirty, isFalse);
     expect(store.cloudChanges.learningStateDirty, isTrue);
   });
+}
+
+class _BrowserBoundRandom implements Random {
+  final requestedBounds = <int>[];
+
+  @override
+  bool nextBool() => false;
+
+  @override
+  double nextDouble() => 0;
+
+  @override
+  int nextInt(int max) {
+    if (max > 1 << 16) {
+      throw RangeError.range(max, 1, 1 << 16);
+    }
+    requestedBounds.add(max);
+    return requestedBounds.length;
+  }
 }
 
 Word _wordModel(int id) => Word(

@@ -26,9 +26,13 @@ class SyncReplica {
 
   void seed(Map<String, dynamic> values) {
     for (final entry in values.entries) {
-      records.putIfAbsent(entry.key, () => {
-        'clock': 0, 'device': deviceId, 'value': entry.value,
-      });
+      records.putIfAbsent(
+          entry.key,
+          () => {
+                'clock': 0,
+                'device': deviceId,
+                'value': entry.value,
+              });
     }
     acceptView(values);
   }
@@ -39,7 +43,21 @@ class SyncReplica {
 
   bool capture(Map<String, dynamic> values, {int? nowMicros}) {
     final changed = {..._view.keys, ...values.keys}.where(
-      (key) => canonical(_view[key]) != canonical(values[key]),
+      (key) {
+        final before = _view[key];
+        final after = values[key];
+        if (key.startsWith('session/') &&
+            before is Map &&
+            after is Map &&
+            before['active'] is Map &&
+            after['active'] is Map &&
+            before['active']['updatedAt'] == after['active']['updatedAt']) {
+          // Derived card states and face changes cannot re-author an old
+          // session. Only an actual local progress revision can do that.
+          return false;
+        }
+        return canonical(before) != canonical(after);
+      },
     ).toList();
     if (changed.isEmpty) return false;
     final wall = nowMicros ?? DateTime.now().toUtc().microsecondsSinceEpoch;
@@ -63,7 +81,8 @@ class SyncReplica {
     if (rawRecovery is Map) {
       for (final entry in rawRecovery.entries) {
         if (entry.value is Map) {
-          recovery[entry.key.toString()] = Map<String, dynamic>.from(entry.value);
+          recovery[entry.key.toString()] =
+              Map<String, dynamic>.from(entry.value);
         }
       }
     }
@@ -75,21 +94,27 @@ class SyncReplica {
       final local = records[key];
       // Legacy daily totals overlap between devices: merge maxima only at the
       // zero-clock baseline. New events have unique IDs and are added once.
-      if (local != null && stamp == 0 && local['clock'] == 0 && key.startsWith('dailyBase/')) {
+      if (local != null &&
+          stamp == 0 &&
+          local['clock'] == 0 &&
+          key.startsWith('dailyBase/')) {
         final counts = Map<String, dynamic>.from(local['value'] as Map? ?? {});
         for (final count in (incoming['value'] as Map? ?? {}).entries) {
-          if ((count.value as num) > ((counts[count.key] as num?) ?? 0)) counts[count.key.toString()] = count.value;
+          if ((count.value as num) > ((counts[count.key] as num?) ?? 0))
+            counts[count.key.toString()] = count.value;
         }
         records[key] = {...local, 'value': counts};
         continue;
       }
       if (local == null || compare(incoming, local) > 0) {
-        if (local != null && key.startsWith('session/') &&
+        if (local != null &&
+            key.startsWith('session/') &&
             canonical(local['value']) != canonical(incoming['value'])) {
           _archive(key, local);
         }
         records[key] = incoming;
-      } else if (compare(incoming, local) < 0 && key.startsWith('session/') &&
+      } else if (compare(incoming, local) < 0 &&
+          key.startsWith('session/') &&
           canonical(local['value']) != canonical(incoming['value'])) {
         _archive(key, incoming);
       }
@@ -97,11 +122,14 @@ class SyncReplica {
   }
 
   Map<String, dynamic> get values => {
-    for (final entry in records.entries) entry.key: entry.value['value'],
-  };
+        for (final entry in records.entries) entry.key: entry.value['value'],
+      };
 
   Map<String, dynamic> toJson() => {
-    'schema': 2, 'deviceId': deviceId, 'clock': clock,
-    'records': records, 'recovery': recovery,
-  };
+        'schema': 2,
+        'deviceId': deviceId,
+        'clock': clock,
+        'records': records,
+        'recovery': recovery,
+      };
 }

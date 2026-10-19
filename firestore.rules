@@ -5,6 +5,18 @@ service cloud.firestore {
       return request.auth != null && request.auth.uid == uid;
     }
 
+    function cardCutover(uid) {
+      return exists(/databases/$(database)/documents/users/$(uid)/cardSync/meta)
+        && get(/databases/$(database)/documents/users/$(uid)/cardSync/meta).data.cutover == true;
+    }
+
+    function cardTextIsValid(data) {
+      return data.term is string && data.reading is string && data.meaning is string
+        && (!('example' in data) || data.example is string)
+        && (!('exampleMeaning' in data) || data.exampleMeaning is string)
+        && (!('explanation' in data) || data.explanation is string);
+    }
+
     // Original card material is deliberately read-only for this app.
     match /users/{uid}/vocabBooks/{bookId} {
       allow read: if owner(uid);
@@ -31,7 +43,54 @@ service cloud.firestore {
       allow read, write: if owner(uid);
     }
     match /users/{uid}/managedBooks/{bookId} {
-      allow read, write: if owner(uid);
+      // Older builds can still read their cached source after the transition,
+      // but cannot overwrite a newer per-card edit with a whole-book upload.
+      allow read: if owner(uid);
+      allow write: if owner(uid) && !cardCutover(uid);
+    }
+    match /users/{uid}/cardSync/{documentId} {
+      allow read: if owner(uid);
+      // Migration metadata is deployed by the administrative migration tool,
+      // never by an ordinary app install.
+      allow write: if false;
+    }
+    match /users/{uid}/cardBooks/{bookId} {
+      allow read: if owner(uid);
+      allow create: if owner(uid) && cardCutover(uid)
+        && request.resource.data.keys().hasOnly([
+          'schema', 'id', 'name', 'isFavorite', 'sessionOverrides',
+          'wordOrder', 'nextChange', 'updatedAt', 'deleted'
+        ]);
+      allow update: if owner(uid) && cardCutover(uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name', 'isFavorite', 'sessionOverrides', 'wordOrder',
+          'nextChange', 'updatedAt', 'deleted'
+        ])
+        && request.resource.data.nextChange is int
+        && request.resource.data.nextChange >= resource.data.nextChange;
+      allow delete: if false;
+      match /cards/{wordId} {
+        allow read: if owner(uid);
+        allow update: if owner(uid) && cardCutover(uid)
+          && cardTextIsValid(request.resource.data)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'term', 'reading', 'meaning', 'example', 'exampleMeaning',
+            'explanation', 'fieldRevisions', 'updatedAt', 'lastOperationId'
+          ]);
+        allow create, delete: if false;
+      }
+      // An immutable recovery trail. The app may append a record but cannot
+      // edit or erase an already written record.
+      match /changes/{changeId} {
+        allow read: if owner(uid);
+        allow create: if owner(uid) && cardCutover(uid);
+        allow update, delete: if false;
+      }
+      match /operations/{operationId} {
+        allow read: if owner(uid);
+        allow create: if owner(uid) && cardCutover(uid);
+        allow update, delete: if false;
+      }
     }
     match /users/{uid}/relations/{relationId} {
       allow read, write: if owner(uid);

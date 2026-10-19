@@ -22,6 +22,41 @@ import 'package:vocaflow/store.dart';
 import 'package:vocaflow/study_speech.dart';
 
 void main() {
+  testWidgets('editing meaning preserves a reading received while editor is open', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final book = await store.addBook('편집 검증', [Word(id: 991, term: 'つくづく', reading: 'old', meaning: '절실히')]);
+    await tester.pumpWidget(MaterialApp(home: CardStudyPage(store: store, words: book.words)));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.edit_outlined));
+    await tester.pumpAndSettle();
+    // Simulate the canonical card being refreshed by another device while
+    // the input controllers still contain the values from opening the sheet.
+    store.resolveCard(book.id, 991)!.reading = 'つくづく';
+    await tester.enterText(find.byKey(const ValueKey('word-meaning')), '뼈저리게');
+    await tester.tap(find.text('저장'));
+    await tester.pumpAndSettle();
+    expect(store.resolveCard(book.id, 991)!.reading, 'つくづく');
+    expect(store.cardChanges.pending.single.fields, {'meaning': '뼈저리게'});
+  });
+  test('startup sync returns control when the web deadline expires', () async {
+    final neverCompletes = Completer<bool>();
+
+    final result = await waitForStartupSync(
+      neverCompletes.future,
+      timeout: const Duration(milliseconds: 1),
+    );
+
+    expect(result, isFalse);
+  });
+
+  test('startup sync preserves a completed result', () async {
+    expect(
+      await waitForStartupSync(Future<bool>.value(true)),
+      isTrue,
+    );
+  });
+
   testWidgets('question template editor saves on a narrow phone',
       (tester) async {
     tester.view.physicalSize = const Size(360, 800);
@@ -330,7 +365,7 @@ void main() {
         .pumpWidget(VocaFlowApp(firebaseInitialization: firebase.future));
     await tester.pump(const Duration(seconds: 1));
 
-    expect(find.text('학습 기록 확인 중…'), findsOneWidget);
+    expect(find.text('클라우드 학습 기록 확인 중…'), findsOneWidget);
     expect(firebase.isCompleted, isFalse);
     firebase.complete(false);
     await tester.pump(const Duration(milliseconds: 100));
@@ -1165,6 +1200,9 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();
     final word = Word(term: 'right-swipe', reading: '', meaning: 'known');
+    // Production study cards belong to a persisted book. The store now
+    // resolves decisions by identity instead of mutating detached fixtures.
+    await store.addBook('right-swipe-test', [word]);
     await tester.pumpWidget(MaterialApp(
       home: CardStudyPage(store: store, words: [word]),
     ));

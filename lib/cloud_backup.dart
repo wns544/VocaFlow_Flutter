@@ -7,6 +7,7 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 
 import 'cloud_change_tracker.dart';
+import 'card_sync.dart';
 import 'book_restore_archive.dart';
 import 'models.dart';
 import 'store.dart';
@@ -78,6 +79,10 @@ class ManagedBookConflictException implements Exception {
   String toString() =>
       'ManagedBookConflictException(book: $bookId, expected: $expected, actual: $actual)';
 }
+
+/// A compact, ordered server delta.  The monotonically increasing [number]
+/// is the conflict order: later committed transactions win only for fields
+/// they changed, while unrelated fields are merged.
 
 class ManagedBookManifest {
   const ManagedBookManifest({
@@ -290,6 +295,180 @@ class CloudBackup {
   /// legacy vocabBooks/*/words documents.
   CollectionReference<Map<String, dynamic>> get _managedBooksRef =>
       firestore.collection('users').doc(_user.uid).collection('managedBooks');
+
+  DocumentReference<Map<String, dynamic>> get _cardSyncMeta => firestore
+      .collection('users')
+      .doc(_user.uid)
+      .collection('cardSync')
+      .doc('meta');
+
+  CollectionReference<Map<String, dynamic>> get _cardBooksRef =>
+      firestore.collection('users').doc(_user.uid).collection('cardBooks');
+
+  DocumentReference<Map<String, dynamic>> get _cardBookSignal => firestore
+      .collection('users')
+      .doc(_user.uid)
+      .collection('syncSignals')
+      .doc('cardBookChanges');
+
+  /// This flag is deliberately server-owned during migration.  New builds can
+  /// be shipped before it flips, without a half-migrated phone ever treating
+  /// an empty cardBooks collection as the source of truth.
+  Future<bool> isCardSyncCutoverEnabled() => _runCloudOperation(() async {
+        final snapshot = await _cardSyncMeta.get();
+        return snapshot.data()?['cutover'] == true;
+      });
+
+  Stream<Map<String, dynamic>?> watchCardBookSyncSignal() =>
+      _cardBookSignal.snapshots().map((event) => event.data());
+
+  /// Applies one local operation exactly once.  The transaction reserves the
+  /// next book change number, writes only edited fields, and creates an
+  /// immutable record containing the prior values for recovery.
+  Future<void> uploadCardChange(CardChange change,
+          {required String deviceId}) =>
+      _runCloudOperation(() async {
+        final bookRef = _cardBooksRef.doc(change.bookId);
+        final cardRef =
+            bookRef.collection('cards').doc(change.wordId.toString());
+        final operationRef = bookRef.collection('operations').doc(change.id);
+        final signalRef = _cardBookSignal;
+        await firestore.runTransaction((transaction) async {
+          final operation = await transaction.get(operationRef);
+          if (operation.exists) return;
+          final book = await transaction.get(bookRef);
+          if (!book.exists) {
+            throw StateError('카드 동기화 단어장을 찾을 수 없습니다: ${change.bookId}');
+          }
+          final card = await transaction.get(cardRef);
+          if (!card.exists) {
+            throw StateError(
+                '카드 동기화 카드를 찾을 수 없습니다: ${change.bookId}/${change.wordId}');
+          }
+          final previousCard = card.data() ?? const <String, dynamic>{};
+          final previous = <String, dynamic>{
+            for (final key in change.fields.keys) key: previousCard[key],
+          };
+          final bookData = book.data() ?? const <String, dynamic>{};
+          final next = ((bookData['nextChange'] as num?)?.toInt() ?? 0) + 1;
+          final fieldRevisions = <String, dynamic>{
+            ...(previousCard['fieldRevisions'] as Map? ?? const {}),
+            for (final key in change.fields.keys) key: next,
+          };
+          transaction.update(cardRef, {
+            ...change.fields,
+            'fieldRevisions': fieldRevisions,
+            'updatedAt': FieldValue.serverTimestamp(),
+            'lastOperationId': change.id,
+          });
+          transaction.update(bookRef, {
+            'nextChange': next,
+            'updatedAt': FieldValue.serverTimestamp(),
+          });
+          final changeRef = bookRef
+              .collection('changes')
+              .doc(next.toString().padLeft(12, '0'));
+          transaction.set(changeRef, {
+            'schema': 1,
+            'number': next,
+            'kind': 'cardPatch',
+            'wordId': change.wordId,
+            'fields': change.fields,
+            'before': previous,
+            'operationId': change.id,
+            'deviceId': deviceId,
+            'localVersion': change.localVersion,
+            'createdAt': FieldValue.serverTimestamp(),
+          });
+          transaction.set(operationRef, {
+            'schema': 1,
+            'operationId': change.id,
+            'changeNumber': next,
+            'wordId': change.wordId,
+            'createdAt': FieldValue.serverTimestamp(),
+          });
+        });
+        await signalRef.set({
+          'deviceId': deviceId,
+          'bookId': change.bookId,
+          'operationId': change.id,
+          'updatedAt': FieldValue.serverTimestamp(),
+        });
+      });
+
+  Future<Map<String, dynamic>?> downloadCard(String bookId, int wordId) =>
+      _runCloudOperation(() async {
+        final card = await _cardBooksRef
+            .doc(bookId)
+            .collection('cards')
+            .doc(wordId.toString())
+            .get(const GetOptions(source: Source.server));
+        return card.data();
+      });
+
+  Future<List<CardBookSnapshot>> downloadCardBooks({
+    Iterable<String>? ids,
+  }) =>
+      _runCloudOperation(() async {
+        final List<DocumentSnapshot<Map<String, dynamic>>> parents;
+        if (ids == null) {
+          parents = (await _cardBooksRef.get()).docs;
+        } else {
+          parents = await Future.wait(
+            ids.map((id) => _cardBooksRef.doc(id).get()),
+          );
+        }
+        final result = <CardBookSnapshot>[];
+        for (final parent in parents) {
+          if (!parent.exists) continue;
+          final data = parent.data()!;
+          if (data['deleted'] == true) continue;
+          final cards = await parent.reference.collection('cards').get();
+          result.add(CardBookSnapshot(
+            book: Map<String, dynamic>.from(data),
+            cards: cards.docs
+                .map((item) => Map<String, dynamic>.from(item.data()))
+                .toList(growable: false),
+            changeNumber: (data['nextChange'] as num?)?.toInt() ?? 0,
+          ));
+        }
+        return result;
+      });
+
+  Future<List<Map<String, dynamic>>> downloadCardBookMetadata() =>
+      _runCloudOperation(() async {
+        final snapshot = await _cardBooksRef.get();
+        return snapshot.docs
+            .map((item) => Map<String, dynamic>.from(item.data()))
+            .where((item) => item['deleted'] != true)
+            .toList(growable: false);
+      });
+
+  Future<List<CardBookChange>> downloadCardChanges(
+    String bookId,
+    int after,
+  ) =>
+      _runCloudOperation(() async {
+        final snapshot = await _cardBooksRef
+            .doc(bookId)
+            .collection('changes')
+            .where('number', isGreaterThan: after)
+            .orderBy('number')
+            .get();
+        return snapshot.docs
+            .map((document) {
+              final data = document.data();
+              return CardBookChange(
+                number: (data['number'] as num?)?.toInt() ?? 0,
+                wordId: (data['wordId'] as num?)?.toInt() ?? 0,
+                fields: Map<String, dynamic>.from(
+                    data['fields'] as Map? ?? const {}),
+                operationId: data['operationId']?.toString() ?? '',
+              );
+            })
+            .where((item) => item.number > 0 && item.wordId != 0)
+            .toList();
+      });
 
   CollectionReference<Map<String, dynamic>> get _bookArchivesRef =>
       firestore.collection('users').doc(_user.uid).collection('bookArchives');

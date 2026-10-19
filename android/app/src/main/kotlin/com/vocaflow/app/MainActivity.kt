@@ -63,8 +63,30 @@ class MainActivity : FlutterActivity() {
     private val forwardedBackEvents = RedispatchedKeyEvents()
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        preserveSyncRecoveryPoint()
         super.onCreate(savedInstanceState)
         showResumeSnapshot()
+    }
+
+    // Capture the old install's bytes before Dart performs any migration or
+    // cloud merge. Only application learning/card data is copied; Firebase
+    // authentication preferences and tokens are deliberately excluded.
+    private fun preserveSyncRecoveryPoint() {
+        val root = getExternalFilesDir(null) ?: return
+        val target = File(root, "sync-recovery-before-61")
+        if (File(target, "complete").exists()) return
+        try {
+            target.mkdirs()
+            val preferences = File(applicationInfo.dataDir, "shared_prefs/FlutterSharedPreferences.xml")
+            if (preferences.exists()) preferences.copyTo(File(target, "FlutterSharedPreferences.xml"), overwrite = true)
+            for (name in listOf("book_archives", "sync_diagnostics")) {
+                val source = File(filesDir, name)
+                if (source.exists()) source.copyRecursively(File(target, name), overwrite = true)
+            }
+            File(target, "complete").writeText(System.currentTimeMillis().toString())
+        } catch (error: Exception) {
+            Log.e(backLogTag, "Sync recovery snapshot failed; original files retained", error)
+        }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {

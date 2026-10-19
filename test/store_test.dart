@@ -504,6 +504,25 @@ void main() {
     expect(reloaded.exampleMeaningFontSize, 17);
   });
 
+  test('integer cloud font settings are accepted as doubles', () async {
+    SharedPreferences.setMockInitialValues({
+      'termFontSize': 40,
+      'readingFontSize': 18,
+      'meaningFontSize': 26,
+      'meaningOpacity': 1,
+      'exampleFontSize': 19,
+      'exampleMeaningFontSize': 17,
+    });
+    final store = await VocaStore.load();
+
+    expect(store.termFontSize, 40.0);
+    expect(store.readingFontSize, 18.0);
+    expect(store.meaningFontSize, 26.0);
+    expect(store.meaningOpacity, 1.0);
+    expect(store.exampleFontSize, 19.0);
+    expect(store.exampleMeaningFontSize, 17.0);
+  });
+
   test('meaning style persists and is included in backup data', () async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();

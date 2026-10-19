@@ -10,7 +10,7 @@ extension VocaStoreSync on VocaStore {
       _prefs.getBool('sync.v2.imported.${_activeAccountId ?? 'local'}') == true;
 
   Future<void> _restoreSyncCheckpoint(String uid) async {
-    final saved = _prefs.getString('sync.v2.checkpoint.$uid');
+    final saved = await readLargeLocalValue(_prefs, 'sync.v2.checkpoint.$uid');
     if (saved == null) return;
     final checkpoint = Map<String, dynamic>.from(jsonDecode(saved));
     final state = Map<String, dynamic>.from(checkpoint['state']);
@@ -27,8 +27,11 @@ extension VocaStoreSync on VocaStore {
         await _setSharedPreference(key, value);
       }
     }
-    await _prefs.setString(
-        '${VocaStore._accountStatePrefix}$uid', jsonEncode(state));
+    await writeLargeLocalValue(
+      _prefs,
+      '${VocaStore._accountStatePrefix}$uid',
+      jsonEncode(state),
+    );
     _activeAccountId = uid;
   }
 
@@ -68,7 +71,18 @@ extension VocaStoreSync on VocaStore {
 
   Future<void> _loadSyncReplica() async {
     final replica = SyncReplica(await cloudChanges.deviceId());
-    final saved = _prefs.getString(_syncReplicaKey);
+    final replicaStorageKey = kIsWeb
+        ? '$_syncReplicaKey.${_activeAccountId ?? 'local'}'
+        : _syncReplicaKey;
+    var saved = await readLargeLocalValue(_prefs, replicaStorageKey);
+    if (kIsWeb && saved == null) {
+      // Migrate the former unscoped browser value once.
+      saved = _prefs.getString(_syncReplicaKey);
+      if (saved != null) {
+        await writeLargeLocalValue(_prefs, replicaStorageKey, saved);
+        await _prefs.remove(_syncReplicaKey);
+      }
+    }
     final hadSavedReplica = saved != null;
     if (hadSavedReplica) {
       replica.merge(Map<String, dynamic>.from(jsonDecode(saved)));
@@ -89,10 +103,21 @@ extension VocaStoreSync on VocaStore {
     }
     // A pre-migration snapshot is immutable and scoped to the adopted account.
     final backupKey = 'sync.v2.beforeMigration.${_activeAccountId ?? 'local'}';
-    if (!_prefs.containsKey(backupKey)) {
+    if (kIsWeb) {
+      // SharedPreferences uses the browser's small localStorage quota. This
+      // snapshot duplicates every book and can exceed that quota before the
+      // app opens. It is not read by the app and Firebase already provides the
+      // durable web recovery source, so never let this optional copy block web
+      // startup. Remove an older copy to reclaim space for live state.
+      if (_prefs.containsKey(backupKey)) await _prefs.remove(backupKey);
+    } else if (!_prefs.containsKey(backupKey)) {
       await _prefs.setString(backupKey, jsonEncode(toBackupJson()));
     }
-    await _prefs.setString(_syncReplicaKey, jsonEncode(replica.toJson()));
+    await writeLargeLocalValue(
+      _prefs,
+      replicaStorageKey,
+      jsonEncode(replica.toJson()),
+    );
   }
 
   Map<String, dynamic> _wordState(Word word) => {
@@ -123,7 +148,7 @@ extension VocaStoreSync on VocaStore {
       },
       for (final entry in activeStudies.entries)
         'session/${entry.key}': {
-          'active': entry.value.toJson(),
+          'active': {...entry.value.toJson(), 'revealed': false},
           // Preserve the branch's touched card states alongside its queue.
           'words': {
             for (final decision in entry.value.undoHistory)
@@ -163,7 +188,14 @@ extension VocaStoreSync on VocaStore {
         await _writeSyncCheckpoint();
       }
       if (persist) {
-        await _prefs.setString(_syncReplicaKey, jsonEncode(replica.toJson()));
+        final key = kIsWeb
+            ? '$_syncReplicaKey.${_activeAccountId ?? 'local'}'
+            : _syncReplicaKey;
+        await writeLargeLocalValue(
+          _prefs,
+          key,
+          jsonEncode(replica.toJson()),
+        );
       }
     });
     _syncWork = task.catchError((Object _) {});
@@ -181,18 +213,21 @@ extension VocaStoreSync on VocaStore {
     };
     final account = _activeAccountId;
     if (account == null) return;
-    await _prefs.setString(
-        'sync.v2.checkpoint.$account',
-        jsonEncode({
-          'account': account,
-          'state': data,
-        }));
+    await writeLargeLocalValue(
+      _prefs,
+      'sync.v2.checkpoint.$account',
+      jsonEncode({
+        'account': account,
+        'state': data,
+      }),
+    );
   }
 
-  Future<Map<String, dynamic>> syncV2Snapshot() async {
-    await _captureSyncReplica(persist: true);
-    return jsonDecode(jsonEncode(_replica!.toJson())) as Map<String, dynamic>;
-  }
+  Future<Map<String, dynamic>> syncV2Snapshot() => runLocalMutation(() async {
+        await _captureSyncReplica(persist: true);
+        return jsonDecode(jsonEncode(_replica!.toJson()))
+            as Map<String, dynamic>;
+      });
 
   /// The legacy merge is used only once, before any version-2 remote merge.
   Future<void> importLegacyForSyncV2(
@@ -236,13 +271,25 @@ extension VocaStoreSync on VocaStore {
 
   Future<void> applySyncV2(Iterable<Map<String, dynamic>> snapshots) async {
     await beforeRemoteApply?.call();
+    await runLocalMutation(() => _applySyncV2Locked(snapshots));
+  }
+
+  Future<void> _applySyncV2Locked(
+      Iterable<Map<String, dynamic>> snapshots) async {
     await _captureSyncReplica();
     final task = _syncWork.then((_) async {
       _applyingReplica = true;
       try {
         for (final snapshot in snapshots) _replica!.merge(snapshot);
         await _applyReplicaValues();
-        await _prefs.setString(_syncReplicaKey, jsonEncode(_replica!.toJson()));
+        final key = kIsWeb
+            ? '$_syncReplicaKey.${_activeAccountId ?? 'local'}'
+            : _syncReplicaKey;
+        await writeLargeLocalValue(
+          _prefs,
+          key,
+          jsonEncode(_replica!.toJson()),
+        );
         if (_activeAccountId != null)
           await _saveAccountState(_activeAccountId!);
         await _writeSyncCheckpoint();
@@ -266,6 +313,8 @@ extension VocaStoreSync on VocaStore {
       await _prefs.setDouble(key, value.toDouble());
     } else if (value is String) {
       await _prefs.setString(key, value);
+    } else if (value is List) {
+      await _prefs.setStringList(key, value.cast<String>());
     }
   }
 
@@ -276,6 +325,32 @@ extension VocaStoreSync on VocaStore {
     word.wrongCount = (raw['wrongCount'] as num?)?.toInt() ?? 0;
     word.lastStudiedAt = DateTime.tryParse('${raw['lastStudiedAt']}');
     word.lastWrongAt = DateTime.tryParse('${raw['lastWrongAt']}');
+  }
+
+  void _restoreDownloadedCardLearning(Word word, String bookId) {
+    final replica = _replica;
+    if (replica == null) return;
+    final key = 'word/$bookId/${word.id}';
+    final reset = replica.records['reset/all'];
+    Map<String, dynamic>? newest = replica.records[key];
+    if (newest != null &&
+        reset != null &&
+        SyncReplica.compare(newest, reset) < 0) {
+      newest = null;
+    }
+    for (final entry in replica.records.entries) {
+      if (!entry.key.startsWith('session/') ||
+          entry.value['value'] is! Map ||
+          (reset != null && SyncReplica.compare(entry.value, reset) < 0))
+        continue;
+      final words = (entry.value['value'] as Map)['words'];
+      if (words is Map &&
+          words[key] is Map &&
+          (newest == null || SyncReplica.compare(entry.value, newest) > 0)) {
+        newest = {...entry.value, 'value': words[key]};
+      }
+    }
+    if (newest?['value'] is Map) _applyWordState(word, newest!['value'] as Map);
   }
 
   Future<void> _applyReplicaValues() async {
@@ -396,11 +471,13 @@ extension VocaStoreSync on VocaStore {
   }
 
   Future<String> _appendSyncEvent(String day, Map<String, int> delta,
-      {String? bookId, int? wordId}) async {
+      {String? bookId, int? wordId, String? eventId}) async {
     final events = _readSyncMap(_syncEventsKey);
     final device = await cloudChanges.deviceId();
-    final id =
-        '$device:${DateTime.now().microsecondsSinceEpoch}:${events.length}';
+    final id = eventId ??
+        (_decisionEventPrefix == null
+            ? '$device:${DateTime.now().microsecondsSinceEpoch}:${events.length}'
+            : '$_decisionEventPrefix:side:${_decisionEventSequence++}');
     events[id] = {
       'date': day,
       'delta': delta,
@@ -412,7 +489,20 @@ extension VocaStoreSync on VocaStore {
   }
 
   Future<void> undoWordDecision(Word word, StudyState previous,
+          {String? bookId}) =>
+      runLocalMutation(() => _undoWordDecision(word, previous, bookId: bookId));
+
+  Future<void> _undoWordDecision(Word word, StudyState previous,
       {String? bookId}) async {
+    if (_prefs.containsKey(_localDecisionKey)) await _recoverLocalDecision();
+    final matches = books
+        .where((book) =>
+            (bookId == null || book.id == bookId) &&
+            book.words.any((item) => item.id == word.id))
+        .toList();
+    if (matches.length != 1) throw StateError('되돌릴 카드를 정확히 찾을 수 없습니다.');
+    bookId = matches.single.id;
+    word = resolveCard(bookId, word.id)!;
     final events = _readSyncMap(_syncEventsKey);
     final keys = events.keys.where((key) {
       final event = events[key] as Map;
@@ -448,7 +538,8 @@ extension VocaStoreSync on VocaStore {
       await _saveStudyEventLog(
           studyEventLog.where((e) => e.id != prior.id).toList());
     }
-    await mark(word, previous, recordAttempt: false);
+    await mark(word, prior?.previousState ?? previous,
+        recordAttempt: false, bookId: bookId);
     await cloudChanges.markLearningState();
   }
 }

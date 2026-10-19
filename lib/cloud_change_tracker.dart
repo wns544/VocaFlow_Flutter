@@ -8,6 +8,15 @@ import 'sync_diagnostic_log.dart';
 
 enum AutoBackupNetworkPolicy { all, wifiOnly }
 
+String createLearningStateDeviceId({DateTime? now, Random? random}) {
+  final source = random ?? Random.secure();
+  // Dart's web secure-random implementation rejects a 2^32 upper bound.
+  // Compose the same 32 bits from two browser-safe 16-bit draws instead.
+  final high = source.nextInt(1 << 16).toRadixString(36).padLeft(4, '0');
+  final low = source.nextInt(1 << 16).toRadixString(36).padLeft(4, '0');
+  return 'device-${(now ?? DateTime.now()).microsecondsSinceEpoch.toRadixString(36)}-$high$low';
+}
+
 class CloudChangeSnapshot {
   const CloudChangeSnapshot({
     required this.generation,
@@ -187,6 +196,16 @@ class CloudChangeTracker {
     onChanged?.call();
   }
 
+  /// Retire an old word entry only after all its local text fields have been
+  /// read back and verified against the new per-card server document.
+  Future<void> acknowledgeVerifiedLegacyWord(String bookId, int wordId) =>
+      _mutate(() {
+        final words = _wordIdsByBook[bookId];
+        if (words == null || !words.remove(wordId)) return false;
+        if (words.isEmpty) _wordIdsByBook.remove(bookId);
+        return true;
+      });
+
   /// Stable per-installation identity: each phone owns a separate remote
   /// learning-state document, so a stale phone cannot overwrite another.
   Future<String> deviceId() async {
@@ -195,8 +214,7 @@ class CloudChangeTracker {
         : '$_deviceIdKey.$_activeAccountId';
     final saved = _prefs.getString(key);
     if (saved != null && saved.isNotEmpty) return saved;
-    final value =
-        'device-${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}-${Random.secure().nextInt(1 << 32).toRadixString(36)}';
+    final value = createLearningStateDeviceId();
     await _prefs.setString(key, value);
     return value;
   }
@@ -425,6 +443,35 @@ class CloudChangeTracker {
   Future<void> recordSuccess(String uid, DateTime time) async {
     await _prefs.setString('$_lastSuccessPrefix$uid', time.toIso8601String());
     await _prefs.remove('$_lastErrorPrefix$uid');
+    onChanged?.call();
+  }
+
+  String channelStatus(String channel) {
+    final prefix = 'sync.channel.${_activeAccountId ?? 'local'}.$channel';
+    final error = _prefs.getString('$prefix.error');
+    final success =
+        DateTime.tryParse(_prefs.getString('$prefix.success') ?? '');
+    return error != null
+        ? '실패: $error'
+        : success == null
+            ? '서버 저장 확인 전'
+            : '마지막 저장 ${success.toLocal().toString().substring(0, 16)}';
+  }
+
+  String? channelError(String channel) => _prefs
+      .getString('sync.channel.${_activeAccountId ?? 'local'}.$channel.error');
+
+  Future<void> recordChannelSuccess(String channel, DateTime time) async {
+    final prefix = 'sync.channel.${_activeAccountId ?? 'local'}.$channel';
+    await _prefs.setString('$prefix.success', time.toUtc().toIso8601String());
+    await _prefs.remove('$prefix.error');
+    onChanged?.call();
+  }
+
+  Future<void> recordChannelFailure(String channel, Object error) async {
+    await _prefs.setString(
+        'sync.channel.${_activeAccountId ?? 'local'}.$channel.error',
+        error.toString());
     onChanged?.call();
   }
 

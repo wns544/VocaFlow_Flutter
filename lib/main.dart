@@ -15,6 +15,7 @@ import 'package:google_sign_in/google_sign_in.dart';
 
 import 'auto_backup.dart';
 import 'book_restore_archive.dart';
+import 'binary_download.dart';
 import 'cloud_change_tracker.dart';
 import 'cloud_backup.dart';
 import 'csv_parser.dart';
@@ -262,7 +263,7 @@ Future<void> cancelResumeSnapshotCapture() async {
 Future<void> notifyRestorationReady() async {
   try {
     await resumeSnapshotChannel.invokeMethod<void>('restorationReady');
-  } on PlatformException {
+  } on Exception {
     // Non-Android platforms do not install the snapshot channel.
   }
 }
@@ -271,6 +272,18 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final firebaseInitialization = initializeFirebase();
   runApp(VocaFlowApp(firebaseInitialization: firebaseInitialization));
+}
+
+@visibleForTesting
+Future<bool> waitForStartupSync(
+  Future<bool> sync, {
+  Duration timeout = const Duration(seconds: 15),
+}) async {
+  try {
+    return await sync.timeout(timeout);
+  } on TimeoutException {
+    return false;
+  }
 }
 
 class VocaFlowApp extends StatefulWidget {
@@ -288,15 +301,38 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
   final autoBackupNotifier = ValueNotifier<AutoBackupCoordinator?>(null);
   final navigatorKey = GlobalKey<NavigatorState>();
   ActiveStudy? initialStudy;
+  Object? startupError;
+  var startupMessage = '저장된 학습 정보 여는 중…';
   var restorationNotified = false;
   var startupSyncReady = false;
+  var cloudSetupStarted = false;
 
   @override
   void initState() {
     super.initState();
     navigationDiagnosticChannel
         .setMethodCallHandler(_handleNavigationDiagnostic);
-    _loadLocalState();
+    _startLocalLoad();
+  }
+
+  void _startLocalLoad() {
+    unawaited(_loadLocalState().catchError((Object error, StackTrace stack) {
+      debugPrint('VOCASTARTUP local load failed: $error\n$stack');
+      if (!mounted) return;
+      setState(() {
+        startupError = error;
+        startupSyncReady = true;
+      });
+    }));
+  }
+
+  void _retryLocalLoad() {
+    setState(() {
+      startupError = null;
+      startupSyncReady = false;
+      startupMessage = '저장된 학습 정보 여는 중…';
+    });
+    _startLocalLoad();
   }
 
   Future<bool> _handleNavigationDiagnostic(MethodCall call) async {
@@ -323,21 +359,47 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
     setState(() {
       store = value;
       initialStudy = active;
+      startupMessage = '클라우드 학습 기록 확인 중…';
     });
-    final ready = await (widget.firebaseInitialization ??
-        Future<bool>.value(firebaseReady));
+    final firebaseInitialization =
+        widget.firebaseInitialization ?? Future<bool>.value(firebaseReady);
+    final ready = kIsWeb
+        ? await waitForStartupSync(
+            firebaseInitialization,
+            timeout: const Duration(seconds: 8),
+          )
+        : await firebaseInitialization;
     if (!mounted) return;
     if (!ready) {
       await _finishStartupSync();
+      if (kIsWeb) {
+        // Firebase initialization can stall in a browser profile with an old
+        // auth/cache state. Open the local app after the deadline, but keep
+        // the original future alive so cloud sync attaches automatically if
+        // Firebase recovers later. No local or remote data is discarded.
+        unawaited(firebaseInitialization.then((lateReady) async {
+          if (lateReady) await _startCloudSync(value);
+        }).catchError((Object _) {}));
+      }
       return;
     }
+    await _startCloudSync(value);
+  }
+
+  Future<void> _startCloudSync(VocaStore value) async {
+    if (!mounted || cloudSetupStarted) return;
+    cloudSetupStarted = true;
     final coordinator = AutoBackupCoordinator(
       store: value,
       onChanged: () {
         if (mounted) setState(() {});
       },
     );
-    coordinator.start();
+    final startupSyncUid =
+        kIsWeb && coordinator.enabled && coordinator.initialized
+            ? coordinator.user?.uid
+            : null;
+    coordinator.start(initialMergeHandledByCallerForUid: startupSyncUid);
     autoBackup = coordinator;
     autoBackupNotifier.value = coordinator;
     await _mergeCloudBackup(coordinator);
@@ -349,16 +411,36 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
       return;
     }
     try {
-      await store?.cloudChanges.recordDiagnostic('startup_sync_started');
-      await coordinator.mergeFromCloud(uploadMerged: false);
-      await store?.cloudChanges.recordDiagnostic('startup_sync_succeeded');
+      _recordStartupDiagnostic('startup_sync_started');
+      final operation = coordinator.mergeFromCloud(uploadMerged: false);
+      final succeeded =
+          kIsWeb ? await waitForStartupSync(operation) : await operation;
+      _recordStartupDiagnostic(
+        succeeded ? 'startup_sync_succeeded' : 'startup_sync_incomplete',
+        data: {
+          if (kIsWeb && !succeeded) 'webTimeoutSeconds': 15,
+        },
+      );
     } catch (error) {
-      await store?.cloudChanges.recordDiagnostic('startup_sync_failed', data: {
+      _recordStartupDiagnostic('startup_sync_failed', data: {
         'error': error.toString(),
       });
     } finally {
       await _finishStartupSync();
     }
+  }
+
+  void _recordStartupDiagnostic(String event,
+      {Map<String, Object?> data = const {}}) {
+    final tracker = store?.cloudChanges;
+    if (tracker == null) return;
+    // Diagnostics are evidence, not startup work. In particular, a browser
+    // whose localStorage is full or slow must not remain on the splash screen
+    // while a best-effort journal write is pending.
+    unawaited(tracker
+        .recordDiagnostic(event, data: data)
+        .timeout(const Duration(seconds: 2))
+        .catchError((Object _) {}));
   }
 
   Future<void> _finishStartupSync() async {
@@ -429,12 +511,20 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
   @override
   Widget build(BuildContext context) {
     final loadedStore = store;
+    if (startupError != null) {
+      return MaterialApp(
+        key: const ValueKey('startup-error-app'),
+        debugShowCheckedModeBanner: false,
+        theme: theme,
+        home: _StartupFailureScreen(onRetry: _retryLocalLoad),
+      );
+    }
     if (loadedStore == null || !startupSyncReady) {
       return MaterialApp(
         key: const ValueKey('startup-sync-app'),
         debugShowCheckedModeBanner: false,
         theme: theme,
-        home: const _StartupSyncScreen(),
+        home: _StartupSyncScreen(message: startupMessage),
       );
     }
     return MaterialApp(
@@ -536,17 +626,57 @@ class _MouseBackForwardScopeState extends State<_MouseBackForwardScope> {
 }
 
 class _StartupSyncScreen extends StatelessWidget {
-  const _StartupSyncScreen();
+  const _StartupSyncScreen({required this.message});
+
+  final String message;
 
   @override
   Widget build(BuildContext context) {
-    return const Scaffold(
+    return Scaffold(
       body: Center(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          CircularProgressIndicator(color: sea),
-          SizedBox(height: 18),
-          Text('학습 기록 확인 중…', style: TextStyle(fontWeight: FontWeight.w700)),
+          const CircularProgressIndicator(color: sea),
+          const SizedBox(height: 18),
+          Text(message, style: const TextStyle(fontWeight: FontWeight.w700)),
         ]),
+      ),
+    );
+  }
+}
+
+class _StartupFailureScreen extends StatelessWidget {
+  const _StartupFailureScreen({required this.onRetry});
+
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.cloud_off_rounded, color: coral, size: 42),
+            const SizedBox(height: 16),
+            const Text(
+              '시작 정보를 불러오지 못했습니다.',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 18),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              '저장된 데이터는 삭제되지 않았습니다. 잠시 후 다시 시도해 주세요.',
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 20),
+            FilledButton.icon(
+              key: const ValueKey('retry-startup'),
+              onPressed: onRetry,
+              icon: const Icon(Icons.refresh_rounded),
+              label: const Text('다시 시도'),
+            ),
+          ]),
+        ),
       ),
     );
   }
@@ -1852,6 +1982,8 @@ class _CardStudyPageState extends State<CardStudyPage>
   var roundCompleted = 0;
   final _primaryDrag = ValueNotifier<double>(0);
   final _keyboardFocusNode = FocusNode(debugLabel: 'study-keyboard');
+  final _studyCardDeckController = _StudyCardDeckController();
+  var _keyboardDecisionAnimating = false;
   Future<void> _persistenceChain = Future<void>.value();
   var memorized = 0;
   var revealed = false;
@@ -1889,6 +2021,7 @@ class _CardStudyPageState extends State<CardStudyPage>
   var exiting = false;
   var finishingStudy = false;
   var roundTransitionPending = false;
+  bool _decisionSaveFailed = false;
   var completionValidated = false;
   var _undoTransitionRevision = 0;
   Offset? _undoEntryDirection;
@@ -1936,16 +2069,28 @@ class _CardStudyPageState extends State<CardStudyPage>
       toggleReveal(queue.first);
       return KeyEventResult.handled;
     }
-    if (key == LogicalKeyboardKey.digit1 ||
-        key == LogicalKeyboardKey.arrowLeft ||
-        key == LogicalKeyboardKey.arrowUp) {
-      decide(stateForDirection(false), dismissedPositive: false);
+    if (key == LogicalKeyboardKey.digit1) {
+      _decideFromKeyboard(false, horizontalMotion: horizontalSwipe);
       return KeyEventResult.handled;
     }
-    if (key == LogicalKeyboardKey.digit2 ||
-        key == LogicalKeyboardKey.arrowRight ||
-        key == LogicalKeyboardKey.arrowDown) {
-      decide(stateForDirection(true), dismissedPositive: true);
+    if (key == LogicalKeyboardKey.arrowLeft) {
+      _decideFromKeyboard(false, horizontalMotion: true);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowUp) {
+      _decideFromKeyboard(false, horizontalMotion: false);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.digit2) {
+      _decideFromKeyboard(true, horizontalMotion: horizontalSwipe);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowRight) {
+      _decideFromKeyboard(true, horizontalMotion: true);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowDown) {
+      _decideFromKeyboard(true, horizontalMotion: false);
       return KeyEventResult.handled;
     }
     if (key == LogicalKeyboardKey.keyZ && undoHistory.isNotEmpty) {
@@ -1953,6 +2098,24 @@ class _CardStudyPageState extends State<CardStudyPage>
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
+  }
+
+  /// Keyboard decisions on the web should feel like a real swipe.  Previously
+  /// this called [decide] immediately, so the card changed with no directional
+  /// movement or green/orange feedback even though touch swipes had both.
+  void _decideFromKeyboard(bool positive, {required bool horizontalMotion}) {
+    if (_keyboardDecisionAnimating || queue.isEmpty || exiting) return;
+    final deck = _studyCardDeckController.current;
+    if (deck == null) {
+      decide(stateForDirection(positive), dismissedPositive: positive);
+      return;
+    }
+    _keyboardDecisionAnimating = true;
+    unawaited(deck
+        .dismissForDirection(positive, horizontalMotion: horizontalMotion)
+        .whenComplete(() {
+      if (mounted) _keyboardDecisionAnimating = false;
+    }));
   }
 
   Future<void> showKeyboardShortcutGuide() => showDialog<void>(
@@ -2091,6 +2254,7 @@ class _CardStudyPageState extends State<CardStudyPage>
       }
     }
     widget.store.learningStateRevision.addListener(_onLearningStateMerged);
+    widget.store.cardContentRevision.addListener(_onCardContentChanged);
     SchedulerBinding.instance.addTimingsCallback(_recordStudyFrameTimings);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       // A resumed route already has a stored snapshot. Re-saving it here used
@@ -2118,6 +2282,7 @@ class _CardStudyPageState extends State<CardStudyPage>
   @override
   void dispose() {
     widget.store.learningStateRevision.removeListener(_onLearningStateMerged);
+    widget.store.cardContentRevision.removeListener(_onCardContentChanged);
     SchedulerBinding.instance.removeTimingsCallback(_recordStudyFrameTimings);
     _keyboardFocusNode.dispose();
     WidgetsBinding.instance.removeObserver(this);
@@ -2162,6 +2327,25 @@ class _CardStudyPageState extends State<CardStudyPage>
         'queueCount': latest.queueIds.length,
       }));
     });
+  }
+
+  void _onCardContentChanged() {
+    // Content updates retain queue order and face, but always resolve through
+    // the stable book/card identity, including mixed-book review sessions.
+    for (final list in [queue, roundUnknown]) {
+      for (var i = 0; i < list.length; i++) {
+        final previous = list[i];
+        final bookId = _bookIdsByWord[previous] ?? _bookIdForWord(previous);
+        final canonical = bookId == null
+            ? null
+            : widget.store.resolveCard(bookId, previous.id);
+        if (canonical != null) {
+          list[i] = canonical;
+          _bookIdsByWord[canonical] = bookId!;
+        }
+      }
+    }
+    if (mounted) setState(() {});
   }
 
   void _applyMergedActiveStudy(ActiveStudy latest) {
@@ -2219,32 +2403,7 @@ class _CardStudyPageState extends State<CardStudyPage>
   }) async {
     if (queue.isEmpty || (exiting && !allowWhileExiting)) return;
     final key = _activeStudyStorageKey;
-    final saved = await widget.store.saveActiveStudyFor(
-        key,
-        ActiveStudy(
-          queueIds: queue.map((word) => word.id).toList(),
-          queueBookIds: _completeBookIdList(queue),
-          total: total,
-          memorized: memorized,
-          reviewed: reviewed.toList(),
-          revealed: revealed,
-          bookId: activeBookId,
-          sessionIndexes: activeSessionIndexes,
-          lastWordId: lastWord?.id,
-          lastState: lastState,
-          undoHistory: undoHistory,
-          seenWordIds: seenWordIds.toList(),
-          roundNumber: roundNumber,
-          roundTotal: roundTotal,
-          roundCompleted: roundCompleted,
-          roundUnknownIds: roundUnknown.map((word) => word.id).toList(),
-          roundUnknownBookIds: _completeBookIdList(roundUnknown),
-          sessionSelections: activeSessionSelections,
-          lastWordBookId: lastWord == null ? null : _bookIdForWord(lastWord!),
-          rangeStart: activeRangeStart,
-          rangeEnd: activeRangeEnd,
-          sourceMode: activeSourceMode,
-        ),
+    final saved = await widget.store.saveActiveStudyFor(key, _studySnapshot(),
         expectedUpdatedAt: _activeStudyUpdatedAt,
         markCloudChange: markCloudChange);
     if (saved == null) {
@@ -2254,11 +2413,32 @@ class _CardStudyPageState extends State<CardStudyPage>
     }
   }
 
-  bool _matchesStoredWord(Word candidate, Word word) =>
-      candidate.id == word.id &&
-      candidate.term == word.term &&
-      candidate.reading == word.reading &&
-      candidate.meaning == word.meaning;
+  ActiveStudy _studySnapshot() => ActiveStudy.fromJson(ActiveStudy(
+        queueIds: queue.map((word) => word.id).toList(),
+        queueBookIds: _completeBookIdList(queue),
+        total: total,
+        memorized: memorized,
+        reviewed: reviewed.toList(),
+        revealed: revealed,
+        bookId: activeBookId,
+        sessionIndexes: activeSessionIndexes,
+        lastWordId: lastWord?.id,
+        lastState: lastState,
+        undoHistory: List.of(undoHistory),
+        seenWordIds: seenWordIds.toList(),
+        roundNumber: roundNumber,
+        roundTotal: roundTotal,
+        roundCompleted: roundCompleted,
+        roundUnknownIds: roundUnknown.map((word) => word.id).toList(),
+        roundUnknownBookIds: _completeBookIdList(roundUnknown),
+        sessionSelections: activeSessionSelections,
+        lastWordBookId: lastWord == null ? null : _bookIdForWord(lastWord!),
+        rangeStart: activeRangeStart,
+        rangeEnd: activeRangeEnd,
+        sourceMode: activeSourceMode,
+      ).toJson());
+
+  bool _matchesStoredWord(Word candidate, Word word) => candidate.id == word.id;
 
   List<String> _completeBookIdList(Iterable<Word> words) {
     final ids = words.map(_bookIdForWord).toList();
@@ -2483,7 +2663,10 @@ class _CardStudyPageState extends State<CardStudyPage>
 
   void _scheduleDecisionPersistence(Word word, StudyState state) {
     final queuedAt = Stopwatch()..start();
-    _persistenceChain = _persistenceChain.then((_) async {
+    final snapshot = _studySnapshot();
+    final decisionId =
+        'decision-${DateTime.now().microsecondsSinceEpoch}-${word.id}';
+    Future<void> writeDecision() async {
       await WidgetsBinding.instance.endOfFrame;
       final markAt = Stopwatch()..start();
       await (widget.decisionWriter?.call(word, state) ??
@@ -2492,10 +2675,17 @@ class _CardStudyPageState extends State<CardStudyPage>
             state,
             bookId: _bookIdForWord(word),
             sessionIndexes: _sessionIndexesForWord(word),
+            decisionId: decisionId,
+            activeStudy: snapshot,
           ));
       final markMs = markAt.elapsedMilliseconds;
       final persistAt = Stopwatch()..start();
-      if (queue.isNotEmpty && !exiting) await persistStudy();
+      if (widget.decisionWriter != null) {
+        if (queue.isNotEmpty && !exiting) await persistStudy();
+      } else {
+        _activeStudyUpdatedAt =
+            widget.store.getActiveStudyFor(_activeStudyStorageKey)?.updatedAt;
+      }
       final persistMs = persistAt.elapsedMilliseconds;
       if (queuedAt.elapsedMilliseconds >= 24 ||
           markMs >= 24 ||
@@ -2507,6 +2697,25 @@ class _CardStudyPageState extends State<CardStudyPage>
           'queueLength': queue.length,
         });
       }
+    }
+
+    _persistenceChain = _persistenceChain
+        .then((_) => writeDecision())
+        .catchError((Object error, StackTrace stack) {
+      _decisionSaveFailed = true;
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: const Text('학습 기록을 기기에 저장하지 못했어요. 저장을 다시 시도해 주세요.'),
+        action: SnackBarAction(
+            label: '다시 시도',
+            onPressed: () {
+              _persistenceChain = _persistenceChain.then((_) async {
+                await widget.store.recoverLocalDecision();
+                await writeDecision();
+                _decisionSaveFailed = false;
+              });
+            }),
+      ));
     });
   }
 
@@ -2594,7 +2803,7 @@ class _CardStudyPageState extends State<CardStudyPage>
   }
 
   void decide(StudyState state, {bool? dismissedPositive}) {
-    if (queue.isEmpty) return;
+    if (queue.isEmpty || _decisionSaveFailed) return;
     final word = queue.removeAt(0);
     seenWordIds.add(word.id);
     roundCompleted = min(roundCompleted + 1, roundTotal);
@@ -2610,13 +2819,13 @@ class _CardStudyPageState extends State<CardStudyPage>
       usedHorizontalSwipe: dismissedPositive == null ? null : horizontalSwipe,
     );
     undoHistory.add(decision);
+    if (widget.decisionWriter != null) word.state = state;
     if (state == StudyState.memorized) {
       memorized++;
     } else {
       reviewed.add(word.term);
       roundUnknown.add(word);
     }
-    word.state = state;
     revealed = false;
     showingExplanation = false;
     if (queue.isEmpty && !finishingStudy) {
@@ -2634,6 +2843,9 @@ class _CardStudyPageState extends State<CardStudyPage>
           if (mounted) unawaited(_showNextRoundDialog(remaining.length));
         });
       }
+      final snapshot = _studySnapshot();
+      final decisionId =
+          'decision-${DateTime.now().microsecondsSinceEpoch}-${word.id}';
       _persistenceChain = _persistenceChain.then((_) async {
         try {
           await (widget.decisionWriter?.call(word, state) ??
@@ -2642,9 +2854,11 @@ class _CardStudyPageState extends State<CardStudyPage>
                 state,
                 bookId: _bookIdForWord(word),
                 sessionIndexes: _sessionIndexesForWord(word),
+                decisionId: decisionId,
+                activeStudy: snapshot,
               ));
           if (remaining.isEmpty) {
-            await _finishRound();
+            await _finishRound(recorded: widget.decisionWriter == null);
           } else {
             await persistStudy();
           }
@@ -2666,15 +2880,15 @@ class _CardStudyPageState extends State<CardStudyPage>
     scheduleResumeSnapshotCapture('study');
   }
 
-  Future<void> _finishRound() async {
-    if (isRangeCourse) {
+  Future<void> _finishRound({bool recorded = false}) async {
+    if (!recorded && isRangeCourse) {
       await widget.store.completeRangeCourse(
           activeBookId!, activeRangeStart!, activeRangeEnd!);
-    } else if (activeSessionSelections.isNotEmpty) {
+    } else if (!recorded && activeSessionSelections.isNotEmpty) {
       for (final selection in activeSessionSelections.entries) {
         await widget.store.completeSessions(selection.key, selection.value);
       }
-    } else {
+    } else if (!recorded) {
       await widget.store.completeCurrentSession();
     }
     final key = widget.store.activeStudyKeyFor(
@@ -2851,15 +3065,21 @@ class _CardStudyPageState extends State<CardStudyPage>
   Future<void> editCurrentWord() async {
     if (queue.isEmpty) return;
     final current = queue.first;
-    final updated = await _showWordEditor(context, current);
+    final updated = await _showWordEditor(context, current,
+        store: widget.store,
+        bookId: _bookIdsByWord[current] ?? _bookIdForWord(current));
     if (!mounted || updated == null) return;
-    await widget.store.updateWord(updated);
+    final resolvedBookId = _bookIdsByWord[current] ?? _bookIdForWord(current);
+    if (resolvedBookId == null) return;
+    if (!await _saveEditedWord(context, widget.store, updated, resolvedBookId))
+      return;
     final index = queue.indexWhere((word) => word.id == updated.id);
     if (index >= 0) {
       final previous = queue[index];
       final bookId = _bookIdsByWord.remove(previous);
-      queue[index] = updated;
-      if (bookId != null) _bookIdsByWord[updated] = bookId;
+      final canonical = widget.store.resolveCard(resolvedBookId, updated.id)!;
+      queue[index] = canonical;
+      if (bookId != null) _bookIdsByWord[canonical] = bookId;
     }
     if (lastWord?.id == updated.id) lastWord = updated;
     if (mounted) setState(() {});
@@ -3606,6 +3826,7 @@ class _CardStudyPageState extends State<CardStudyPage>
                       child: KeyedSubtree(
                         key: ValueKey('undo-card-$_undoTransitionRevision'),
                         child: _StudyCardDeck(
+                          controller: _studyCardDeckController,
                           frontId:
                               '${_cardIdentity(word)}:${showingExplanation ? 'explanation' : 'card'}',
                           backId:
@@ -3731,6 +3952,7 @@ class _StudyBackground extends StatelessWidget {
 
 class _StudyCardDeck extends StatefulWidget {
   const _StudyCardDeck({
+    required this.controller,
     required this.frontId,
     required this.backId,
     required this.horizontalSwipe,
@@ -3743,6 +3965,7 @@ class _StudyCardDeck extends StatefulWidget {
 
   final String frontId;
   final String? backId;
+  final _StudyCardDeckController controller;
   final bool horizontalSwipe;
   final Widget front;
   final Widget? back;
@@ -3752,6 +3975,22 @@ class _StudyCardDeck extends StatefulWidget {
 
   @override
   State<_StudyCardDeck> createState() => _StudyCardDeckState();
+}
+
+/// Keeps an imperative handle to only the visible front deck.  AnimatedSwitcher
+/// intentionally keeps outgoing decks alive for a moment, so a GlobalKey would
+/// be invalid here: it would be attached to both the outgoing and incoming
+/// card.  The most recently built deck owns this controller instead.
+class _StudyCardDeckController {
+  _StudyCardDeckState? _current;
+
+  _StudyCardDeckState? get current => _current;
+
+  void attach(_StudyCardDeckState state) => _current = state;
+
+  void detach(_StudyCardDeckState state) {
+    if (identical(_current, state)) _current = null;
+  }
 }
 
 class _StudyCardDeckState extends State<_StudyCardDeck>
@@ -3764,6 +4003,7 @@ class _StudyCardDeckState extends State<_StudyCardDeck>
   double _rotation = 0;
   bool _dismissing = false;
   bool? _lockedPositive;
+  bool? _programmaticPositive;
   double _dominantPrimary = 0;
 
   double _primaryFor(Offset offset) {
@@ -3781,6 +4021,7 @@ class _StudyCardDeckState extends State<_StudyCardDeck>
   @override
   void initState() {
     super.initState();
+    widget.controller.attach(this);
     _controller = AnimationController(vsync: this)
       ..addListener(() {
         final offsetAnimation = _offsetAnimation;
@@ -3790,13 +4031,20 @@ class _StudyCardDeckState extends State<_StudyCardDeck>
           _offset = offsetAnimation.value;
           _rotation = rotationAnimation.value;
         });
-        widget.onPrimaryDragChanged(_primaryFor(_offset));
+        final programmaticPositive = _programmaticPositive;
+        widget.onPrimaryDragChanged(programmaticPositive == null
+            ? _primaryFor(_offset)
+            : (programmaticPositive ? 1 : -1) * _offset.distance);
       });
   }
 
   @override
   void didUpdateWidget(covariant _StudyCardDeck oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.controller, widget.controller)) {
+      oldWidget.controller.detach(this);
+      widget.controller.attach(this);
+    }
     if (oldWidget.frontId == widget.frontId) return;
     _controller.stop();
     _offset = Offset.zero;
@@ -3804,11 +4052,13 @@ class _StudyCardDeckState extends State<_StudyCardDeck>
     _touchBias = Offset.zero;
     _dismissing = false;
     _lockedPositive = null;
+    _programmaticPositive = null;
     _dominantPrimary = 0;
   }
 
   @override
   void dispose() {
+    widget.controller.detach(this);
     _controller.dispose();
     super.dispose();
   }
@@ -3926,6 +4176,44 @@ class _StudyCardDeckState extends State<_StudyCardDeck>
     );
     if (!mounted) return;
     _lockedPositive = null;
+    _dominantPrimary = 0;
+    widget.onPrimaryDragChanged(0);
+    widget.onDismissed(positive);
+  }
+
+  /// Drives the exact same dismissal path as a completed pointer swipe.
+  /// This is used by web keyboard shortcuts, where there is no pointer drag
+  /// to feed the card and background feedback animations.
+  Future<void> dismissForDirection(
+    bool positive, {
+    required bool horizontalMotion,
+  }) async {
+    if (_dismissing) return;
+    final availableSize = context.size ?? MediaQuery.sizeOf(context);
+    final dismissDistance =
+        max(availableSize.width, availableSize.height) * 1.25;
+    final direction = horizontalMotion
+        ? Offset(positive ? 1 : -1, 0)
+        : Offset(0, positive ? 1 : -1);
+    final target = direction * dismissDistance;
+    setState(() {
+      _dismissing = true;
+      _lockedPositive = positive;
+      _programmaticPositive = positive;
+    });
+    await _animateTo(
+      offset: target,
+      // Keyboard dismissal begins at the centre of the card, so there is no
+      // touch position to produce the small natural tilt a pointer swipe has.
+      rotation: horizontalMotion
+          ? (positive ? .025 : -.025)
+          : (positive ? .014 : -.014),
+      duration: const Duration(milliseconds: 240),
+      curve: Curves.easeInCubic,
+    );
+    if (!mounted) return;
+    _lockedPositive = null;
+    _programmaticPositive = null;
     _dominantPrimary = 0;
     widget.onPrimaryDragChanged(0);
     widget.onDismissed(positive);
@@ -4378,7 +4666,7 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
 
   Future<void> openNaver() async {
     final uri = naverHanjaSearchUri(widget.character);
-    if (widget.store.openDictionaryInApp) {
+    if (widget.store.openDictionaryInApp && !kIsWeb) {
       await Navigator.of(context, rootNavigator: true).push(
         MaterialPageRoute(
           builder: (_) => InAppBrowserPage(
@@ -4395,7 +4683,7 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
 
   Future<void> openTongHanja() async {
     final uri = tongHanjaSearchUri(widget.character);
-    if (widget.store.openDictionaryInApp) {
+    if (widget.store.openDictionaryInApp && !kIsWeb) {
       await Navigator.of(context, rootNavigator: true).push(
         MaterialPageRoute(
           builder: (_) => InAppBrowserPage(
@@ -4413,7 +4701,7 @@ class _KanjiDetailSheetState extends State<_KanjiDetailSheet> {
 
   Future<void> openNihongoKanji() async {
     final uri = nihongoKanjiSearchUri(widget.character);
-    if (widget.store.openDictionaryInApp) {
+    if (widget.store.openDictionaryInApp && !kIsWeb) {
       await Navigator.of(context, rootNavigator: true).push(
         MaterialPageRoute(
           builder: (_) => InAppBrowserPage(
@@ -5507,9 +5795,11 @@ class _WordDetailSheetState extends State<_WordDetailSheet> {
   }
 
   Future<void> _edit() async {
-    final updated = await _showWordEditor(context, word);
+    final updated = await _showWordEditor(context, word,
+        store: widget.store, bookId: widget.book.id);
     if (!mounted || updated == null) return;
-    await widget.store.updateWord(updated);
+    if (!await _saveEditedWord(context, widget.store, updated, widget.book.id))
+      return;
     if (!mounted) return;
     setState(() => word = updated);
     widget.onChanged();
@@ -5766,10 +6056,11 @@ class _BooksPageState extends State<BooksPage> {
     widget.refresh();
   }
 
-  Future<void> editWord(Word word) async {
-    final updated = await _showWordEditor(context, word);
+  Future<void> editWord(Word word, String bookId) async {
+    final updated = await _showWordEditor(context, word,
+        store: widget.store, bookId: bookId);
     if (!mounted || updated == null) return;
-    await widget.store.updateWord(updated);
+    if (!await _saveEditedWord(context, widget.store, updated, bookId)) return;
     if (!mounted) return;
     if (searchQuery.trim().isNotEmpty) runSearch();
     widget.refresh();
@@ -6226,7 +6517,7 @@ class _BooksPageState extends State<BooksPage> {
             subtitle: Text('${word.reading}\n${word.meaning}'),
             isThreeLine: true,
             trailing: const Icon(Icons.edit_outlined, size: 18),
-            onTap: () => editWord(word),
+            onTap: () => editWord(word, book.id),
           ),
         );
       },
@@ -6645,9 +6936,11 @@ class _BookDetailPageState extends State<BookDetailPage> {
       widget.store.books.firstWhere((item) => item.id == widget.bookId);
 
   Future<void> editWord(Word word) async {
-    final updated = await _showWordEditor(context, word);
+    final updated = await _showWordEditor(context, word,
+        store: widget.store, bookId: widget.bookId);
     if (!mounted || updated == null) return;
-    await widget.store.updateWord(updated);
+    if (!await _saveEditedWord(context, widget.store, updated, widget.bookId))
+      return;
     widget.onChanged();
     if (!mounted) return;
     if (searchQuery.trim().isNotEmpty) {
@@ -6942,9 +7235,11 @@ class _WordListPageState extends State<WordListPage> {
       .firstWhere((item) => item.index == widget.sessionIndex);
 
   Future<void> editWord(Word word) async {
-    final updated = await _showWordEditor(context, word);
+    final updated = await _showWordEditor(context, word,
+        store: widget.store, bookId: widget.bookId);
     if (!mounted || updated == null) return;
-    await widget.store.updateWord(updated);
+    if (!await _saveEditedWord(context, widget.store, updated, widget.bookId))
+      return;
     if (mounted) setState(() {});
   }
 
@@ -7234,15 +7529,25 @@ class _SettingsPageState extends State<SettingsPage> {
     }
     setState(() => signingIn = true);
     try {
-      await ensureGoogleSignInInitialized();
-      final account = await GoogleSignIn.instance.authenticate(
-        scopeHint: const ['email', 'profile'],
-      );
-      final googleAuth = account.authentication;
-      final credential = GoogleAuthProvider.credential(
-        idToken: googleAuth.idToken,
-      );
-      await FirebaseAuth.instance.signInWithCredential(credential);
+      if (kIsWeb) {
+        // The Google Sign-In platform package is used for Android.  On the
+        // web it can finish without opening an account chooser, whereas
+        // Firebase Auth's popup flow is the browser-native sign-in route.
+        final provider = GoogleAuthProvider()
+          ..addScope('email')
+          ..addScope('profile');
+        await FirebaseAuth.instance.signInWithPopup(provider);
+      } else {
+        await ensureGoogleSignInInitialized();
+        final account = await GoogleSignIn.instance.authenticate(
+          scopeHint: const ['email', 'profile'],
+        );
+        final googleAuth = account.authentication;
+        final credential = GoogleAuthProvider.credential(
+          idToken: googleAuth.idToken,
+        );
+        await FirebaseAuth.instance.signInWithCredential(credential);
+      }
       if (mounted) {
         setState(() {});
         await _setupAutoBackupAfterLogin();
@@ -7257,6 +7562,17 @@ class _SettingsPageState extends State<SettingsPage> {
           SnackBar(content: Text('Google 로그인에 실패했습니다. (${error.code.name})')));
     } on FirebaseAuthException catch (error) {
       if (!mounted) return;
+      if (kIsWeb && error.code == 'popup-blocked') {
+        final provider = GoogleAuthProvider()
+          ..addScope('email')
+          ..addScope('profile');
+        await FirebaseAuth.instance.signInWithRedirect(provider);
+        return;
+      }
+      if (error.code == 'popup-closed-by-user' ||
+          error.code == 'cancelled-popup-request') {
+        return;
+      }
       final message = error.code == 'operation-not-allowed'
           ? 'Firebase 콘솔에서 Google 로그인을 먼저 사용 설정해 주세요.'
           : 'Google 로그인에 실패했습니다. (${error.code})';
@@ -7269,8 +7585,12 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> signOut() async {
     await FirebaseAuth.instance.signOut();
-    await ensureGoogleSignInInitialized();
-    await GoogleSignIn.instance.signOut();
+    // Browser authentication is owned by Firebase Auth. Calling the mobile
+    // Google Sign-In plugin here can leave a web logout button unresponsive.
+    if (!kIsWeb) {
+      await ensureGoogleSignInInitialized();
+      await GoogleSignIn.instance.signOut();
+    }
     await deleteResumeSnapshot();
     if (mounted) setState(() {});
   }
@@ -7383,14 +7703,13 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> exportWordBookExcel(WordBook book) async {
     final safeName = book.name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_').trim();
     try {
-      final path = await FilePicker.platform.saveFile(
-        dialogTitle: '단어장 Excel로 내보내기',
+      final saved = await saveBinaryDownload(
+        createWordBookXlsx(book),
         fileName: '${safeName.isEmpty ? '단어장' : safeName}.xlsx',
-        type: FileType.custom,
-        allowedExtensions: const ['xlsx'],
-        bytes: createWordBookXlsx(book),
+        mimeType:
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       );
-      if (!mounted || path == null) return;
+      if (!mounted || !saved) return;
       _showSnack('Excel 파일로 내보냈습니다.');
     } catch (error) {
       _showSnack('Excel 내보내기에 실패했습니다. ($error)');
@@ -7920,6 +8239,12 @@ class _SettingsPageState extends State<SettingsPage> {
                     '대기 중 변경: ${auto?.pendingCount ?? widget.store.cloudChanges.pendingCount}개',
                     style: const TextStyle(
                         color: Color(0xFF8E8E93), fontSize: 12)),
+                if (auto != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(auto.channelSummary,
+                        style: const TextStyle(fontSize: 12)),
+                  ),
                 if (auto?.isUploading == true)
                   const Text('증분 백업 중...',
                       style: TextStyle(color: sea, fontSize: 12)),
@@ -8289,21 +8614,32 @@ class _SettingsPageState extends State<SettingsPage> {
         const SizedBox(height: 20),
         const _SectionTitle('한자 상세 조회'),
         Card(
-          child: SwitchListTile.adaptive(
-            key: const ValueKey('open-dictionary-in-app-setting'),
-            secondary: const Icon(Icons.language_outlined, color: sea),
-            title: const Text('사전을 앱 내부에서 열기',
-                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
-            subtitle: Text(widget.store.openDictionaryInApp
-                ? '네이버 한자사전을 VocaFlow 안에서 엽니다.'
-                : '네이버 한자사전을 기본 브라우저에서 엽니다.'),
-            value: widget.store.openDictionaryInApp,
-            onChanged: (value) async {
-              await widget.store.setOpenDictionaryInApp(value);
-              widget.refresh();
-              if (mounted) setState(() {});
-            },
-          ),
+          child: kIsWeb
+              ? const ListTile(
+                  key: ValueKey('open-dictionary-web-notice'),
+                  leading: Icon(Icons.open_in_new_outlined, color: sea),
+                  title: Text('사전 열기 방식',
+                      style:
+                          TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+                  subtitle:
+                      Text('웹에서는 사전을 항상 새 탭으로 엽니다.\n모바일의 내부 브라우저 설정은 유지됩니다.'),
+                )
+              : SwitchListTile.adaptive(
+                  key: const ValueKey('open-dictionary-in-app-setting'),
+                  secondary: const Icon(Icons.language_outlined, color: sea),
+                  title: const Text('사전을 앱 내부에서 열기',
+                      style:
+                          TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+                  subtitle: Text(widget.store.openDictionaryInApp
+                      ? '네이버 한자사전을 VocaFlow 안에서 엽니다.'
+                      : '네이버 한자사전을 기본 브라우저에서 엽니다.'),
+                  value: widget.store.openDictionaryInApp,
+                  onChanged: (value) async {
+                    await widget.store.setOpenDictionaryInApp(value);
+                    widget.refresh();
+                    if (mounted) setState(() {});
+                  },
+                ),
         ),
         const SizedBox(height: 10),
         Card(
@@ -9589,25 +9925,88 @@ class _Metric extends StatelessWidget {
           ])));
 }
 
-Future<Word?> _showWordEditor(BuildContext context, Word word) =>
+final _latestCardFeedback = <String, String>{};
+
+Future<bool> _saveEditedWord(
+    BuildContext context, VocaStore store, Word updated, String bookId) async {
+  final messenger = ScaffoldMessenger.maybeOf(context);
+  try {
+    final operation = await store.updateWord(updated, bookId: bookId);
+    if (operation == null) return true;
+    final feedbackKey = '$bookId/${updated.id}';
+    _latestCardFeedback[feedbackKey] = operation.id;
+    final coordinator = AutoBackupCoordinator.activeInstance;
+    unawaited(() async {
+      CardSaveOutcome outcome;
+      try {
+        outcome = coordinator != null && identical(coordinator.store, store)
+            ? await coordinator.saveEditedCard(operation)
+            : CardSaveOutcome.waiting;
+      } catch (_) {
+        outcome = CardSaveOutcome.failed;
+      }
+      if (messenger == null || !messenger.mounted) return;
+      if (_latestCardFeedback[feedbackKey] != operation.id) return;
+      final message = switch (outcome) {
+        CardSaveOutcome.saved => operation.fields.length == 1 &&
+                operation.fields.containsKey('meaning')
+            ? '수정한 뜻을 서버에 저장했어요'
+            : '카드 수정을 서버에 저장했어요',
+        CardSaveOutcome.offline => '폰에 저장했어요. 연결되면 서버에 전송해요',
+        CardSaveOutcome.waiting => '폰에 저장했어요. 서버 저장을 확인 중이에요',
+        CardSaveOutcome.failed => '폰에는 저장됐지만 서버 전송에 실패했어요',
+      };
+      messenger.showSnackBar(SnackBar(content: Text(message)));
+      if (outcome == CardSaveOutcome.waiting && coordinator != null) {
+        final receipt = coordinator.cardSaveReceipt(operation.id);
+        if (receipt != null) {
+          final result = await receipt;
+          if (messenger.mounted &&
+              _latestCardFeedback[feedbackKey] == operation.id &&
+              WidgetsBinding.instance.lifecycleState ==
+                  AppLifecycleState.resumed) {
+            messenger.showSnackBar(SnackBar(
+                content: Text(result == CardSaveOutcome.saved
+                    ? '카드 수정을 서버에 저장했어요'
+                    : '폰에는 저장됐지만 서버 전송에 실패했어요')));
+          }
+        }
+      }
+    }());
+    return true;
+  } catch (_) {
+    if (messenger != null && messenger.mounted) {
+      messenger.showSnackBar(
+          const SnackBar(content: Text('기기에 저장하지 못했어요. 수정 내용을 다시 확인해 주세요.')));
+    }
+    return false;
+  }
+}
+
+Future<Word?> _showWordEditor(BuildContext context, Word word,
+        {VocaStore? store, String? bookId}) =>
     showModalBottomSheet<Word>(
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
       showDragHandle: true,
-      builder: (_) => _WordEditorSheet(word: word),
+      builder: (_) =>
+          _WordEditorSheet(word: word, store: store, bookId: bookId),
     );
 
 class _WordEditorSheet extends StatefulWidget {
-  const _WordEditorSheet({required this.word});
+  const _WordEditorSheet({required this.word, this.store, this.bookId});
 
   final Word word;
+  final VocaStore? store;
+  final String? bookId;
 
   @override
   State<_WordEditorSheet> createState() => _WordEditorSheetState();
 }
 
 class _WordEditorSheetState extends State<_WordEditorSheet> {
+  late final Word _initialWord;
   late final TextEditingController term;
   late final TextEditingController reading;
   late final TextEditingController meaning;
@@ -9619,6 +10018,7 @@ class _WordEditorSheetState extends State<_WordEditorSheet> {
   @override
   void initState() {
     super.initState();
+    _initialWord = widget.word.copyWith();
     term = TextEditingController(text: widget.word.term);
     reading = TextEditingController(text: widget.word.reading);
     meaning = TextEditingController(text: widget.word.meaning);
@@ -9641,16 +10041,31 @@ class _WordEditorSheetState extends State<_WordEditorSheet> {
 
   void save() {
     if (term.text.trim().isEmpty) return;
+    final latest = widget.store != null && widget.bookId != null
+        ? widget.store!.resolveCard(widget.bookId!, widget.word.id) ??
+            widget.word
+        : widget.word;
     Navigator.pop(
       context,
-      widget.word.copyWith(
-        term: term.text.trim(),
-        reading: reading.text.trim(),
-        meaning: meaning.text.trim(),
-        example: example.text.trim(),
-        exampleMeaning: exampleMeaning.text.trim(),
-        explanation: explanation.text.trim(),
-        isFavorite: isFavorite,
+      latest.copyWith(
+        term: term.text.trim() == _initialWord.term ? null : term.text.trim(),
+        reading: reading.text.trim() == _initialWord.reading
+            ? null
+            : reading.text.trim(),
+        meaning: meaning.text.trim() == _initialWord.meaning
+            ? null
+            : meaning.text.trim(),
+        example: example.text.trim() == _initialWord.example
+            ? null
+            : example.text.trim(),
+        exampleMeaning:
+            exampleMeaning.text.trim() == _initialWord.exampleMeaning
+                ? null
+                : exampleMeaning.text.trim(),
+        explanation: explanation.text.trim() == _initialWord.explanation
+            ? null
+            : explanation.text.trim(),
+        isFavorite: isFavorite == _initialWord.isFavorite ? null : isFavorite,
       ),
     );
   }
@@ -9674,6 +10089,15 @@ class _WordEditorSheetState extends State<_WordEditorSheet> {
               FilledButton(onPressed: save, child: const Text('저장')),
             ]),
             const SizedBox(height: 16),
+            if (widget.store != null && widget.bookId != null)
+              ValueListenableBuilder<int>(
+                valueListenable: widget.store!.cardChanges.revision,
+                builder: (_, __, ___) => Text(
+                    widget.store!.cardChanges
+                        .statusFor(widget.bookId!, widget.word.id),
+                    style: const TextStyle(
+                        fontSize: 12, color: Color(0xFF8E8E93))),
+              ),
             TextField(
                 key: const ValueKey('word-term'),
                 controller: term,
