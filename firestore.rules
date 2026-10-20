@@ -17,6 +17,80 @@ service cloud.firestore {
         && (!('explanation' in data) || data.explanation is string);
     }
 
+    // Staged rollout: only an administrator can enable this after ALL active
+    // clients have the receipt linkage. Never infer readiness from a read.
+    function atomicCardsRequired(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)/cardSync/meta).data.get('requireAtomicOperations', false);
+    }
+
+    function recordedBookField(change, before, after, field) {
+      return field in change.fields
+        ? after.get(field, null) == change.fields[field]
+          && change.before.get(field, null) == before.get(field, null)
+        : after.get(field, null) == before.get(field, null);
+    }
+
+    function atomicBookWrite(uid, bookId) {
+      let root = /databases/$(database)/documents/users/$(uid)/cardBooks/$(bookId);
+      let parent = getAfter(root).data;
+      let opPath = /databases/$(database)/documents/users/$(uid)/cardBooks/$(bookId)/operations/$(parent.lastOperationId);
+      let op = getAfter(opPath).data;
+      let changePath = /databases/$(database)/documents/users/$(uid)/cardBooks/$(bookId)/changes/$(op.changeId);
+      let change = getAfter(changePath).data;
+      return parent.lastOperationId is string && parent.lastOperationKind is string
+        && !exists(opPath) && !exists(changePath)
+        && parent.nextChange == (exists(root) ? get(root).data.nextChange + 1 : 1)
+        && parent.updatedAt == request.time
+        && op.schema == 1 && op.operationId == parent.lastOperationId
+        && op.changeNumber == parent.nextChange && op.changeId is string
+        && op.kind == parent.lastOperationKind && op.wordId is int
+        && op.kind in ['cardPatch','cardCreate','cardDelete','cardRestore','bookCreate','bookPatch','bookDelete','bookRestore']
+        && op.createdAt == request.time
+        && change.schema == 1 && change.operationId == op.operationId
+        && change.number == op.changeNumber && change.wordId == op.wordId
+        && change.kind == op.kind && change.fields is map && change.before is map
+        && change.deviceId is string && change.localVersion is int
+        && change.createdAt == request.time
+        && (!exists(root) || (
+          recordedBookField(change, get(root).data, parent, 'name')
+          && recordedBookField(change, get(root).data, parent, 'isFavorite')
+          && recordedBookField(change, get(root).data, parent, 'sessionOverrides')
+          && (op.kind in ['cardCreate','cardDelete','cardRestore']
+            || recordedBookField(change, get(root).data, parent, 'wordOrder'))))
+        && (op.kind in ['bookCreate','bookPatch','bookDelete','bookRestore']
+          || getAfter(/databases/$(database)/documents/users/$(uid)/cardBooks/$(bookId)/cards/$(string(op.wordId))).data.lastOperationId == op.operationId);
+    }
+
+    function recordedCardField(change, before, after, field, number) {
+      return field in change.fields
+        ? (change.fields[field] is string && after.get(field, '') == change.fields[field]
+          && change.before.get(field, null) == before.get(field, null)
+          && after.fieldRevisions[field] == number)
+        : after.get(field, '') == before.get(field, '');
+    }
+
+    function atomicCardWrite(uid, bookId, wordId, data) {
+      let parent = getAfter(/databases/$(database)/documents/users/$(uid)/cardBooks/$(bookId)).data;
+      let op = getAfter(/databases/$(database)/documents/users/$(uid)/cardBooks/$(bookId)/operations/$(data.lastOperationId)).data;
+      let cardPath = /databases/$(database)/documents/users/$(uid)/cardBooks/$(bookId)/cards/$(wordId);
+      let before = exists(cardPath) ? get(cardPath).data : {};
+      let change = getAfter(/databases/$(database)/documents/users/$(uid)/cardBooks/$(bookId)/changes/$(op.changeId)).data;
+      return atomicBookWrite(uid, bookId)
+        && data.lastOperationId == parent.lastOperationId
+        && data.lastOperationKind == parent.lastOperationKind
+        && string(op.wordId) == wordId
+        && op.kind in ['cardPatch', 'cardCreate', 'cardDelete', 'cardRestore']
+        && data.updatedAt == request.time
+        && change.fields.keys().hasOnly(['term','reading','meaning','example','exampleMeaning','explanation'])
+        && recordedCardField(change, before, data, 'term', op.changeNumber)
+        && recordedCardField(change, before, data, 'reading', op.changeNumber)
+        && recordedCardField(change, before, data, 'meaning', op.changeNumber)
+        && recordedCardField(change, before, data, 'example', op.changeNumber)
+        && recordedCardField(change, before, data, 'exampleMeaning', op.changeNumber)
+        && recordedCardField(change, before, data, 'explanation', op.changeNumber)
+        && data.get('deleted', false) == (op.kind == 'cardDelete');
+    }
+
     // Original card material is deliberately read-only for this app.
     match /users/{uid}/vocabBooks/{bookId} {
       allow read: if owner(uid);
@@ -31,13 +105,22 @@ service cloud.firestore {
       allow read, write: if owner(uid);
     }
     match /users/{uid}/learningStateV2/{deviceId} {
-      allow read, write: if owner(uid);
+      allow read: if owner(uid);
+      allow create, update: if owner(uid) && (
+        !exists(/databases/$(database)/documents/users/$(uid)/learningSync/meta)
+        || !('minimumProtocol' in get(/databases/$(database)/documents/users/$(uid)/learningSync/meta).data)
+        || ('protocol' in request.resource.data && request.resource.data.protocol is int
+          && request.resource.data.protocol >= get(/databases/$(database)/documents/users/$(uid)/learningSync/meta).data.minimumProtocol));
       match /versions/{revision} {
         allow read, write: if owner(uid);
         match /chunks/{chunkId} {
           allow read, write: if owner(uid);
         }
       }
+    }
+    match /users/{uid}/learningSync/{documentId} {
+      allow read: if owner(uid);
+      allow write: if false;
     }
     match /users/{uid}/syncSignals/{signalId} {
       allow read, write: if owner(uid);
@@ -57,38 +140,71 @@ service cloud.firestore {
     match /users/{uid}/cardBooks/{bookId} {
       allow read: if owner(uid);
       allow create: if owner(uid) && cardCutover(uid)
+        && (!atomicCardsRequired(uid) || atomicBookWrite(uid, bookId))
         && request.resource.data.keys().hasOnly([
           'schema', 'id', 'name', 'isFavorite', 'sessionOverrides',
           'wordOrder', 'nextChange', 'updatedAt', 'deleted'
-        ]);
+          , 'lastOperationId', 'lastOperationKind'
+        ]) && request.resource.data.id == bookId
+        && request.resource.data.name is string
+        && request.resource.data.wordOrder is list
+        && request.resource.data.nextChange is int;
       allow update: if owner(uid) && cardCutover(uid)
+        && (!atomicCardsRequired(uid) || atomicBookWrite(uid, bookId))
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
           'name', 'isFavorite', 'sessionOverrides', 'wordOrder',
           'nextChange', 'updatedAt', 'deleted'
+          , 'lastOperationId', 'lastOperationKind'
         ])
         && request.resource.data.nextChange is int
-        && request.resource.data.nextChange >= resource.data.nextChange;
+        && request.resource.data.nextChange >= resource.data.nextChange
+        && request.resource.data.name is string
+        && request.resource.data.wordOrder is list
+        && (!resource.data.get('deleted', false)
+          || request.resource.data.get('deleted', false)
+          || request.resource.data.get('lastOperationKind', '') == 'bookRestore');
       allow delete: if false;
       match /cards/{wordId} {
         allow read: if owner(uid);
         allow update: if owner(uid) && cardCutover(uid)
+          && (!atomicCardsRequired(uid) || atomicCardWrite(uid, bookId, wordId, request.resource.data))
           && cardTextIsValid(request.resource.data)
+          && !getAfter(/databases/$(database)/documents/users/$(uid)/cardBooks/$(bookId)).data.get('deleted', false)
+          && (!resource.data.get('deleted', false)
+            || request.resource.data.get('deleted', false)
+            || request.resource.data.get('lastOperationKind', '') == 'cardRestore')
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
             'term', 'reading', 'meaning', 'example', 'exampleMeaning',
-            'explanation', 'fieldRevisions', 'updatedAt', 'lastOperationId'
+            'explanation', 'fieldRevisions', 'updatedAt', 'lastOperationId',
+            'lastOperationKind', 'deleted'
           ]);
-        allow create, delete: if false;
+        allow create: if owner(uid) && cardCutover(uid)
+          && (!atomicCardsRequired(uid) || atomicCardWrite(uid, bookId, wordId, request.resource.data))
+          && cardTextIsValid(request.resource.data)
+          && request.resource.data.id is int
+          && string(request.resource.data.id) == wordId
+          && !getAfter(/databases/$(database)/documents/users/$(uid)/cardBooks/$(bookId)).data.get('deleted', false)
+          && request.resource.data.keys().hasOnly([
+            'schema','id','term','reading','meaning','example','exampleMeaning',
+            'explanation','fieldRevisions','updatedAt','lastOperationId','lastOperationKind','deleted'
+          ]);
+        allow delete: if false;
       }
       // An immutable recovery trail. The app may append a record but cannot
       // edit or erase an already written record.
       match /changes/{changeId} {
         allow read: if owner(uid);
-        allow create: if owner(uid) && cardCutover(uid);
+        allow create: if owner(uid) && cardCutover(uid)
+          && (!atomicCardsRequired(uid) || (atomicBookWrite(uid, bookId)
+            && getAfter(/databases/$(database)/documents/users/$(uid)/cardBooks/$(bookId)/operations/$(request.resource.data.operationId)).data.changeId == changeId));
         allow update, delete: if false;
       }
       match /operations/{operationId} {
         allow read: if owner(uid);
-        allow create: if owner(uid) && cardCutover(uid);
+        allow create: if owner(uid) && cardCutover(uid)
+          && (!atomicCardsRequired(uid) || (atomicBookWrite(uid, bookId)
+            && request.resource.data.operationId == operationId
+            && getAfter(/databases/$(database)/documents/users/$(uid)/cardBooks/$(bookId)).data.lastOperationId == operationId));
         allow update, delete: if false;
       }
     }

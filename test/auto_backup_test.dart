@@ -3,6 +3,7 @@ import 'dart:math';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:shared_preferences_platform_interface/shared_preferences_platform_interface.dart';
 import 'package:vocaflow/auto_backup.dart';
 import 'package:vocaflow/backup_merge.dart';
 import 'package:vocaflow/cloud_change_tracker.dart';
@@ -15,6 +16,113 @@ void main() {
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
+  });
+  test(
+      'read-only settings success durably clears old errors without claiming upload',
+      () async {
+    final tracker = await CloudChangeTracker.load();
+    await tracker.activateAccount('a');
+    final savedAt = DateTime.utc(2026, 10, 19);
+    await tracker.recordChannelSuccess('settings', savedAt);
+    await tracker.recordSuccess('a', savedAt);
+    await tracker.recordSettingsFailure('unavailable');
+    expect(await tracker.confirmSettingsCheck(tracker.settingsFailureRevision),
+        isTrue);
+    expect(tracker.settingsLastError, isNull);
+    expect(tracker.channelError('settings'), isNull);
+    expect(tracker.lastSuccess('a'), savedAt);
+    expect(tracker.channelStatus('settings'), contains('2026-10-19'));
+    final restarted = await CloudChangeTracker.load();
+    await restarted.activateAccount('a');
+    expect(restarted.settingsLastError, isNull);
+    expect(restarted.channelError('settings'), isNull);
+  });
+  test(
+      'an error-only settings acknowledgement persists even with no queued keys',
+      () async {
+    final tracker = await CloudChangeTracker.load();
+    await tracker.recordSettingsFailure('old');
+    await tracker.acknowledgeSettings([]);
+    expect((await CloudChangeTracker.load()).settingsLastError, isNull);
+  });
+  test('older settings response cannot clear a newer identical failure',
+      () async {
+    final tracker = await CloudChangeTracker.load();
+    await tracker.recordSettingsFailure('unavailable');
+    final observed = tracker.settingsFailureRevision;
+    await tracker.recordSettingsFailure('unavailable');
+    expect(await tracker.confirmSettingsCheck(observed), isFalse);
+    await tracker.acknowledgeSettings([], expectedFailureRevision: observed);
+    expect(tracker.settingsLastError, 'unavailable');
+    expect(tracker.channelError('settings'), 'unavailable');
+    expect((await CloudChangeTracker.load()).settingsLastError, 'unavailable');
+  });
+  test('read-only check leaves pending settings and errors intact', () async {
+    final tracker = await CloudChangeTracker.load();
+    final observed = tracker.settingsFailureRevision;
+    await tracker.markSettings({'termFontSize'});
+    await tracker.recordSettingsFailure('pending failed');
+    expect(await tracker.confirmSettingsCheck(observed), isFalse);
+    expect(await tracker.confirmSettingsCheck(tracker.settingsFailureRevision),
+        isFalse);
+    expect(tracker.snapshot.settingsKeys, {'termFontSize'});
+    expect(tracker.settingsLastError, 'pending failed');
+  });
+  test('failure queued after settings success remains visible', () async {
+    final tracker = await CloudChangeTracker.load();
+    await tracker.recordSettingsFailure('old');
+    final success = tracker.confirmSettingsCheck(
+        tracker.settingsFailureRevision,
+        uploadedAt: DateTime.utc(2026));
+    final failure = tracker.recordSettingsFailure('new');
+    await success;
+    await failure;
+    expect(tracker.settingsLastError, 'new');
+    expect(tracker.channelError('settings'), 'new');
+  });
+  test('late timed-out learning upload cannot publish over a newer snapshot',
+      () {
+    expect(
+        learningHeadWouldRegress({'clock': 200, 'sequence': 4},
+            clock: 100, sequence: 3),
+        isTrue);
+    expect(
+        learningHeadWouldRegress({'clock': 200, 'sequence': 4},
+            clock: 200, sequence: 3),
+        isTrue);
+    expect(
+        learningHeadWouldRegress({'clock': 200, 'sequence': 4},
+            clock: 201, sequence: 1),
+        isFalse);
+    expect(learningHeadWouldRegress({}, clock: 200, sequence: 4), isFalse);
+  });
+  test('disk failure cannot clear the learning or settings retry markers',
+      () async {
+    final tracker = await CloudChangeTracker.load();
+    await tracker.markLearningState();
+    await tracker.markSettings({'card.termFontSize'});
+    final snapshot = tracker.snapshot;
+    final original = SharedPreferencesStorePlatform.instance;
+    SharedPreferencesStorePlatform.instance = _RejectedWrites();
+    addTearDown(() => SharedPreferencesStorePlatform.instance = original);
+    await expectLater(
+        tracker.acknowledgeLearningState(snapshot), throwsStateError);
+    await expectLater(
+        tracker.acknowledgeSettings(snapshot.settingsKeys), throwsStateError);
+    expect(tracker.learningStateDirty, isTrue);
+    expect(tracker.settingsDirty, isTrue);
+  });
+  test('disk failure while clearing a settings error does not report success',
+      () async {
+    final tracker = await CloudChangeTracker.load();
+    await tracker.recordSettingsFailure('unavailable');
+    final original = SharedPreferencesStorePlatform.instance;
+    SharedPreferencesStorePlatform.instance = _RejectedWrites();
+    addTearDown(() => SharedPreferencesStorePlatform.instance = original);
+    await expectLater(
+        tracker.confirmSettingsCheck(tracker.settingsFailureRevision),
+        throwsStateError);
+    expect(tracker.settingsLastError, 'unavailable');
   });
 
   test('device id generation stays inside the web secure-random bound', () {
@@ -611,6 +719,13 @@ void main() {
     expect(store.cloudChanges.managedBookContentDirty, isFalse);
     expect(store.cloudChanges.learningStateDirty, isTrue);
   });
+}
+
+class _RejectedWrites extends InMemorySharedPreferencesStore {
+  _RejectedWrites() : super.empty();
+  @override
+  Future<bool> setValue(String valueType, String key, Object value) async =>
+      false;
 }
 
 class _BrowserBoundRandom implements Random {

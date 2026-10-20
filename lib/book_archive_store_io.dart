@@ -9,7 +9,8 @@ class BookArchiveStore {
   Future<Directory> _directory(String accountId) async {
     final support = await getApplicationSupportDirectory();
     final safe = base64Url.encode(utf8.encode(accountId)).replaceAll('=', '');
-    final directory = Directory('${support.path}${Platform.pathSeparator}book_archives${Platform.pathSeparator}$safe');
+    final directory = Directory(
+        '${support.path}${Platform.pathSeparator}book_archives${Platform.pathSeparator}$safe');
     if (!await directory.exists()) await directory.create(recursive: true);
     return directory;
   }
@@ -25,8 +26,8 @@ class BookArchiveStore {
     final file = File('${directory.path}${Platform.pathSeparator}$id.json');
     if (!await file.exists()) return null;
     try {
-      return BookRestorePoint.fromJson(
-          Map<String, dynamic>.from(jsonDecode(await file.readAsString()) as Map));
+      return BookRestorePoint.fromJson(Map<String, dynamic>.from(
+          jsonDecode(await file.readAsString()) as Map));
     } catch (_) {
       return null;
     }
@@ -44,8 +45,8 @@ class BookArchiveStore {
     await for (final entity in directory.list()) {
       if (entity is! File || !entity.path.endsWith('.json')) continue;
       try {
-        result.add(BookRestorePoint.fromJson(
-            Map<String, dynamic>.from(jsonDecode(await entity.readAsString()) as Map)));
+        result.add(BookRestorePoint.fromJson(Map<String, dynamic>.from(
+            jsonDecode(await entity.readAsString()) as Map)));
       } catch (_) {}
     }
     result.sort((a, b) => b.createdAt.compareTo(a.createdAt));

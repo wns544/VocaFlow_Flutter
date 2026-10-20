@@ -5,7 +5,8 @@ import 'package:file_picker/file_picker.dart';
 
 import 'pronunciation_store.dart';
 
-Future<bool> savePronunciationSelections(PronunciationSelectionStore store) async {
+Future<bool> savePronunciationSelections(
+    PronunciationSelectionStore store) async {
   final path = await FilePicker.platform.saveFile(
     dialogTitle: '발음 선택 내보내기',
     fileName: 'vocaflow-pronunciation-selections.json',

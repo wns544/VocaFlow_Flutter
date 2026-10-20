@@ -1,7 +1,7 @@
 name: vocaflow
 description: A calm, focused vocabulary study app.
 publish_to: "none"
-version: 1.0.56+63
+version: 1.0.61+68
 
 environment:
   sdk: ">=3.4.0 <4.0.0"
@@ -32,6 +32,7 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^6.0.0
+  shared_preferences_platform_interface: ^2.4.2
 
 dependency_overrides:
   flutter_plugin_android_lifecycle: 2.0.23

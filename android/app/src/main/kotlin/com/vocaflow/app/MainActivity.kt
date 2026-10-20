@@ -73,7 +73,7 @@ class MainActivity : FlutterActivity() {
     // authentication preferences and tokens are deliberately excluded.
     private fun preserveSyncRecoveryPoint() {
         val root = getExternalFilesDir(null) ?: return
-        val target = File(root, "sync-recovery-before-61")
+        val target = File(root, "sync-recovery-before-68")
         if (File(target, "complete").exists()) return
         try {
             target.mkdirs()

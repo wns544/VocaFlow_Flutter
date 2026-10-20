@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ko"><meta charset="utf-8"><title>VocaFlow isolated storage lab</title>
+<style>body{font:16px system-ui;margin:32px;max-width:900px}button{margin:8px;padding:12px}pre{white-space:pre-wrap;background:#eee;padding:16px}</style>
+<h1>VocaFlow 로컬 격리 검수</h1>
+<p>운영 Firebase 연결 없음 · 합성 데이터만 사용 · localhost 전용</p>
+<div id="controls"></div><pre id="result">Starting…</pre>
+<script>
+// Test-only fault injection. Never included in the application build.
+let originalPut = IDBObjectStore.prototype.put;
+let uncaught = 0;
+window.addEventListener('unhandledrejection', () => uncaught++);
+window.addEventListener('error', () => uncaught++);
+window.labFault = function(mode) {
+  IDBObjectStore.prototype.put = mode === 'quota' ? function() {
+    throw new DOMException('Synthetic quota failure', 'QuotaExceededError');
+  } : mode === 'abort' ? function(...args) {
+    const request = originalPut.apply(this, args);
+    this.transaction.abort();
+    return request;
+  } : originalPut;
+};
+window.labUncaught = () => uncaught;
+</script>
+<script defer src="lab.js"></script></html>

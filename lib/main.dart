@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'web_writer_guard.dart';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:ui' show FrameTiming;
@@ -287,9 +288,15 @@ Future<bool> waitForStartupSync(
 }
 
 class VocaFlowApp extends StatefulWidget {
-  const VocaFlowApp({super.key, this.firebaseInitialization});
+  const VocaFlowApp({
+    super.key,
+    this.firebaseInitialization,
+    this.acquireWebWriter,
+  });
 
   final Future<bool>? firebaseInitialization;
+  @visibleForTesting
+  final Future<void> Function()? acquireWebWriter;
 
   @override
   State<VocaFlowApp> createState() => _VocaFlowAppState();
@@ -343,6 +350,9 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
   }
 
   Future<void> _loadLocalState() async {
+    // Acquire before loading ANY shared cache or starting sync. Two web tabs
+    // otherwise use stale whole-journal snapshots and the same replica ID.
+    await (widget.acquireWebWriter ?? ensureWebWriter)();
     final localState = VocaStore.load();
     if (kReleaseMode) {
       await Future<void>.delayed(flutterSplashMinimumDuration);
@@ -516,7 +526,12 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
         key: const ValueKey('startup-error-app'),
         debugShowCheckedModeBanner: false,
         theme: theme,
-        home: _StartupFailureScreen(onRetry: _retryLocalLoad),
+        home: _StartupFailureScreen(
+          onRetry: _retryLocalLoad,
+          writerError: startupError is WebWriterUnavailable
+              ? startupError as WebWriterUnavailable
+              : null,
+        ),
       );
     }
     if (loadedStore == null || !startupSyncReady) {
@@ -645,9 +660,10 @@ class _StartupSyncScreen extends StatelessWidget {
 }
 
 class _StartupFailureScreen extends StatelessWidget {
-  const _StartupFailureScreen({required this.onRetry});
+  const _StartupFailureScreen({required this.onRetry, this.writerError});
 
   final VoidCallback onRetry;
+  final WebWriterUnavailable? writerError;
 
   @override
   Widget build(BuildContext context) {
@@ -658,14 +674,15 @@ class _StartupFailureScreen extends StatelessWidget {
           child: Column(mainAxisSize: MainAxisSize.min, children: [
             const Icon(Icons.cloud_off_rounded, color: coral, size: 42),
             const SizedBox(height: 16),
-            const Text(
-              '시작 정보를 불러오지 못했습니다.',
+            Text(
+              writerError?.title ?? '시작 정보를 불러오지 못했습니다.',
               textAlign: TextAlign.center,
-              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 18),
+              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 18),
             ),
             const SizedBox(height: 8),
-            const Text(
-              '저장된 데이터는 삭제되지 않았습니다. 잠시 후 다시 시도해 주세요.',
+            Text(
+              writerError?.detail ??
+                  '저장된 데이터는 삭제되지 않았습니다. 잠시 후 다시 시도해 주세요.',
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 20),
@@ -1972,7 +1989,7 @@ class CardStudyPage extends StatefulWidget {
 class _CardStudyPageState extends State<CardStudyPage>
     with WidgetsBindingObserver, RouteAware {
   late final List<Word> queue;
-  late final int total;
+  late int total;
   late final Map<Word, String> _bookIdsByWord;
   final reviewed = <String>{};
   final roundUnknown = <Word>[];
@@ -2030,23 +2047,37 @@ class _CardStudyPageState extends State<CardStudyPage>
   final undoHistory = <StudyDecision>[];
   ModalRoute<dynamic>? _route;
   DateTime? _activeStudyUpdatedAt;
+  String? _activeStudyProgressId;
+  ActiveStudy? _sessionContext;
 
   bool get horizontalSwipe => widget.store.horizontalSwipe;
-  String? get activeBookId => widget.resume?.bookId ?? widget.bookId;
-  int? get activeRangeStart => widget.resume?.rangeStart ?? widget.rangeStart;
-  int? get activeRangeEnd => widget.resume?.rangeEnd ?? widget.rangeEnd;
+  String? get activeBookId =>
+      _sessionContext?.bookId ?? widget.resume?.bookId ?? widget.bookId;
+  int? get activeRangeStart =>
+      _sessionContext?.rangeStart ??
+      widget.resume?.rangeStart ??
+      widget.rangeStart;
+  int? get activeRangeEnd =>
+      _sessionContext?.rangeEnd ?? widget.resume?.rangeEnd ?? widget.rangeEnd;
   String? get activeSourceMode =>
-      widget.resume?.sourceMode ?? widget.sourceMode;
+      _sessionContext?.sourceMode ??
+      widget.resume?.sourceMode ??
+      widget.sourceMode;
   bool get isRangeCourse =>
       activeBookId != null &&
       activeRangeStart != null &&
       activeRangeEnd != null;
   List<int> get activeSessionIndexes =>
-      widget.resume?.sessionIndexes ?? widget.sessionIndexes;
+      _sessionContext?.sessionIndexes ??
+      widget.resume?.sessionIndexes ??
+      widget.sessionIndexes;
   Map<String, List<int>> get activeSessionSelections {
-    final resumed = widget.resume?.sessionSelections ?? const {};
+    final resumed = _sessionContext?.sessionSelections ??
+        widget.resume?.sessionSelections ??
+        const {};
     if (resumed.isNotEmpty) return resumed;
-    if (widget.sessionSelections.isNotEmpty) return widget.sessionSelections;
+    if (_sessionContext == null && widget.sessionSelections.isNotEmpty)
+      return widget.sessionSelections;
     final bookId = activeBookId;
     return bookId == null || activeSessionIndexes.isEmpty
         ? const {}
@@ -2172,6 +2203,11 @@ class _CardStudyPageState extends State<CardStudyPage>
         for (final word in book.words) word: book.id,
     };
     ActiveStudy? resolvedResume = widget.resume;
+    if (resolvedResume != null && widget.useSavedResume) {
+      resolvedResume = widget.store
+              .getActiveStudyFor(widget.store.activeStudyKey(resolvedResume)) ??
+          resolvedResume;
+    }
     if (resolvedResume == null && widget.useSavedResume) {
       if (widget.rangeStart != null &&
           widget.rangeEnd != null &&
@@ -2191,6 +2227,7 @@ class _CardStudyPageState extends State<CardStudyPage>
       }
     }
     final resume = resolvedResume;
+    _sessionContext = resume;
     if (resume == null) {
       final words = widget.words ?? widget.store.nextWords();
       queue = shuffleNewStudyQueues
@@ -2200,6 +2237,7 @@ class _CardStudyPageState extends State<CardStudyPage>
       roundTotal = queue.length;
     } else {
       _activeStudyUpdatedAt = resume.updatedAt;
+      _activeStudyProgressId = resume.progress['id'] as String?;
       queue = widget.store.resolveActiveWords(resume);
       // Keep the original-book association even when this is a combined
       // review.  The queue can contain same-id cards from several books, so
@@ -2259,7 +2297,7 @@ class _CardStudyPageState extends State<CardStudyPage>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       // A resumed route already has a stored snapshot. Re-saving it here used
       // to race a just-finished cloud merge and could put an older queue back.
-      if (resume == null) unawaited(persistStudy());
+      if (resume == null) unawaited(persistStudy(progressChanged: true));
       if (mounted) scheduleResumeSnapshotCapture('study');
     });
   }
@@ -2316,7 +2354,8 @@ class _CardStudyPageState extends State<CardStudyPage>
       final latestAt = latest?.updatedAt;
       if (latest == null ||
           latestAt == null ||
-          (_activeStudyUpdatedAt != null &&
+          (latest.progress['id'] == _activeStudyProgressId &&
+              _activeStudyUpdatedAt != null &&
               !latestAt.isAfter(_activeStudyUpdatedAt!))) return;
       _applyMergedActiveStudy(latest);
       unawaited(widget.store.cloudChanges
@@ -2332,7 +2371,13 @@ class _CardStudyPageState extends State<CardStudyPage>
   void _onCardContentChanged() {
     // Content updates retain queue order and face, but always resolve through
     // the stable book/card identity, including mixed-book review sessions.
+    final previousCurrent = queue.firstOrNull;
     for (final list in [queue, roundUnknown]) {
+      list.removeWhere((word) {
+        final bookId = _bookIdsByWord[word] ?? _bookIdForWord(word);
+        return bookId != null &&
+            widget.store.resolveCard(bookId, word.id) == null;
+      });
       for (var i = 0; i < list.length; i++) {
         final previous = list[i];
         final bookId = _bookIdsByWord[previous] ?? _bookIdForWord(previous);
@@ -2344,6 +2389,17 @@ class _CardStudyPageState extends State<CardStudyPage>
           _bookIdsByWord[canonical] = bookId!;
         }
       }
+    }
+    if (previousCurrent != queue.firstOrNull) {
+      revealed = false;
+      showingExplanation = false;
+    }
+    if (previousCurrent != null && queue.isEmpty) {
+      // Content deletion is not a completed learning round.
+      completionValidated = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) Navigator.of(context).maybePop();
+      });
     }
     if (mounted) setState(() {});
   }
@@ -2357,9 +2413,11 @@ class _CardStudyPageState extends State<CardStudyPage>
         currentWord.id != nextWord.id ||
         _bookIdForWord(currentWord) != _bookIdForWord(nextWord);
     setState(() {
+      _sessionContext = latest;
       queue
         ..clear()
         ..addAll(latestQueue);
+      total = latest.total;
       memorized = latest.memorized.clamp(0, total);
       roundNumber = max(1, latest.roundNumber);
       roundTotal = latest.roundTotal > 0 ? latest.roundTotal : queue.length;
@@ -2394,22 +2452,38 @@ class _CardStudyPageState extends State<CardStudyPage>
         ..clear()
         ..addAll(latest.undoHistory);
       _activeStudyUpdatedAt = latest.updatedAt;
+      _activeStudyProgressId = latest.progress['id'] as String?;
     });
   }
 
   Future<void> persistStudy({
     bool markCloudChange = true,
     bool allowWhileExiting = false,
+    bool progressChanged = false,
   }) async {
     if (queue.isEmpty || (exiting && !allowWhileExiting)) return;
     final key = _activeStudyStorageKey;
     final saved = await widget.store.saveActiveStudyFor(key, _studySnapshot(),
         expectedUpdatedAt: _activeStudyUpdatedAt,
+        expectedProgressId: _activeStudyProgressId,
+        progressChanged: progressChanged,
         markCloudChange: markCloudChange);
     if (saved == null) {
       _onLearningStateMerged();
     } else {
       _activeStudyUpdatedAt = saved.updatedAt;
+      _activeStudyProgressId = saved.progress['id'] as String?;
+      if (!progressChanged &&
+          mounted &&
+          !exiting &&
+          (total != saved.total ||
+              memorized != saved.memorized ||
+              roundCompleted != saved.roundCompleted ||
+              activeRangeStart != saved.rangeStart ||
+              activeRangeEnd != saved.rangeEnd ||
+              queue.firstOrNull?.id != saved.queueIds.firstOrNull)) {
+        _applyMergedActiveStudy(saved);
+      }
     }
   }
 
@@ -2681,10 +2755,14 @@ class _CardStudyPageState extends State<CardStudyPage>
       final markMs = markAt.elapsedMilliseconds;
       final persistAt = Stopwatch()..start();
       if (widget.decisionWriter != null) {
-        if (queue.isNotEmpty && !exiting) await persistStudy();
+        if (queue.isNotEmpty && !exiting)
+          await persistStudy(progressChanged: true);
       } else {
         _activeStudyUpdatedAt =
             widget.store.getActiveStudyFor(_activeStudyStorageKey)?.updatedAt;
+        _activeStudyProgressId = widget.store
+            .getActiveStudyFor(_activeStudyStorageKey)
+            ?.progress['id'] as String?;
       }
       final persistMs = persistAt.elapsedMilliseconds;
       if (queuedAt.elapsedMilliseconds >= 24 ||
@@ -2860,7 +2938,13 @@ class _CardStudyPageState extends State<CardStudyPage>
           if (remaining.isEmpty) {
             await _finishRound(recorded: widget.decisionWriter == null);
           } else {
-            await persistStudy();
+            final latest =
+                widget.store.getActiveStudyFor(_activeStudyStorageKey);
+            if (widget.decisionWriter == null && latest != null) {
+              _activeStudyUpdatedAt = latest.updatedAt;
+              _activeStudyProgressId = latest.progress['id'] as String?;
+            }
+            await persistStudy(progressChanged: widget.decisionWriter != null);
           }
         } catch (error, stackTrace) {
           await _recoverFailedRoundTransition(
@@ -2999,7 +3083,7 @@ class _CardStudyPageState extends State<CardStudyPage>
             bookId: decision.bookId ?? activeBookId,
           );
         }
-        await persistStudy();
+        await persistStudy(progressChanged: true);
       } catch (rollbackError, rollbackStackTrace) {
         unawaited(widget.store.cloudChanges.recordDiagnostic(
           'round_transition_rollback_failed',
@@ -3534,7 +3618,7 @@ class _CardStudyPageState extends State<CardStudyPage>
     }
     await widget.store.undoWordDecision(word, undone.previousState,
         bookId: undone.bookId ?? activeBookId);
-    await persistStudy();
+    await persistStudy(progressChanged: true);
     scheduleResumeSnapshotCapture('study');
   }
 
@@ -7768,9 +7852,10 @@ class _SettingsPageState extends State<SettingsPage> {
     );
     if (!confirmed) return;
     await _runCloudTask(() async {
-      final result = await CloudBackup()
-          .syncSettings(const <String, Map<String, dynamic>>{});
-      await widget.store.applySettingsEntries(result.fields);
+      final coordinator = widget.autoBackup;
+      if (coordinator == null)
+        throw StateError('동기화 준비가 끝나지 않았습니다. 잠시 후 다시 시도해 주세요.');
+      await coordinator.manualSettingsRefresh();
       widget.refresh();
       if (mounted) setState(() {});
       _showSnack('클라우드 설정을 확인했습니다.');
@@ -9936,16 +10021,24 @@ Future<bool> _saveEditedWord(
     final feedbackKey = '$bookId/${updated.id}';
     _latestCardFeedback[feedbackKey] = operation.id;
     final coordinator = AutoBackupCoordinator.activeInstance;
+    final feedbackAccount = coordinator?.user?.uid;
     unawaited(() async {
       CardSaveOutcome outcome;
       try {
         outcome = coordinator != null && identical(coordinator.store, store)
             ? await coordinator.saveEditedCard(operation)
             : CardSaveOutcome.waiting;
-      } catch (_) {
+      } catch (error, stackTrace) {
+        await store.cloudChanges
+            .recordDiagnostic('card_feedback_failed', data: {
+          'operationId': operation.id,
+          'error': error.toString(),
+          'stackTrace': stackTrace.toString(),
+        });
         outcome = CardSaveOutcome.failed;
       }
       if (messenger == null || !messenger.mounted) return;
+      if (coordinator?.user?.uid != feedbackAccount) return;
       if (_latestCardFeedback[feedbackKey] != operation.id) return;
       final message = switch (outcome) {
         CardSaveOutcome.saved => operation.fields.length == 1 &&
@@ -9962,6 +10055,9 @@ Future<bool> _saveEditedWord(
         if (receipt != null) {
           final result = await receipt;
           if (messenger.mounted &&
+              coordinator.user?.uid == feedbackAccount &&
+              (result == CardSaveOutcome.saved ||
+                  result == CardSaveOutcome.failed) &&
               _latestCardFeedback[feedbackKey] == operation.id &&
               WidgetsBinding.instance.lifecycleState ==
                   AppLifecycleState.resumed) {
@@ -9974,7 +10070,13 @@ Future<bool> _saveEditedWord(
       }
     }());
     return true;
-  } catch (_) {
+  } catch (error, stackTrace) {
+    await store.cloudChanges.recordDiagnostic('card_local_save_failed', data: {
+      'bookId': bookId,
+      'wordId': updated.id,
+      'error': error.toString(),
+      'stackTrace': stackTrace.toString(),
+    });
     if (messenger != null && messenger.mounted) {
       messenger.showSnackBar(
           const SnackBar(content: Text('기기에 저장하지 못했어요. 수정 내용을 다시 확인해 주세요.')));

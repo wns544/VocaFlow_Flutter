@@ -144,8 +144,8 @@ class PronunciationSelectionStore extends ChangeNotifier {
     var imported = 0;
     for (final item in raw) {
       if (item is! Map) throw const FormatException('Invalid selection item.');
-      final selection = PronunciationSelection.fromJson(
-          Map<String, dynamic>.from(item));
+      final selection =
+          PronunciationSelection.fromJson(Map<String, dynamic>.from(item));
       final reference = selection.reference;
       if (reference.bookId.isEmpty ||
           reference.wordId <= 0 ||

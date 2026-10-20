@@ -65,6 +65,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     DateTime Function()? now,
     this.idleDelay = const Duration(seconds: 15),
     this.minimumInterval = const Duration(seconds: 15),
+    this.cardFeedbackDelay = const Duration(seconds: 5),
   })  : cloud = cloud ?? CloudBackup(),
         connectivity = connectivity ?? Connectivity(),
         _now = now ?? DateTime.now;
@@ -76,6 +77,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   final DateTime Function() _now;
   final Duration idleDelay;
   final Duration minimumInterval;
+  final Duration cardFeedbackDelay;
   final BookArchiveStore _archiveStore = BookArchiveStore();
 
   Timer? _timer;
@@ -107,7 +109,9 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   Timer? _cardRetryTimer;
   int _cardFailures = 0;
   bool _cardPermissionBlocked = false;
+  bool _cardRetryExhausted = false;
   bool _legacyCardWorkNeedsReview = false;
+  int _observedCardVersion = -1;
   final Map<String, Completer<CardSaveOutcome>> _cardReceipts = {};
   DateTime? _firstLearningPendingAt;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
@@ -146,6 +150,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       store.cloudChanges.snapshot.settingsKeys.length +
       (store.cloudChanges.managedBookContentDirty ? 1 : 0) +
       store.cardChanges.pendingCount +
+      store.cardChanges.refreshCards.length +
       (store.cloudChanges.archiveContentDirty ? 1 : 0);
   DateTime? get lastSuccess =>
       user == null ? null : store.cloudChanges.lastSuccess(user!.uid);
@@ -189,7 +194,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     String time(DateTime? value) =>
         value == null ? '아직 없음' : value.toLocal().toString().substring(0, 16);
     final state = store.cloudChanges;
-    return '카드 수정: ${store.cardChanges.pendingCount}개 대기 · 마지막 저장 ${time(store.cardChanges.lastSuccess)}'
+    return '카드 수정: ${store.cardChanges.pendingCount}개 대기 · 최신값 확인 ${store.cardChanges.refreshCards.length}개 · 마지막 저장 ${time(store.cardChanges.lastSuccess)}'
         '${store.cardChanges.lastError == null ? '' : '\n카드 오류: ${store.cardChanges.lastError}'}'
         '\n학습: ${state.learningStateDirty ? '전송 대기' : '대기 없음'} · ${state.channelStatus('learning')}'
         '\n설정: ${state.snapshot.settingsKeys.length}개 대기 · ${state.channelStatus('settings')}'
@@ -198,19 +203,74 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   }
 
   Future<CardSaveOutcome> saveEditedCard(CardChange change) async {
-    if (!store.cardChanges.contains(change.id)) return CardSaveOutcome.saved;
-    if (user == null) return CardSaveOutcome.waiting;
-    final results = await connectivity.checkConnectivity();
-    if (!store.cardChanges.contains(change.id)) return CardSaveOutcome.saved;
-    if (results.every((result) => result == ConnectivityResult.none)) {
-      _requestCardDrain(resetFailure: true);
-      return CardSaveOutcome.offline;
+    final accountId = user?.uid;
+    if (accountId == null) return CardSaveOutcome.waiting;
+    // Subscribe before preparation/network awaits: an already-running drain
+    // can fail or succeed while this caller is still preparing its account.
+    if (_cardReceipts[change.id]?.isCompleted == true) {
+      _cardReceipts.remove(change.id);
     }
     final receipt = _cardReceipts.putIfAbsent(
         change.id, () => Completer<CardSaveOutcome>());
-    _requestCardDrain(resetFailure: true);
-    return receipt.future.timeout(const Duration(seconds: 5),
-        onTimeout: () => CardSaveOutcome.waiting);
+    try {
+      await _prepareAccount();
+      if (user?.uid != accountId) return CardSaveOutcome.waiting;
+      if (store.cardChanges.wasAcknowledged(change.id))
+        return CardSaveOutcome.saved;
+      if (!store.cardChanges.contains(change.id))
+        return CardSaveOutcome.waiting;
+      final results = await connectivity.checkConnectivity();
+      if (user?.uid != accountId) return CardSaveOutcome.waiting;
+      if (store.cardChanges.wasAcknowledged(change.id))
+        return CardSaveOutcome.saved;
+      if (!store.cardChanges.contains(change.id))
+        return CardSaveOutcome.waiting;
+      if (results.every((result) => result == ConnectivityResult.none)) {
+        _requestCardDrain(resetFailure: true);
+        return CardSaveOutcome.offline;
+      }
+      _requestCardDrain(resetFailure: true);
+      return await receipt.future
+          .timeout(cardFeedbackDelay, onTimeout: () => CardSaveOutcome.waiting);
+    } catch (error, stackTrace) {
+      if (user?.uid == accountId) {
+        await _recordCardFailure(error, stackTrace, operationId: change.id);
+      }
+      return CardSaveOutcome.failed;
+    }
+  }
+
+  Future<void> _recordCardFailure(Object error, StackTrace stackTrace,
+      {String? operationId}) async {
+    final readBackOnly =
+        !store.cardChanges.isDirty && store.cardChanges.refreshCards.isNotEmpty;
+    await store.cardChanges.recordFailure(error);
+    await store.cloudChanges.recordChannelFailure('cards', error);
+    await store.cloudChanges.recordLog(
+        '${readBackOnly ? '카드 서버 저장 후 최신값 확인 실패' : '카드 서버 전송 실패'} · ${operationId ?? '대기 작업'} · $error');
+    await store.cloudChanges.recordDiagnostic(
+        readBackOnly ? 'card_readback_failed' : 'card_upload_failed',
+        data: {
+          'operationId': operationId,
+          'pendingOperationIds':
+              store.cardChanges.pending.map((op) => op.id).toList(),
+          'error': error.toString(),
+          'stackTrace': stackTrace.toString(),
+        });
+  }
+
+  void _completeCardReceipt(String operationId, CardSaveOutcome result) {
+    final receipt = _cardReceipts[operationId];
+    if (receipt != null && !receipt.isCompleted) receipt.complete(result);
+    if (_cardReceipts.length > 512) {
+      final completed = _cardReceipts.entries
+          .where((entry) => entry.value.isCompleted)
+          .map((entry) => entry.key)
+          .toList();
+      for (final id in completed.take(_cardReceipts.length - 512)) {
+        _cardReceipts.remove(id);
+      }
+    }
   }
 
   Future<CardSaveOutcome>? cardSaveReceipt(String operationId) =>
@@ -220,13 +280,16 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     if (resetFailure) {
       _cardPermissionBlocked = false;
       _cardFailures = 0;
+      _cardRetryExhausted = false;
       _cardRetryTimer?.cancel();
       _cardRetryTimer = null;
     }
-    if (user == null ||
-        !store.cardChanges.isDirty ||
+    if (_disposed ||
+        user == null ||
+        !store.cardChanges.hasWork ||
         _cardDrain != null ||
         _cardPermissionBlocked ||
+        _cardRetryExhausted ||
         _cardRetryTimer != null) return;
     _cardDrain = () async {
       final accountId = user?.uid;
@@ -237,15 +300,12 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
           throw StateError('선택한 네트워크에 연결되어 있지 않습니다.');
         await _sendPendingCardChanges(reason: '카드 즉시 저장');
         _cardFailures = 0;
-      } catch (error) {
+      } catch (error, stackTrace) {
         failed = true;
         if (user?.uid != accountId) return;
-        await store.cardChanges.recordFailure(error);
-        await store.cloudChanges.recordChannelFailure('cards', error);
+        await _recordCardFailure(error, stackTrace);
         for (final pending in store.cardChanges.pending) {
-          final receipt = _cardReceipts.remove(pending.id);
-          if (receipt != null && !receipt.isCompleted)
-            receipt.complete(CardSaveOutcome.failed);
+          _completeCardReceipt(pending.id, CardSaveOutcome.failed);
         }
         _cardPermissionBlocked = error.toString().contains('permission-denied');
         const delays = [
@@ -258,11 +318,13 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
             _cardRetryTimer = null;
             _requestCardDrain();
           });
+        } else {
+          _cardRetryExhausted = true;
         }
       } finally {
         _cardDrain = null;
         onChanged?.call();
-        if (!failed && store.cardChanges.isDirty)
+        if (!failed && store.cardChanges.hasWork)
           scheduleMicrotask(_requestCardDrain);
       }
     }();
@@ -274,6 +336,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     if (_preparedAccountId == current.uid && _accountPreparation != null) {
       return _accountPreparation!;
     }
+    _observedCardVersion = -1;
     _preparedAccountId = current.uid;
     return _accountPreparation = () async {
       await store.activateAccount(current.uid);
@@ -281,7 +344,14 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       if (user?.uid != current.uid) {
         throw StateError('동기화 계정이 변경되었습니다.');
       }
-    }();
+    }()
+        .catchError((Object error, StackTrace stackTrace) {
+      if (_preparedAccountId == current.uid) {
+        _preparedAccountId = null;
+        _accountPreparation = null;
+      }
+      Error.throwWithStackTrace(error, stackTrace);
+    });
   }
 
   Future<void> _watchRemoteChanges() async {
@@ -492,7 +562,10 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
           }
           await _watchRemoteChanges();
           if (enabled && initialized) await _seedLearningState();
-        }());
+        }()
+            .catchError((Object error, StackTrace stackTrace) async {
+          await _recordFailure(error, '계정 동기화 준비', stackTrace: stackTrace);
+        }));
       }
       onChanged?.call();
     });
@@ -524,6 +597,10 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
 
   void dispose() {
     _disposed = true;
+    for (final receipt in _cardReceipts.values) {
+      if (!receipt.isCompleted) receipt.complete(CardSaveOutcome.waiting);
+    }
+    _cardReceipts.clear();
     if (activeInstance == this) activeInstance = null;
     WidgetsBinding.instance.removeObserver(this);
     if (store.cloudChanges.onChanged == _handleTrackedChange) {
@@ -711,6 +788,9 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       if (store.cloudChanges.learningStateDirty) {
         throw StateError('클라우드 업로드가 완료되지 않았습니다. 네트워크를 확인한 뒤 다시 시도해 주세요.');
       }
+    } catch (error, stackTrace) {
+      await _recordFailure(error, '이 기기 학습 데이터 업로드', stackTrace: stackTrace);
+      rethrow;
     } finally {
       _syncing = false;
       onChanged?.call();
@@ -739,10 +819,31 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         ownsGate: true,
         pullManagedBooks: false,
       );
+    } catch (error, stackTrace) {
+      await _recordFailure(error, '클라우드 학습 데이터 가져오기', stackTrace: stackTrace);
+      rethrow;
     } finally {
       _syncing = false;
       onChanged?.call();
       if (_hasRemotePending) unawaited(_drainRemoteChanges());
+    }
+  }
+
+  Future<void> manualSettingsRefresh() async {
+    await _prepareAccount();
+    if (user == null) throw StateError('Google login is required.');
+    final accountId = user!.uid;
+    if (_syncing) throw StateError('다른 동기화가 진행 중입니다. 잠시 후 다시 시도해 주세요.');
+    _syncing = true;
+    try {
+      if (!await _syncSettingsWithoutBlockingLearning(
+          reason: '수동 설정 확인', readOnly: true)) {
+        throw StateError('클라우드 설정을 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.');
+      }
+      if (user?.uid != accountId) throw StateError('동기화 계정이 변경되었습니다.');
+    } finally {
+      _syncing = false;
+      onChanged?.call();
     }
   }
 
@@ -897,7 +998,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         (!store.cloudChanges.learningStateDirty &&
             !store.cloudChanges.settingsDirty &&
             !store.cloudChanges.managedBookContentDirty &&
-            !store.cardChanges.isDirty &&
+            !store.cardChanges.hasWork &&
             !store.cloudChanges.archiveContentDirty)) return;
     _flushingForBackground = true;
     _cancelScheduledUpload();
@@ -920,7 +1021,10 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   void _handleTrackedChange() {
     if (_disposed) return;
     onChanged?.call();
-    _requestCardDrain();
+    final latest = store.cardChanges.pending.lastOrNull?.localVersion ?? -1;
+    final newWork = latest > _observedCardVersion;
+    if (newWork) _observedCardVersion = latest;
+    _requestCardDrain(resetFailure: newWork);
     if (accountBookSyncEnabled &&
         ((enabled && store.cloudChanges.learningStateDirty) ||
             store.cloudChanges.settingsDirty ||
@@ -944,6 +1048,12 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     String reason = '자동 업로드',
     bool isRetry = false,
   }) {
+    if (_disposed) return;
+    if (!isRetry &&
+        _retryBudgetExhausted &&
+        _failedGeneration ==
+            store.cloudChanges.snapshot.learningStateGeneration &&
+        !ignoreMinimumInterval) return;
     if ((!isRetry && _syncing) ||
         !accountBookSyncEnabled ||
         ((!enabled || !initialized || !store.cloudChanges.learningStateDirty) &&
@@ -951,7 +1061,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
             !store.cloudChanges.profileDirty &&
             !store.cloudChanges.dictionaryOpenSettingDirty &&
             !store.cloudChanges.managedBookContentDirty &&
-            !store.cardChanges.isDirty &&
+            !store.cardChanges.hasWork &&
             !store.cloudChanges.archiveContentDirty)) return;
     final generation = store.cloudChanges.snapshot.learningStateGeneration;
     if (_timer != null &&
@@ -988,7 +1098,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     if (!isRetry && !ignoreMinimumInterval && _lastSuccessAt != null) {
       final untilAllowed =
           _lastSuccessAt!.add(minimumInterval).difference(_now());
-      if (untilAllowed > delay && !store.cardChanges.isDirty)
+      if (untilAllowed > delay && !store.cardChanges.hasWork)
         delay = untilAllowed;
     }
     if (delay.isNegative) delay = Duration.zero;
@@ -1024,12 +1134,17 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   }
 
   Future<void> _uploadPending({String reason = '자동 업로드'}) async {
-    await _prepareAccount();
+    try {
+      await _prepareAccount();
+    } catch (error, stackTrace) {
+      await _recordFailure(error, '$reason · 계정 준비', stackTrace: stackTrace);
+      return;
+    }
     final hasNonLearningWork = store.cloudChanges.settingsDirty ||
         store.cloudChanges.profileDirty ||
         store.cloudChanges.dictionaryOpenSettingDirty ||
         store.cloudChanges.managedBookContentDirty ||
-        store.cardChanges.isDirty ||
+        store.cardChanges.hasWork ||
         store.cloudChanges.archiveContentDirty;
     if (_syncing ||
         (!hasNonLearningWork &&
@@ -1046,7 +1161,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         !store.cloudChanges.profileDirty &&
         !store.cloudChanges.dictionaryOpenSettingDirty &&
         !store.cloudChanges.managedBookContentDirty &&
-        !store.cardChanges.isDirty &&
+        !store.cardChanges.hasWork &&
         !store.cloudChanges.archiveContentDirty;
     final generationAtStart =
         store.cloudChanges.snapshot.learningStateGeneration;
@@ -1066,6 +1181,29 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       if (!networkAllowed) {
         throw StateError('선택한 네트워크에 연결되어 있지 않습니다.');
       }
+      // A mixed queue must start learning before waiting for settings or
+      // archives; an unrelated timeout cannot delay the progress request.
+      Object? learningSyncError;
+      StackTrace? learningSyncStackTrace;
+      if (!onlySettingsWerePending &&
+          enabled &&
+          initialized &&
+          store.cloudChanges.learningStateDirty) {
+        try {
+          await _pullLearningState(
+              reason: '$reason · 선행 병합',
+              ownsGate: true,
+              pullManagedBooks: false);
+          if (store.cloudChanges.learningStateDirty) {
+            await _sendLearningState(reason: reason);
+          }
+        } catch (error, stackTrace) {
+          learningSyncError = error;
+          learningSyncStackTrace = stackTrace;
+          await store.cloudChanges
+              .recordLog('$reason · 학습 전송 실패 · 다른 대기 작업 확인 계속');
+        }
+      }
       var settingsSucceeded = true;
       if (settingsWerePending) {
         settingsSucceeded =
@@ -1083,12 +1221,6 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       StackTrace? contentSyncStackTrace;
       // Progress has its own deadline. A card-only edit never reads progress
       // and a stalled archive cannot delay the next progress upload.
-      if (enabled && initialized && store.cloudChanges.learningStateDirty) {
-        await _pullLearningState(
-            reason: '$reason · 선행 병합', ownsGate: true, pullManagedBooks: false);
-        if (store.cloudChanges.learningStateDirty)
-          await _sendLearningState(reason: reason);
-      }
       final contentWasPending = (store.cloudChanges.managedBookContentDirty &&
               !_legacyCardWorkNeedsReview) ||
           store.cloudChanges.archiveContentDirty;
@@ -1143,6 +1275,12 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
           contentSyncStackTrace ?? StackTrace.current,
         );
       }
+      if (learningSyncError != null) {
+        Error.throwWithStackTrace(learningSyncError, learningSyncStackTrace!);
+      }
+      if (!settingsSucceeded) {
+        throw StateError('설정 동기화에 실패했습니다. 학습 전송 결과는 별도로 보존됩니다.');
+      }
       _failureCount = 0;
       _failedGeneration = null;
       _retryBudgetExhausted = false;
@@ -1191,6 +1329,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     learningStateVerified = false;
     if (!ownsGate) _syncing = true;
     _downloading = true;
+    final accountId = user?.uid;
     try {
       await store.cloudChanges.recordLog('$reason · learningState 내려받기 시작');
       await store.cloudChanges.recordDiagnostic('sync_download_started', data: {
@@ -1201,6 +1340,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         await wordRelations.syncFromCloud();
       }
       final snapshots = await cloud.downloadLearningStates();
+      if (user?.uid != accountId) return;
       if (snapshots.every((snapshot) => snapshot['schema'] != 2)) {
         await store.importLegacyForSyncV2(snapshots);
       }
@@ -1222,26 +1362,40 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _syncSettings({required String reason}) async {
+  Future<void> _syncSettings(
+      {required String reason, bool readOnly = false}) async {
     final current = user;
     if (current == null) return;
     final snapshot = store.cloudChanges.snapshot;
-    final captured = store.settingsEntries(snapshot.settingsKeys);
+    final failureRevision = store.cloudChanges.settingsFailureRevision;
+    final accountEpoch = store.cloudChanges.accountEpoch;
+    final captured = readOnly
+        ? <String, Map<String, dynamic>>{}
+        : store.settingsEntries(snapshot.settingsKeys);
     final result = await cloud.syncSettings(captured);
     // A tap made during the request keeps its pending marker. A cloud value
     // may only replace a field that is still exactly the captured local value.
-    final unchanged = store.unchangedSettingsKeys(result.submitted);
-    if (unchanged.isNotEmpty) {
-      await store.cloudChanges.acknowledgeSettings(unchanged);
-    }
-    await store.applySettingsEntries(
-      result.fields,
-      expectedVersions: result.submitted,
-    );
+    if (user?.uid != current.uid ||
+        store.cloudChanges.accountEpoch != accountEpoch) return;
+    await store.runLocalMutation(() async {
+      if (user?.uid != current.uid ||
+          store.cloudChanges.accountEpoch != accountEpoch) return;
+      final unchanged = store.unchangedSettingsKeys(result.submitted);
+      await store.applySettingsEntries(result.fields,
+          expectedVersions: result.submitted);
+      if (unchanged.isNotEmpty) {
+        await store.cloudChanges.acknowledgeSettings(unchanged,
+            expectedFailureRevision: failureRevision);
+      }
+      final confirmed = await store.cloudChanges.confirmSettingsCheck(
+          failureRevision,
+          uploadedAt: captured.isEmpty ? null : _now());
+      if (confirmed && captured.isNotEmpty) {
+        await store.cloudChanges.recordSuccess(current.uid, _now());
+        _lastSuccessAt = _now();
+      }
+    });
     if (captured.isNotEmpty) {
-      await store.cloudChanges.recordChannelSuccess('settings', _now());
-      await store.cloudChanges.recordSuccess(current.uid, _now());
-      _lastSuccessAt = _now();
       await store.cloudChanges.recordLog('$reason · 설정 저장 완료');
     }
   }
@@ -1251,24 +1405,30 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   /// and mixed uploads so a settings outage cannot strand card/session data.
   Future<bool> _syncSettingsWithoutBlockingLearning({
     required String reason,
-  }) =>
-      isolateSettingsSyncFailure(
-        operation: () => _syncSettings(reason: reason),
-        onFailure: (error, stackTrace) async {
-          await store.cloudChanges.recordSettingsFailure(error);
-          await store.cloudChanges.recordChannelFailure('settings', error);
-          await store.cloudChanges.recordLog(
-            '$reason · 설정 동기화 실패 · 학습 기록 동기화는 계속 진행',
-          );
-          await store.cloudChanges
-              .recordDiagnostic('settings_sync_failed', data: {
-            'reason': reason,
-            'error': error.toString(),
-            'learningContinues': true,
-            'stackTrace': stackTrace.toString(),
-          });
-        },
-      );
+    bool readOnly = false,
+  }) {
+    final accountId = user?.uid;
+    final accountEpoch = store.cloudChanges.accountEpoch;
+    return isolateSettingsSyncFailure(
+      operation: () => _syncSettings(reason: reason, readOnly: readOnly),
+      onFailure: (error, stackTrace) async {
+        if (user?.uid != accountId ||
+            store.cloudChanges.accountEpoch != accountEpoch) return;
+        await store.cloudChanges
+            .recordSettingsFailure(error, expectedAccountEpoch: accountEpoch);
+        await store.cloudChanges.recordLog(
+          '$reason · 설정 동기화 실패 · 학습 기록 동기화는 계속 진행',
+        );
+        await store.cloudChanges
+            .recordDiagnostic('settings_sync_failed', data: {
+          'reason': reason,
+          'error': error.toString(),
+          'learningContinues': true,
+          'stackTrace': stackTrace.toString(),
+        });
+      },
+    );
+  }
 
   Future<void> _sendManagedBookContent({required String reason}) async {
     if (!store.cloudChanges.managedBookContentDirty) return;
@@ -1311,13 +1471,14 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   }
 
   Future<void> _sendPendingCardChanges({required String reason}) async {
-    if (!store.cardChanges.isDirty) return;
+    if (!store.cardChanges.hasWork) return;
     final current = user;
     if (current == null) return;
     final deviceId = await store.cloudChanges.deviceId();
     // Drain exact operation IDs. A newer edit appended in flight is a
     // separate operation and cannot be acknowledged by this one's receipt.
     var sentCount = 0;
+    final structuralBooks = <String>{};
     while (store.cardChanges.isDirty && user?.uid == current.uid) {
       final change = store.cardChanges.pending.first;
       try {
@@ -1325,70 +1486,107 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         // Pending fields already protect the optimistic view. Do not reapply
         // an older sent patch over a newer edit made during the request.
         if (user?.uid != current.uid) return;
+        if (change.isStructural) {
+          await store.cardChanges.recordServerDeletions(change.bookId,
+              deleted: change.kind == 'bookDelete',
+              cards: change.isBookOperation
+                  ? []
+                  : [
+                      {
+                        'id': change.wordId,
+                        'deleted': change.kind == 'cardDelete'
+                      }
+                    ]);
+        }
         await store
             .runLocalMutation(() => store.cardChanges.acknowledge(change));
-        final receipt = _cardReceipts.remove(change.id);
-        if (receipt != null && !receipt.isCompleted)
-          receipt.complete(CardSaveOutcome.saved);
+        _completeCardReceipt(change.id, CardSaveOutcome.saved);
         sentCount++;
         await store.cloudChanges.recordChannelSuccess('cards', _now());
-        // Pull the current committed card after acknowledgement. A remote
-        // update received while the local patch was pending may have been
-        // deliberately masked, even though its book cursor already advanced.
-        try {
-          final server = await cloud.downloadCard(change.bookId, change.wordId);
-          if (server != null && user?.uid == current.uid) {
-            await store.applyCardBookChanges(change.bookId, [
-              CardBookChange(
-                number: 0,
-                wordId: change.wordId,
-                fields: {
-                  for (final key in [
-                    'term',
-                    'reading',
-                    'meaning',
-                    'example',
-                    'exampleMeaning',
-                    'explanation'
-                  ])
-                    key: server[key] ?? ''
-                },
-                operationId: change.id,
-              )
-            ]);
-            final local = store.resolveCard(change.bookId, change.wordId);
-            if (local != null &&
-                store.cardChanges
-                    .pendingFields(change.bookId, change.wordId)
-                    .isEmpty &&
-                [
-                      local.term,
-                      local.reading,
-                      local.meaning,
-                      local.example,
-                      local.exampleMeaning,
-                      local.explanation
-                    ].join('\u0000') ==
-                    [
-                      'term',
-                      'reading',
-                      'meaning',
-                      'example',
-                      'exampleMeaning',
-                      'explanation'
-                    ].map((key) => server[key] ?? '').join('\u0000')) {
-              await store.cloudChanges
-                  .acknowledgeVerifiedLegacyWord(change.bookId, change.wordId);
-            }
-          }
-        } catch (error) {
-          await store.cloudChanges.recordLog('카드 저장 확인 후 최신값 재확인 대기: $error');
+        await store.cloudChanges
+            .recordDiagnostic('card_upload_succeeded', data: {
+          'operationId': change.id,
+          'bookId': change.bookId,
+          'wordId': change.wordId,
+        });
+        if (change.isStructural) {
+          structuralBooks.add(change.bookId);
+          continue;
         }
       } catch (error) {
         await store.cardChanges.recordFailure(error);
         rethrow;
       }
     }
+    // A receipt may have been durably saved before the app terminated or a
+    // read failed. Recheck without retransmitting the acknowledged edit.
+    for (final entry in store.cardChanges.refreshCards.entries) {
+      final split = entry.key.lastIndexOf('/');
+      final bookId = entry.key.substring(0, split);
+      final wordId = int.parse(entry.key.substring(split + 1));
+      final server = await cloud.downloadCard(bookId, wordId);
+      if (user?.uid != current.uid) return;
+      if (server == null) {
+        throw StateError('저장된 카드의 최신값을 확인하지 못했습니다.');
+      }
+      if (server['deleted'] == true) {
+        if (!await _pullCardBooks(
+            reason: '삭제 카드 재확인', forceBookIds: {bookId})) {
+          throw StateError('삭제된 카드의 재확인이 필요합니다.');
+        }
+      } else {
+        await store.applyCardBookChanges(bookId, [
+          CardBookChange(
+            number: 0,
+            wordId: wordId,
+            operationId: entry.value,
+            fields: {
+              for (final key in [
+                'term',
+                'reading',
+                'meaning',
+                'example',
+                'exampleMeaning',
+                'explanation'
+              ])
+                key: server[key] ?? ''
+            },
+          )
+        ]);
+        final local = store.resolveCard(bookId, wordId);
+        if (local != null &&
+            store.cardChanges.pendingFields(bookId, wordId).isEmpty &&
+            [
+                  local.term,
+                  local.reading,
+                  local.meaning,
+                  local.example,
+                  local.exampleMeaning,
+                  local.explanation
+                ].join('\u0000') ==
+                [
+                  'term',
+                  'reading',
+                  'meaning',
+                  'example',
+                  'exampleMeaning',
+                  'explanation'
+                ].map((key) => server[key] ?? '').join('\u0000')) {
+          await store.cloudChanges
+              .acknowledgeVerifiedLegacyWord(bookId, wordId);
+        }
+      }
+      if (user?.uid != current.uid) return;
+      await store.cardChanges.acknowledgeRefresh(entry.key, entry.value);
+    }
+    if (structuralBooks.isNotEmpty) {
+      if (!await _pullCardBooks(
+          reason: '단어장 구조 저장 확인', forceBookIds: structuralBooks)) {
+        throw StateError('구조 변경은 저장됐지만 최신 단어장 재확인이 필요합니다.');
+      }
+    }
+    if (user?.uid != current.uid) return;
+    await store.cloudChanges.recordChannelSuccess('cards', _now());
     await store.cloudChanges.recordLog('$reason · 카드별 변경 $sentCount개 저장 완료');
   }
 
@@ -1397,13 +1595,16 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   /// A failed apply never advances that cursor, so the same change is safe to
   /// fetch again on the next retry.
   Future<bool> _pullCardBooks(
-      {required String reason, bool forceFull = false}) async {
+      {required String reason,
+      bool forceFull = false,
+      Set<String>? forceBookIds}) async {
     final inFlight = _cardPull;
     if (inFlight != null) {
       final result = await inFlight;
-      if (!forceFull) return result;
+      if (!forceFull && forceBookIds == null) return result;
     }
-    final task = _pullCardBooksOnce(reason: reason, forceFull: forceFull);
+    final task = _pullCardBooksOnce(
+        reason: reason, forceFull: forceFull, forceBookIds: forceBookIds);
     _cardPull = task;
     try {
       return await task;
@@ -1413,19 +1614,40 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   }
 
   Future<bool> _pullCardBooksOnce(
-      {required String reason, bool forceFull = false}) async {
+      {required String reason,
+      bool forceFull = false,
+      Set<String>? forceBookIds}) async {
     final accountId = user?.uid;
     try {
       if (!await cloud.isCardSyncCutoverEnabled()) return true;
       final metadata = await cloud.downloadCardBookMetadata();
+      if (store.cloudChanges.managedBookContentDirty) {
+        final pending = store.cloudChanges.snapshot;
+        final ids = {
+          ...pending.bookIds,
+          ...pending.wordIdsByBook.keys,
+          ...pending.deletedWordIdsByBook.keys,
+          ...pending.deletedBookIds
+        }..remove('default');
+        final originals = await cloud.downloadCardBooks(ids: ids);
+        if (user?.uid != accountId) return false;
+        _legacyCardWorkNeedsReview =
+            !await store.verifyLegacyCardWork(originals, metadata);
+      }
       for (final parent in metadata) {
         if (user?.uid != accountId) return false;
         final bookId = parent['id']?.toString() ?? '';
         if (bookId.isEmpty) continue;
         final remoteNumber = (parent['nextChange'] as num?)?.toInt() ?? 0;
+        if (parent['deleted'] == true) {
+          await store.applyCardBookDeletion(bookId);
+          await store.cardChanges.acknowledgeRemote(bookId, remoteNumber);
+          continue;
+        }
         final localBookExists = store.books.any((book) => book.id == bookId);
         final cursor = store.cardChanges.appliedChange(bookId);
         if (forceFull ||
+            (forceBookIds?.contains(bookId) ?? false) ||
             !localBookExists ||
             !store.cardChanges.hasAppliedBook(bookId)) {
           final full = await cloud.downloadCardBooks(ids: [bookId]);
@@ -1439,7 +1661,10 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         }
         if (remoteNumber <= cursor) continue;
         final changes = await cloud.downloadCardChanges(bookId, cursor);
-        if (changes.isEmpty) {
+        if (!cardDeltasCover(cursor, remoteNumber, changes) ||
+            changes.any((change) => change.kind != 'cardPatch') ||
+            changes.any(
+                (change) => store.resolveCard(bookId, change.wordId) == null)) {
           // A pruned/missing delta must never silently leave the card stale.
           final full = await cloud.downloadCardBooks(ids: [bookId]);
           if (user?.uid != accountId) return false;
@@ -1664,6 +1889,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       ...metrics,
     });
     await cloud.uploadLearningState(store, snapshot);
+    if (user?.uid != current.uid) return;
     await store.cloudChanges.acknowledgeProfileMetadata(snapshot);
     await store.cloudChanges.acknowledgeLearningState(snapshot);
     await store.cloudChanges.recordChannelSuccess('learning', _now());
@@ -1719,7 +1945,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     ];
     _failureCount++;
     final retryable = store.cloudChanges.learningStateDirty ||
-        store.cardChanges.isDirty ||
+        store.cardChanges.hasWork ||
         store.cloudChanges.settingsDirty ||
         store.cloudChanges.archiveContentDirty ||
         (store.cloudChanges.managedBookContentDirty &&
@@ -1785,6 +2011,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       _requestCardDrain();
       unawaited(_learningSignalSubscription?.cancel());
       unawaited(_bookSignalSubscription?.cancel());
+      unawaited(_cardBookSignalSubscription?.cancel());
       unawaited(_settingsSignalSubscription?.cancel());
       unawaited(
           store.cloudChanges.recordLog('앱 백그라운드 · learningState 즉시 전송 시도'));

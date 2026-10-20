@@ -733,7 +733,7 @@ void main() {
     expect(repaired.meaning, '유적');
     final preferences = await SharedPreferences.getInstance();
     expect(preferences.getBool('readingMeaningMigrationV1'), isTrue);
-    expect(store.cloudChanges.snapshot.wordIdsByBook['japanese'], {88});
+    expect(store.cardChanges.pending.map((op) => op.wordId).toSet(), {88});
   });
 
   test('repairs placeholder-meaning imports without changing word identity',
@@ -759,7 +759,7 @@ void main() {
     expect(repaired.meaning, '어이없다, 싱겁다');
     final preferences = await SharedPreferences.getInstance();
     expect(preferences.getBool('readingMeaningMigrationV2'), isTrue);
-    expect(store.cloudChanges.snapshot.wordIdsByBook['placeholder'], {89});
+    expect(store.cardChanges.pending.map((op) => op.wordId).toSet(), {89});
   });
 
   test(
@@ -788,7 +788,8 @@ void main() {
     expect(store.books.single.words[2].reading, 'くいとめる');
     final preferences = await SharedPreferences.getInstance();
     expect(preferences.getBool('verifiedTextCorrectionMigrationV4'), isTrue);
-    expect(store.cloudChanges.snapshot.wordIdsByBook['verified'], {90, 91, 92});
+    expect(
+        store.cardChanges.pending.map((op) => op.wordId).toSet(), {90, 91, 92});
   });
 
   test('last main tab persists and clamps invalid values', () async {

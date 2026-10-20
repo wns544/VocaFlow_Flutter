@@ -43,7 +43,10 @@ class PronunciationPcBridge {
     pending.add(_BridgeRequest(normalizedTerm, normalizedReading));
     final temporary = File('${file.path}.next');
     await temporary.writeAsString(
-      jsonEncode({'schemaVersion': 1, 'requests': pending.map((e) => e.json).toList()}),
+      jsonEncode({
+        'schemaVersion': 1,
+        'requests': pending.map((e) => e.json).toList()
+      }),
       flush: true,
     );
     if (await file.exists()) await file.delete();
@@ -56,18 +59,24 @@ class PronunciationPcBridge {
   Future<bool> importIncoming() async {
     final root = await _root();
     if (root == null) return false;
-    final incoming = Directory('${root.path}${Platform.pathSeparator}$_incomingDirectory');
+    final incoming =
+        Directory('${root.path}${Platform.pathSeparator}$_incomingDirectory');
     if (!await incoming.exists()) return false;
     var imported = false;
     await for (final entity in incoming.list()) {
-      if (entity is! File || !entity.path.toLowerCase().endsWith('.vfpitch.zip')) continue;
+      if (entity is! File ||
+          !entity.path.toLowerCase().endsWith('.vfpitch.zip')) continue;
       try {
         final bytes = await entity.readAsBytes();
-        final archive = PronunciationPackArchive.inspect(Uint8List.fromList(bytes));
+        final archive =
+            PronunciationPackArchive.inspect(Uint8List.fromList(bytes));
         await _store.install(bytes);
         await entity.delete();
-        await _removeFulfilledRequests(root, archive.manifest.entries
-            .map((entry) => '${entry.term}\u0000${entry.reading}').toSet());
+        await _removeFulfilledRequests(
+            root,
+            archive.manifest.entries
+                .map((entry) => '${entry.term}\u0000${entry.reading}')
+                .toSet());
         imported = true;
       } catch (_) {
         // Do not lose a transferred pack merely because it needs inspection.
@@ -79,7 +88,8 @@ class PronunciationPcBridge {
   Future<List<_BridgeRequest>> _readRequests(File file) async {
     if (!await file.exists()) return [];
     try {
-      final root = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+      final root =
+          jsonDecode(await file.readAsString()) as Map<String, dynamic>;
       if (root['schemaVersion'] != 1 || root['requests'] is! List) return [];
       return (root['requests'] as List)
           .whereType<Map>()
@@ -91,22 +101,28 @@ class PronunciationPcBridge {
     }
   }
 
-  Future<void> _removeFulfilledRequests(Directory root, Set<String> fulfilled) async {
+  Future<void> _removeFulfilledRequests(
+      Directory root, Set<String> fulfilled) async {
     if (fulfilled.isEmpty) return;
     final file = File('${root.path}${Platform.pathSeparator}$_requestFile');
     final pending = await _readRequests(file);
-    final remaining = pending.where((item) => !fulfilled.contains(item.key)).toList();
+    final remaining =
+        pending.where((item) => !fulfilled.contains(item.key)).toList();
     if (remaining.length == pending.length) return;
     final temporary = File('${file.path}.next');
     await temporary.writeAsString(
-      jsonEncode({'schemaVersion': 1, 'requests': remaining.map((e) => e.json).toList()}),
+      jsonEncode({
+        'schemaVersion': 1,
+        'requests': remaining.map((e) => e.json).toList()
+      }),
       flush: true,
     );
     if (await file.exists()) await file.delete();
     await temporary.rename(file.path);
   }
 
-  static bool _looksJapanese(String value) => RegExp(r'[\u3040-\u30ff\u3400-\u9fff]').hasMatch(value);
+  static bool _looksJapanese(String value) =>
+      RegExp(r'[\u3040-\u30ff\u3400-\u9fff]').hasMatch(value);
 }
 
 class _BridgeRequest {

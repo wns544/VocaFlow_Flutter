@@ -1,0 +1,68 @@
+name: Sync safety checks (no deployment)
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  core-sync:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.1'
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      # Sync tests need no proprietary/untracked speech packs. Do not create
+      # fake assets or treat this core-only job as an APK/release build.
+      - run: flutter test --no-test-assets test/reference_correction_test.dart test/sync_identifiers_test.dart test/reinspection_regressions_test.dart test/session_causality_test.dart test/cloud_transaction_test.dart test/card_sync_test.dart test/structure_sync_test.dart test/web_writer_startup_test.dart
+  browser-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.1'
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: |
+          mkdir -p build/browser-sync-smoke
+          dart compile js tools/browser_sync_smoke.dart -o build/browser-sync-smoke/smoke.js
+          cp tools/browser_sync_smoke.html build/browser-sync-smoke/index.html
+          google-chrome --headless --dump-dom --virtual-time-budget=10000 "file://$PWD/build/browser-sync-smoke/index.html" > build/browser-sync-smoke/result.html
+          grep -q 'data-result="PASS"' build/browser-sync-smoke/result.html
+      - run: |
+          mkdir -p build/browser-storage-lab
+          dart compile js tools/browser_storage_lab.dart -o build/browser-storage-lab/lab.js
+          cp tools/browser_storage_lab.html build/browser-storage-lab/index.html
+          node tools/serve_browser_lab.cjs > build/browser-storage-lab/server.log 2>&1 &
+          LAB_PID=$!
+          trap 'kill "$LAB_PID"' EXIT
+          for i in 1 2 3 4 5; do curl -fsS http://127.0.0.1:8769/ > /dev/null && break || sleep 1; done
+          google-chrome --headless --dump-dom --virtual-time-budget=10000 "http://127.0.0.1:8769/?auto=true" > build/browser-storage-lab/result.html
+          grep -q 'data-result="PASS"' build/browser-storage-lab/result.html
+  firestore-rules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - run: npm install --global firebase-tools@15.28.2
+      # Demo project only: no login token or production credentials in CI.
+      - run: firebase emulators:exec --only firestore --project demo-vocaflow-sync --config firebase.sync-test.json "node tools/firestore-rules-test.cjs"

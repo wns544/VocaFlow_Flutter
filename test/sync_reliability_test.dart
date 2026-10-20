@@ -83,6 +83,9 @@ void main() {
       Word(id: 42, term: 'つくづく', reading: 'つくづく', meaning: '절실히'),
       Word(id: 43, term: '次', reading: 'つぎ', meaning: '다음'),
     ]);
+    for (final op in store.cardChanges.pending) {
+      await store.cardChanges.acknowledge(op);
+    }
     return (store, book);
   }
 

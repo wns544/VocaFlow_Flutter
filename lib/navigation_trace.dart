@@ -53,6 +53,7 @@ class NavigationBackGate {
       'windowMs': window.inMilliseconds,
     });
   }
+
   bool accept(String source, {Map<String, Object?> data = const {}}) {
     final now = DateTime.now();
     final previous = _lastAcceptedAt;

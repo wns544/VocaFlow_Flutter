@@ -32,12 +32,12 @@ class _PronunciationPackManagerState extends State<PronunciationPackManager> {
       await _selectionLoad;
       final saved = await savePronunciationSelections(_selections);
       if (!mounted || !saved) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('발음 선택 파일을 저장했어요')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('발음 선택 파일을 저장했어요')));
     } catch (_) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('발음 선택 파일을 저장하지 못했어요')));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('발음 선택 파일을 저장하지 못했어요')));
       }
     }
   }
@@ -47,8 +47,8 @@ class _PronunciationPackManagerState extends State<PronunciationPackManager> {
       await _selectionLoad;
       final count = await importPronunciationSelections(_selections);
       if (!mounted || count == null) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('발음 선택 $count개를 가져왔어요')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('발음 선택 $count개를 가져왔어요')));
     } catch (_) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(

@@ -15,6 +15,7 @@ import 'sync_auxiliary.dart';
 import 'word_relations.dart';
 
 part 'store_sync.dart';
+part 'store_card_structure.dart';
 
 String _encodeAccountSnapshot(Map<String, dynamic> state) => jsonEncode(state);
 
@@ -45,6 +46,7 @@ class ActiveStudy {
     this.rangeEnd,
     this.sourceMode,
     this.rangeCourseSchema = VocaStore.rangeCourseSchemaVersion,
+    this.progress = const {},
   });
 
   final List<int> queueIds;
@@ -72,6 +74,9 @@ class ActiveStudy {
   final int? rangeEnd;
   final String? sourceMode;
   final int rangeCourseSchema;
+
+  /// Causal revision of actual study actions, never of a restored screen.
+  final Map<String, dynamic> progress;
 
   bool get isRangeCourse =>
       bookId != null && rangeStart != null && rangeEnd != null;
@@ -103,6 +108,7 @@ class ActiveStudy {
         'rangeEnd': rangeEnd,
         'sourceMode': sourceMode,
         'rangeCourseSchema': rangeCourseSchema,
+        'progress': progress,
       };
 
   factory ActiveStudy.fromJson(Map<String, dynamic> json) => ActiveStudy(
@@ -155,6 +161,7 @@ class ActiveStudy {
         rangeEnd: (json['rangeEnd'] as num?)?.toInt(),
         sourceMode: json['sourceMode'] as String?,
         rangeCourseSchema: (json['rangeCourseSchema'] as num?)?.toInt() ?? 1,
+        progress: Map<String, dynamic>.from(json['progress'] as Map? ?? {}),
       );
 }
 
@@ -485,6 +492,7 @@ class VocaStore {
         store._overlayPendingCardFields(word, book.id);
       }
     }
+    store._overlayPendingStructureOperations();
     if (store.cardChanges.isDirty) await store._saveBooks();
     await store._migrateRangeCourses();
     await store._repairSwappedJapaneseFields();
@@ -565,20 +573,22 @@ class VocaStore {
   String get chatGptKanjiPromptTemplate =>
       _prefs.getString(_chatGptKanjiPromptTemplateKey) ?? '';
 
-  Future<void> setChatGptPromptTemplates(String word, String kanji) async {
-    final changed = <String>[];
-    final normalizedWord = word.trim();
-    final normalizedKanji = kanji.trim();
-    if (chatGptWordPromptTemplate != normalizedWord) {
-      await _prefs.setString(_chatGptWordPromptTemplateKey, normalizedWord);
-      changed.add(_chatGptWordPromptTemplateKey);
-    }
-    if (chatGptKanjiPromptTemplate != normalizedKanji) {
-      await _prefs.setString(_chatGptKanjiPromptTemplateKey, normalizedKanji);
-      changed.add(_chatGptKanjiPromptTemplateKey);
-    }
-    await _markSettingsChanged(changed);
-  }
+  Future<void> setChatGptPromptTemplates(String word, String kanji) =>
+      runLocalMutation(() async {
+        final changed = <String>[];
+        final normalizedWord = word.trim();
+        final normalizedKanji = kanji.trim();
+        if (chatGptWordPromptTemplate != normalizedWord) {
+          await _prefs.setString(_chatGptWordPromptTemplateKey, normalizedWord);
+          changed.add(_chatGptWordPromptTemplateKey);
+        }
+        if (chatGptKanjiPromptTemplate != normalizedKanji) {
+          await _prefs.setString(
+              _chatGptKanjiPromptTemplateKey, normalizedKanji);
+          changed.add(_chatGptKanjiPromptTemplateKey);
+        }
+        await _markSettingsChanged(changed);
+      });
 
   bool get openDictionaryInApp =>
       _prefs.getBool(_openDictionaryInAppKey) ?? false;
@@ -1058,13 +1068,21 @@ class VocaStore {
   }
 
   Future<ActiveStudy?> saveActiveStudyFor(String key, ActiveStudy active,
-          {bool markCloudChange = true, DateTime? expectedUpdatedAt}) =>
+          {bool markCloudChange = true,
+          DateTime? expectedUpdatedAt,
+          bool progressChanged = true,
+          String? expectedProgressId}) =>
       runLocalMutation(() => _saveActiveStudyFor(key, active,
           markCloudChange: markCloudChange,
+          progressChanged: progressChanged,
+          expectedProgressId: expectedProgressId,
           expectedUpdatedAt: expectedUpdatedAt));
 
   Future<ActiveStudy?> _saveActiveStudyFor(String key, ActiveStudy active,
-      {bool markCloudChange = true, DateTime? expectedUpdatedAt}) async {
+      {bool markCloudChange = true,
+      DateTime? expectedUpdatedAt,
+      bool progressChanged = true,
+      String? expectedProgressId}) async {
     final studies = Map<String, ActiveStudy>.from(activeStudies);
     final resolvedKey = active.isRangeCourse && active.bookId != null
         ? currentCourseKey(active.bookId!)
@@ -1074,6 +1092,8 @@ class VocaStore {
           study.bookId == active.bookId && study.isRangeCourse);
     }
     final previousActive = activeStudies[resolvedKey];
+    if (expectedProgressId != null &&
+        previousActive?.progress['id'] != expectedProgressId) return null;
     if (expectedUpdatedAt != null &&
         previousActive?.updatedAt != null &&
         previousActive!.updatedAt!.isAfter(expectedUpdatedAt)) {
@@ -1113,9 +1133,11 @@ class VocaStore {
       };
     }
 
+    if (!progressChanged && previousActive == null) return null;
     if (previousActive != null &&
-        SyncReplica.canonical(progress(previousActive)) ==
-            SyncReplica.canonical(progress(active))) {
+        (!progressChanged ||
+            SyncReplica.canonical(progress(previousActive)) ==
+                SyncReplica.canonical(progress(active)))) {
       // Pausing, flipping, or leaving a restored route is a local view save,
       // not a new learning action. Never give stale progress a fresh clock.
       final view = ActiveStudy.fromJson(
@@ -1128,6 +1150,11 @@ class VocaStore {
         previousActive?.startedAt ??
         previousActive?.updatedAt ??
         DateTime.now();
+    final device = await cloudChanges.deviceId();
+    final revision = Map<String, dynamic>.from(previousActive?.progress ?? {});
+    final vector = Map<String, dynamic>.from(revision['vector'] as Map? ?? {});
+    vector[device] = ((vector[device] as num?)?.toInt() ?? 0) + 1;
+    final actionAt = DateTime.now().toUtc();
     final updatedActive = ActiveStudy(
       queueIds: active.queueIds,
       queueBookIds: active.queueBookIds,
@@ -1154,6 +1181,13 @@ class VocaStore {
       sourceMode: active.sourceMode,
       rangeCourseSchema: active.rangeCourseSchema,
       updatedAt: DateTime.now(),
+      progress: {
+        'schema': 1,
+        'id': '$device:${actionAt.microsecondsSinceEpoch}:${vector[device]}',
+        'device': device,
+        'primary': revision['primary'] ?? device,
+        'vector': vector,
+      },
     );
     studies[resolvedKey] = updatedActive;
     if (studies.length > 20) {
@@ -1486,7 +1520,12 @@ class VocaStore {
   Future<void> applySettingsEntries(
     Map<String, dynamic> entries, {
     Map<String, Map<String, dynamic>>? expectedVersions,
-  }) async {
+  }) =>
+      runLocalMutation(() =>
+          _applySettingsEntries(entries, expectedVersions: expectedVersions));
+
+  Future<void> _applySettingsEntries(Map<String, dynamic> entries,
+      {Map<String, Map<String, dynamic>>? expectedVersions}) async {
     final versions = _settingsVersions();
     var changedVersions = false;
     for (final entry in entries.entries) {
@@ -1520,60 +1559,61 @@ class VocaStore {
     }
   }
 
-  Future<void> selectQuickBook(String id) async {
-    await _prefs.setString(_quickBookKey, id);
-    await _markSettingsChanged([_quickBookKey]);
-  }
+  Future<void> selectQuickBook(String id) => runLocalMutation(() async {
+        await _prefs.setString(_quickBookKey, id);
+        await _markSettingsChanged([_quickBookKey]);
+      });
 
-  Future<void> setSessionSize(int value) async {
-    await _rememberCompletedMembership();
-    await _prefs.setInt(_sessionSizeKey, value.clamp(5, 100).toInt());
-    await _projectCompletedMembership();
-    await clearAllActiveStudies(markCloudChange: false);
-    await _markSettingsChanged([_sessionSizeKey]);
-  }
+  Future<void> setSessionSize(int value) => runLocalMutation(() async {
+        await _rememberCompletedMembership();
+        await _prefs.setInt(_sessionSizeKey, value.clamp(5, 100).toInt());
+        await _projectCompletedMembership();
+        await clearAllActiveStudies(markCloudChange: false);
+        await _markSettingsChanged([_sessionSizeKey]);
+      });
 
-  Future<void> setHorizontalSwipe(bool value) async {
-    await _prefs.setBool(_horizontalSwipeKey, value);
-    await _markSettingsChanged([_horizontalSwipeKey]);
-  }
+  Future<void> setHorizontalSwipe(bool value) => runLocalMutation(() async {
+        await _prefs.setBool(_horizontalSwipeKey, value);
+        await _markSettingsChanged([_horizontalSwipeKey]);
+      });
 
-  Future<void> setReverseSwipe(bool value) async {
-    await _prefs.setBool(_reverseSwipeKey, value);
-    await _markSettingsChanged([_reverseSwipeKey]);
-  }
+  Future<void> setReverseSwipe(bool value) => runLocalMutation(() async {
+        await _prefs.setBool(_reverseSwipeKey, value);
+        await _markSettingsChanged([_reverseSwipeKey]);
+      });
 
-  Future<void> setReadingAboveTerm(bool value) async {
-    await _prefs.setBool(_readingAboveTermKey, value);
-    await _markSettingsChanged([_readingAboveTermKey]);
-  }
+  Future<void> setReadingAboveTerm(bool value) => runLocalMutation(() async {
+        await _prefs.setBool(_readingAboveTermKey, value);
+        await _markSettingsChanged([_readingAboveTermKey]);
+      });
 
-  Future<void> setShowExamples(bool value) async {
-    await _prefs.setBool(_showExamplesKey, value);
-    await _markSettingsChanged([_showExamplesKey]);
-  }
+  Future<void> setShowExamples(bool value) => runLocalMutation(() async {
+        await _prefs.setBool(_showExamplesKey, value);
+        await _markSettingsChanged([_showExamplesKey]);
+      });
 
-  Future<void> setFlipCard(bool value) async {
-    await _prefs.setBool(_flipCardKey, value);
-    await _markSettingsChanged([_flipCardKey]);
-  }
+  Future<void> setFlipCard(bool value) => runLocalMutation(() async {
+        await _prefs.setBool(_flipCardKey, value);
+        await _markSettingsChanged([_flipCardKey]);
+      });
 
-  Future<void> setAutoPlayPronunciation(bool value) async {
-    await _prefs.setBool(_autoPlayPronunciationKey, value);
-    await _markSettingsChanged([_autoPlayPronunciationKey]);
-  }
+  Future<void> setAutoPlayPronunciation(bool value) =>
+      runLocalMutation(() async {
+        await _prefs.setBool(_autoPlayPronunciationKey, value);
+        await _markSettingsChanged([_autoPlayPronunciationKey]);
+      });
 
-  Future<void> setUndoHaptics(bool value) async {
-    await _prefs.setBool(_undoHapticsKey, value);
-    await _markSettingsChanged([_undoHapticsKey]);
-  }
+  Future<void> setUndoHaptics(bool value) => runLocalMutation(() async {
+        await _prefs.setBool(_undoHapticsKey, value);
+        await _markSettingsChanged([_undoHapticsKey]);
+      });
 
-  Future<void> setJapaneseFont(String value) async {
-    const allowed = {'system', 'notoSerifJP', 'sourceHanSerifJP'};
-    await _prefs.setString(
-        _japaneseFontKey, allowed.contains(value) ? value : 'system');
-    await _markSettingsChanged([_japaneseFontKey]);
-  }
+  Future<void> setJapaneseFont(String value) => runLocalMutation(() async {
+        const allowed = {'system', 'notoSerifJP', 'sourceHanSerifJP'};
+        await _prefs.setString(
+            _japaneseFontKey, allowed.contains(value) ? value : 'system');
+        await _markSettingsChanged([_japaneseFontKey]);
+      });
 
   Future<void> setCardFontSizes({
     required double term,
@@ -1581,73 +1621,76 @@ class VocaStore {
     required double meaning,
     required double example,
     required double exampleMeaning,
-  }) async {
-    final next = <String, double>{
-      _termFontSizeKey: term.clamp(20, 52).toDouble(),
-      _readingFontSizeKey: reading.clamp(10, 28).toDouble(),
-      _meaningFontSizeKey: meaning.clamp(14, 38).toDouble(),
-      _exampleFontSizeKey: example.clamp(11, 28).toDouble(),
-      _exampleMeaningFontSizeKey: exampleMeaning.clamp(10, 26).toDouble(),
-    };
-    final changed = next.entries
-        .where(
-            (entry) => _doublePreference(entry.key, double.nan) != entry.value)
-        .toList();
-    await Future.wait(
-        changed.map((entry) => _prefs.setDouble(entry.key, entry.value)));
-    await _markSettingsChanged(changed.map((entry) => entry.key));
-  }
+  }) =>
+      runLocalMutation(() async {
+        final next = <String, double>{
+          _termFontSizeKey: term.clamp(20, 52).toDouble(),
+          _readingFontSizeKey: reading.clamp(10, 28).toDouble(),
+          _meaningFontSizeKey: meaning.clamp(14, 38).toDouble(),
+          _exampleFontSizeKey: example.clamp(11, 28).toDouble(),
+          _exampleMeaningFontSizeKey: exampleMeaning.clamp(10, 26).toDouble(),
+        };
+        final changed = next.entries
+            .where((entry) =>
+                _doublePreference(entry.key, double.nan) != entry.value)
+            .toList();
+        await Future.wait(
+            changed.map((entry) => _prefs.setDouble(entry.key, entry.value)));
+        await _markSettingsChanged(changed.map((entry) => entry.key));
+      });
 
   Future<void> setMeaningStyle({
     required int fontWeight,
     required double opacity,
-  }) async {
-    final normalizedWeight =
-        (((fontWeight.clamp(400, 700) / 100).round() * 100).clamp(400, 700))
-            .toInt();
-    final normalizedOpacity = opacity.clamp(.45, 1).toDouble();
-    final changed = <String>[];
-    if (meaningFontWeight != normalizedWeight) {
-      await _prefs.setInt(_meaningFontWeightKey, normalizedWeight);
-      changed.add(_meaningFontWeightKey);
-    }
-    if (meaningOpacity != normalizedOpacity) {
-      await _prefs.setDouble(_meaningOpacityKey, normalizedOpacity);
-      changed.add(_meaningOpacityKey);
-    }
-    await _markSettingsChanged(changed);
-  }
+  }) =>
+      runLocalMutation(() async {
+        final normalizedWeight =
+            (((fontWeight.clamp(400, 700) / 100).round() * 100).clamp(400, 700))
+                .toInt();
+        final normalizedOpacity = opacity.clamp(.45, 1).toDouble();
+        final changed = <String>[];
+        if (meaningFontWeight != normalizedWeight) {
+          await _prefs.setInt(_meaningFontWeightKey, normalizedWeight);
+          changed.add(_meaningFontWeightKey);
+        }
+        if (meaningOpacity != normalizedOpacity) {
+          await _prefs.setDouble(_meaningOpacityKey, normalizedOpacity);
+          changed.add(_meaningOpacityKey);
+        }
+        await _markSettingsChanged(changed);
+      });
 
-  Future<bool> setChatGptConversationUrl(String value) async {
-    final normalized =
-        value.trim().isEmpty ? '' : normalizeChatGptConversationUrl(value);
-    if (normalized == null) return false;
-    final previous = DateTime.tryParse(
-        _prefs.getString(_chatGptConversationUrlUpdatedAtKey) ?? '');
-    final now = DateTime.now().toUtc();
-    final updated = previous != null && !now.isAfter(previous)
-        ? previous.add(const Duration(microseconds: 1))
-        : now;
-    await Future.wait([
-      _prefs.setString(_chatGptConversationUrlKey, normalized),
-      _prefs.setString(
-          _chatGptConversationUrlUpdatedAtKey, updated.toIso8601String()),
-    ]);
-    await _markSettingsChanged([_chatGptConversationUrlKey]);
-    return true;
-  }
+  Future<bool> setChatGptConversationUrl(String value) =>
+      runLocalMutation(() async {
+        final normalized =
+            value.trim().isEmpty ? '' : normalizeChatGptConversationUrl(value);
+        if (normalized == null) return false;
+        final previous = DateTime.tryParse(
+            _prefs.getString(_chatGptConversationUrlUpdatedAtKey) ?? '');
+        final now = DateTime.now().toUtc();
+        final updated = previous != null && !now.isAfter(previous)
+            ? previous.add(const Duration(microseconds: 1))
+            : now;
+        await Future.wait([
+          _prefs.setString(_chatGptConversationUrlKey, normalized),
+          _prefs.setString(
+              _chatGptConversationUrlUpdatedAtKey, updated.toIso8601String()),
+        ]);
+        await _markSettingsChanged([_chatGptConversationUrlKey]);
+        return true;
+      });
 
-  Future<void> setOpenDictionaryInApp(bool value) async {
-    final updatedAt = DateTime.now().toUtc();
-    await Future.wait([
-      _prefs.setBool(_openDictionaryInAppKey, value),
-      _prefs.setString(
-        _openDictionaryInAppUpdatedAtKey,
-        updatedAt.toIso8601String(),
-      ),
-    ]);
-    await _markSettingsChanged([_openDictionaryInAppKey]);
-  }
+  Future<void> setOpenDictionaryInApp(bool value) => runLocalMutation(() async {
+        final updatedAt = DateTime.now().toUtc();
+        await Future.wait([
+          _prefs.setBool(_openDictionaryInAppKey, value),
+          _prefs.setString(
+            _openDictionaryInAppUpdatedAtKey,
+            updatedAt.toIso8601String(),
+          ),
+        ]);
+        await _markSettingsChanged([_openDictionaryInAppKey]);
+      });
 
   Future<void> applyOpenDictionaryInAppSettingFromCloud(
     Map<String, dynamic> setting,
@@ -1678,31 +1721,32 @@ class VocaStore {
     );
   }
 
-  Future<void> setTarget(String name, DateTime? date) async {
-    await _prefs.setString(_targetNameKey, name.trim());
-    if (date == null) {
-      await _prefs.remove(_targetDateKey);
-    } else {
-      await _prefs.setString(_targetDateKey, date.toIso8601String());
-    }
-    await _markSettingsChanged([_targetNameKey, _targetDateKey]);
-  }
+  Future<void> setTarget(String name, DateTime? date) =>
+      runLocalMutation(() async {
+        await _prefs.setString(_targetNameKey, name.trim());
+        if (date == null) {
+          await _prefs.remove(_targetDateKey);
+        } else {
+          await _prefs.setString(_targetDateKey, date.toIso8601String());
+        }
+        await _markSettingsChanged([_targetNameKey, _targetDateKey]);
+      });
 
-  Future<WordBook> addBook(String name, List<Word> words) async {
-    books.add(WordBook(
-      id: _newBookId(),
-      name: name.trim().isEmpty ? '가져온 단어장' : name.trim(),
-      words: words,
-    ));
-    await _saveBooks();
-    wordSearch.invalidate();
-    final added = books.last;
-    await cloudChanges.markBook(added.id);
-    await cloudChanges.markWords(added.id, added.words.map((word) => word.id));
-    await cloudChanges.markProfile();
-    await _markBookOrderChanged();
-    return added;
-  }
+  Future<WordBook> addBook(String name, List<Word> words) =>
+      runLocalMutation(() async {
+        final added = WordBook(
+          id: _newBookId(),
+          name: name.trim().isEmpty ? '가져온 단어장' : name.trim(),
+          words: words,
+        );
+        await _queueBookCreation(added);
+        books.add(added);
+        await _saveBooks();
+        wordSearch.invalidate();
+        await _markBookOrderChanged();
+        cardChanges.notifyChanged();
+        return added;
+      });
 
   /// Keeps each signed-in account's book library in its own local cache. The
   /// first account adopts the pre-account legacy library once; another account
@@ -1752,6 +1796,7 @@ class VocaStore {
         _overlayPendingCardFields(word, book.id);
       }
     }
+    _overlayPendingStructureOperations();
     await _recoverLocalDecision();
     await _loadSyncReplica();
     await wordRelations.reload();
@@ -1842,21 +1887,40 @@ class VocaStore {
     _resetMarkersCache = null;
   }
 
-  Future<void> updateBook(WordBook updated) async {
-    final index = books.indexWhere((book) => book.id == updated.id);
-    if (index < 0) return;
-    await onBeforeBookMutation?.call(updated.id, 'edit');
-    final previousWordIds = books[index].words.map((word) => word.id).toSet();
-    final updatedWordIds = updated.words.map((word) => word.id).toSet();
-    books[index] = updated;
-    await _saveBooks();
-    wordSearch.invalidate();
-    await cloudChanges.markBook(updated.id);
-    await cloudChanges.markWords(updated.id, updatedWordIds);
-    for (final removedId in previousWordIds.difference(updatedWordIds)) {
-      await cloudChanges.deleteWord(updated.id, removedId);
-    }
-  }
+  Future<void> updateBook(WordBook updated) => runLocalMutation(() async {
+        final index = books.indexWhere((book) => book.id == updated.id);
+        if (index < 0) return;
+        await onBeforeBookMutation?.call(updated.id, 'edit');
+        final favoriteChanged = books[index].isFavorite != updated.isFavorite;
+        await _queueBookUpdate(books[index], updated);
+        final oldById = {for (final word in books[index].words) word.id: word};
+        final canonical = <Word>[];
+        for (final next in updated.words) {
+          final old = oldById[next.id];
+          if (old == null) {
+            canonical.add(next);
+            continue;
+          }
+          old.term = next.term;
+          old.reading = next.reading;
+          old.meaning = next.meaning;
+          old.example = next.example;
+          old.exampleMeaning = next.exampleMeaning;
+          old.explanation = next.explanation;
+          canonical.add(old);
+        }
+        books[index] = WordBook(
+            id: updated.id,
+            name: updated.name,
+            words: canonical,
+            isFavorite: updated.isFavorite,
+            sessionOverrides: updated.sessionOverrides);
+        await _saveBooks();
+        if (favoriteChanged) await cloudChanges.markLearningState();
+        wordSearch.invalidate();
+        cardContentRevision.value++;
+        cardChanges.notifyChanged();
+      });
 
   /// Persists a card locally first, then queues only its changed text fields.
   /// New callers should always pass [bookId]; retaining the narrow fallback
@@ -1936,9 +2000,6 @@ class VocaStore {
     await _saveBooks();
     wordSearch.invalidate();
     await cloudChanges.markProfile();
-    for (final book in books) {
-      await cloudChanges.markBook(book.id);
-    }
     await _markBookOrderChanged();
   }
 
@@ -1948,9 +2009,6 @@ class VocaStore {
     await _saveBooks();
     wordSearch.invalidate();
     await cloudChanges.markProfile();
-    for (final reordered in books) {
-      await cloudChanges.markBook(reordered.id);
-    }
     await _markBookOrderChanged();
   }
 
@@ -2006,28 +2064,39 @@ class VocaStore {
     return true;
   }
 
-  Future<void> deleteBook(String id) async {
-    if (id != 'default' && books.any((book) => book.id == id)) {
-      await onBeforeBookMutation?.call(id, 'delete');
-    }
-    final wasSelected = quickBook.id == id;
-    final deleted = books.where((book) => book.id == id).firstOrNull;
-    final studiesToClear = activeStudies.entries
-        .where((entry) => entry.value.bookId == id)
-        .map((entry) => entry.key)
-        .toList();
-    for (final key in studiesToClear) {
-      await clearActiveStudyFor(key);
-    }
-    books.removeWhere((book) => book.id == id && id != 'default');
-    if (wasSelected) await selectQuickBook('default');
-    await _saveBooks();
-    wordSearch.invalidate();
-    if (deleted != null && id != 'default') {
-      await cloudChanges.deleteBook(id, deleted.words.map((word) => word.id));
-      await _markBookOrderChanged();
-    }
-  }
+  Future<void> deleteBook(String id) => runLocalMutation(() async {
+        if (id != 'default' && books.any((book) => book.id == id)) {
+          await onBeforeBookMutation?.call(id, 'delete');
+        }
+        final wasSelected = quickBook.id == id;
+        final deleted = books.where((book) => book.id == id).firstOrNull;
+        if (deleted != null && id != 'default') {
+          await cardChanges.enqueueBatch([
+            {
+              'kind': 'bookDelete',
+              'bookId': id,
+              'fields': <String, dynamic>{},
+              'before': _bookMetadata(deleted)
+            }
+          ], notify: false);
+        }
+        final studiesToClear = activeStudies.entries
+            .where((entry) => entry.value.bookId == id)
+            .map((entry) => entry.key)
+            .toList();
+        for (final key in studiesToClear) {
+          await clearActiveStudyFor(key);
+        }
+        books.removeWhere((book) => book.id == id && id != 'default');
+        if (wasSelected) await selectQuickBook('default');
+        await _saveBooks();
+        wordSearch.invalidate();
+        if (deleted != null && id != 'default') {
+          await _markBookOrderChanged();
+          cardContentRevision.value++;
+          cardChanges.notifyChanged();
+        }
+      });
 
   Future<void> _markBookOrderChanged() async {
     final previous =
@@ -2102,69 +2171,72 @@ class VocaStore {
   /// Replaces only the archived book and its book-scoped learning state. The
   /// original ID is retained, so sessions, favorites and relations still point
   /// to the same cards after recovery.
-  Future<void> restoreBookFromPayload(Map<String, dynamic> payload) async {
-    final rawBook = payload['book'];
-    if (rawBook is! Map) throw StateError('복원 기록에 단어장 정보가 없습니다.');
-    final restored = WordBook.fromJson(Map<String, dynamic>.from(rawBook));
-    if (restored.id == 'default') throw StateError('기본 단어장은 복원할 수 없습니다.');
-    final index = books.indexWhere((book) => book.id == restored.id);
-    if (index < 0) {
-      books.add(restored);
-    } else {
-      books[index] = restored;
-    }
-    final learning =
-        Map<String, dynamic>.from(payload['learning'] as Map? ?? const {});
-    final id = restored.id;
-    final completed = (_prefs.getStringList(_completedKey) ?? <String>[])
-        .where((key) => !key.startsWith('$id:'))
-        .toSet()
-      ..addAll((learning['completed'] as List? ?? const [])
-          .map((item) => item.toString()));
-    final completedTimes = Map<String, DateTime>.from(completedAt)
-      ..removeWhere((key, _) => key.contains(id));
-    completedTimes.addAll(_datesFromMap(learning['completedAt']));
-    final passes = Map<String, int>.from(coursePasses)
-      ..removeWhere((key, _) => key.contains(id));
-    passes.addAll(_intsFromMap(learning['rangeCoursePasses']));
-    final active = Map<String, ActiveStudy>.from(activeStudies)
-      ..removeWhere(
-          (_, value) => _activeValueReferencesBook(value.toJson(), id));
-    final archiveActive = learning['activeStudies'];
-    if (archiveActive is Map) {
-      archiveActive.forEach((key, value) {
-        if (value is Map)
-          active[key.toString()] =
-              ActiveStudy.fromJson(Map<String, dynamic>.from(value));
+  Future<void> restoreBookFromPayload(Map<String, dynamic> payload) =>
+      runLocalMutation(() async {
+        final rawBook = payload['book'];
+        if (rawBook is! Map) throw StateError('복원 기록에 단어장 정보가 없습니다.');
+        final restored = WordBook.fromJson(Map<String, dynamic>.from(rawBook));
+        if (restored.id == 'default') throw StateError('기본 단어장은 복원할 수 없습니다.');
+        await _queueBookCreation(restored, restore: true);
+        final index = books.indexWhere((book) => book.id == restored.id);
+        if (index < 0) {
+          books.add(restored);
+        } else {
+          books[index] = restored;
+        }
+        final learning =
+            Map<String, dynamic>.from(payload['learning'] as Map? ?? const {});
+        final id = restored.id;
+        final completed = (_prefs.getStringList(_completedKey) ?? <String>[])
+            .where((key) => !key.startsWith('$id:'))
+            .toSet()
+          ..addAll((learning['completed'] as List? ?? const [])
+              .map((item) => item.toString()));
+        final completedTimes = Map<String, DateTime>.from(completedAt)
+          ..removeWhere((key, _) => key.contains(id));
+        completedTimes.addAll(_datesFromMap(learning['completedAt']));
+        final passes = Map<String, int>.from(coursePasses)
+          ..removeWhere((key, _) => key.contains(id));
+        passes.addAll(_intsFromMap(learning['rangeCoursePasses']));
+        final active = Map<String, ActiveStudy>.from(activeStudies)
+          ..removeWhere(
+              (_, value) => _activeValueReferencesBook(value.toJson(), id));
+        final archiveActive = learning['activeStudies'];
+        if (archiveActive is Map) {
+          archiveActive.forEach((key, value) {
+            if (value is Map)
+              active[key.toString()] =
+                  ActiveStudy.fromJson(Map<String, dynamic>.from(value));
+          });
+        }
+        final tombstones = Map<String, DateTime>.from(activeStudyTombstones)
+          ..removeWhere((key, _) => key.contains(id));
+        tombstones.addAll(_datesFromMap(learning['activeStudyTombstones']));
+        final markers = Map<String, DateTime>.from(resetMarkers)
+          ..removeWhere((key, _) => key.contains(id));
+        markers.addAll(_datesFromMap(learning['resetMarkers']));
+        final events =
+            studyEventLog.where((event) => event.bookId != id).toList();
+        final eventIds = events.map((event) => event.id).toSet();
+        for (final raw in learning['studyEventLog'] as List? ?? const []) {
+          if (raw is! Map) continue;
+          final event = StudyEventLog.fromJson(Map<String, dynamic>.from(raw));
+          if (eventIds.add(event.id)) events.add(event);
+        }
+        await _saveBooks();
+        wordSearch.invalidate();
+        await _prefs.setStringList(_completedKey, completed.toList());
+        await _saveCompletedAt(completedTimes);
+        await _prefs.setString(_coursePassesKey, jsonEncode(passes));
+        await _saveActiveStudies(active);
+        await _saveActiveStudyTombstones(tombstones);
+        await _saveResetMarkers(markers);
+        await _saveStudyEventLog(_prunedStudyEventLog(events));
+        await cloudChanges.markLearningState();
+        cardContentRevision.value++;
+        cardChanges.notifyChanged();
+        learningStateRevision.value++;
       });
-    }
-    final tombstones = Map<String, DateTime>.from(activeStudyTombstones)
-      ..removeWhere((key, _) => key.contains(id));
-    tombstones.addAll(_datesFromMap(learning['activeStudyTombstones']));
-    final markers = Map<String, DateTime>.from(resetMarkers)
-      ..removeWhere((key, _) => key.contains(id));
-    markers.addAll(_datesFromMap(learning['resetMarkers']));
-    final events = studyEventLog.where((event) => event.bookId != id).toList();
-    final eventIds = events.map((event) => event.id).toSet();
-    for (final raw in learning['studyEventLog'] as List? ?? const []) {
-      if (raw is! Map) continue;
-      final event = StudyEventLog.fromJson(Map<String, dynamic>.from(raw));
-      if (eventIds.add(event.id)) events.add(event);
-    }
-    await _saveBooks();
-    wordSearch.invalidate();
-    await _prefs.setStringList(_completedKey, completed.toList());
-    await _saveCompletedAt(completedTimes);
-    await _prefs.setString(_coursePassesKey, jsonEncode(passes));
-    await _saveActiveStudies(active);
-    await _saveActiveStudyTombstones(tombstones);
-    await _saveResetMarkers(markers);
-    await _saveStudyEventLog(_prunedStudyEventLog(events));
-    await cloudChanges.markBook(id);
-    await cloudChanges.markWords(id, restored.words.map((word) => word.id));
-    await cloudChanges.markLearningState();
-    learningStateRevision.value++;
-  }
 
   Map<String, DateTime> _datesFromMap(dynamic raw) {
     if (raw is! Map) return const {};
@@ -2276,9 +2348,11 @@ class VocaStore {
       final bookData = snapshot.book;
       final id = bookData['id']?.toString() ?? '';
       if (id.isEmpty || id == 'default') continue;
+      await cardChanges.recordServerDeletions(id,
+          deleted: false, cards: snapshot.cards);
       final cardById = <int, Map<String, dynamic>>{
         for (final card in snapshot.cards)
-          if ((card['id'] as num?)?.toInt() != null)
+          if (card['deleted'] != true && (card['id'] as num?)?.toInt() != null)
             (card['id'] as num).toInt(): card,
       };
       final order = (bookData['wordOrder'] as List? ?? const [])
@@ -2355,6 +2429,7 @@ class VocaStore {
       changed++;
     }
     if (changed > 0) {
+      _overlayPendingStructureOperations();
       await _saveBooks();
       // Seed previously unseen cards at clock zero, and accept the hydrated
       // view without re-authoring existing server learning records.
@@ -3256,11 +3331,10 @@ class VocaStore {
       }
     }
     if (changedWords.isNotEmpty) {
+      await _queueTextRepairsFromCache(changedWords);
       await _saveBooks();
       wordSearch.invalidate();
-      for (final entry in changedWords.entries) {
-        await cloudChanges.markWords(entry.key, entry.value);
-      }
+      cardChanges.notifyChanged();
     }
     await _prefs.setBool(_readingMeaningMigrationKey, true);
   }
@@ -3294,11 +3368,10 @@ class VocaStore {
       }
     }
     if (changedWords.isNotEmpty) {
+      await _queueTextRepairsFromCache(changedWords);
       await _saveBooks();
       wordSearch.invalidate();
-      for (final entry in changedWords.entries) {
-        await cloudChanges.markWords(entry.key, entry.value);
-      }
+      cardChanges.notifyChanged();
     }
     await _prefs.setBool(_placeholderReadingMeaningMigrationKey, true);
   }
@@ -3465,11 +3538,10 @@ class VocaStore {
       }
     }
     if (changedWords.isNotEmpty) {
+      await _queueTextRepairsFromCache(changedWords);
       await _saveBooks();
       wordSearch.invalidate();
-      for (final entry in changedWords.entries) {
-        await cloudChanges.markWords(entry.key, entry.value);
-      }
+      cardChanges.notifyChanged();
     }
     await _prefs.setBool(_verifiedTextCorrectionMigrationKey, true);
   }

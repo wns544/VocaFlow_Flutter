@@ -131,6 +131,11 @@ extension VocaStoreSync on VocaStore {
   Map<String, dynamic> _syncValues() {
     final state = toLearningStateJson();
     return {
+      // Removing card content must not erase its independent learning history.
+      for (final entry in _replica?.records.entries ??
+          <MapEntry<String, Map<String, dynamic>>>[])
+        if (entry.key.startsWith('word/') || entry.key.startsWith('favorite/'))
+          entry.key: entry.value['value'],
       'bookOrder': books.map((b) => b.id).toList(),
       for (final raw
           in jsonDecode(_prefs.getString('wordRelations.v1') ?? '[]') as List)
@@ -151,12 +156,13 @@ extension VocaStoreSync on VocaStore {
           'active': {...entry.value.toJson(), 'revealed': false},
           // Preserve the branch's touched card states alongside its queue.
           'words': {
-            for (final decision in entry.value.undoHistory)
-              for (final book in books.where(
-                  (b) => b.id == (decision.bookId ?? entry.value.bookId)))
-                for (final word
-                    in book.words.where((w) => w.id == decision.wordId))
-                  'word/${book.id}/${word.id}': _wordState(word),
+            if (entry.value.progress['schema'] != 1)
+              for (final decision in entry.value.undoHistory)
+                for (final book in books.where(
+                    (b) => b.id == (decision.bookId ?? entry.value.bookId)))
+                  for (final word
+                      in book.words.where((w) => w.id == decision.wordId))
+                    'word/${book.id}/${word.id}': _wordState(word),
           },
         },
       for (final entry in _readSyncMap(_syncCompletedKey).entries)
@@ -344,6 +350,10 @@ extension VocaStoreSync on VocaStore {
           (reset != null && SyncReplica.compare(entry.value, reset) < 0))
         continue;
       final words = (entry.value['value'] as Map)['words'];
+      final active = (entry.value['value'] as Map)['active'];
+      if (active is Map &&
+          active['progress'] is Map &&
+          active['progress']['schema'] == 1) continue;
       if (words is Map &&
           words[key] is Map &&
           (newest == null || SyncReplica.compare(entry.value, newest) > 0)) {
@@ -397,6 +407,7 @@ extension VocaStoreSync on VocaStore {
       final data = entry.value['value'] as Map;
       studies[entry.key.substring(8)] =
           ActiveStudy.fromJson(Map<String, dynamic>.from(data['active']));
+      if (studies[entry.key.substring(8)]!.progress['schema'] == 1) continue;
       for (final word in (data['words'] as Map? ?? {}).entries) {
         final old = wordRecords[word.key];
         if (old == null || SyncReplica.compare(entry.value, old) > 0) {

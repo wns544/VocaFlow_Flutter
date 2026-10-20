@@ -11,7 +11,9 @@ Future<void> writeLargeLocalValue(
   String key,
   String value,
 ) async {
-  await preferences.setString(key, value);
+  if (!await preferences.setString(key, value)) {
+    throw StateError('학습 기록을 기기에 저장하지 못했습니다: $key');
+  }
 }
 
 Future<void> removeLargeLocalValue(

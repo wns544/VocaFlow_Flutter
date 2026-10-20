@@ -11,6 +11,7 @@ import 'card_sync.dart';
 import 'book_restore_archive.dart';
 import 'models.dart';
 import 'store.dart';
+part 'cloud_card_structure.dart';
 
 Uint8List _encodeSyncPayload(Map<String, dynamic> payload) =>
     Uint8List.fromList(utf8.encode(jsonEncode(payload)));
@@ -50,6 +51,16 @@ class CloudSyncTimeoutException implements Exception {
 
   @override
   String toString() => 'CloudSyncTimeoutException';
+}
+
+/// A request that timed out may still finish later. It cannot publish an
+/// older snapshot over a newer head belonging to this installation.
+@visibleForTesting
+bool learningHeadWouldRegress(Map<String, dynamic> current,
+    {required int clock, required int sequence}) {
+  final remoteClock = (current['clock'] as num?)?.toInt() ?? 0;
+  if (remoteClock != clock) return remoteClock > clock;
+  return ((current['sequence'] as num?)?.toInt() ?? 0) > sequence;
 }
 
 /// The exact local values captured before a settings upload, plus the merged
@@ -328,6 +339,10 @@ class CloudBackup {
   Future<void> uploadCardChange(CardChange change,
           {required String deviceId}) =>
       _runCloudOperation(() async {
+        if (change.kind != 'cardPatch') {
+          await _uploadStructureChange(change, deviceId: deviceId);
+          return;
+        }
         final bookRef = _cardBooksRef.doc(change.bookId);
         final cardRef =
             bookRef.collection('cards').doc(change.wordId.toString());
@@ -335,7 +350,17 @@ class CloudBackup {
         final signalRef = _cardBookSignal;
         await firestore.runTransaction((transaction) async {
           final operation = await transaction.get(operationRef);
-          if (operation.exists) return;
+          if (operation.exists) {
+            // A prior response may have been lost. Reannounce the exact
+            // committed operation together with this idempotent receipt.
+            transaction.set(signalRef, {
+              'deviceId': deviceId,
+              'bookId': change.bookId,
+              'operationId': change.id,
+              'updatedAt': FieldValue.serverTimestamp(),
+            });
+            return;
+          }
           final book = await transaction.get(bookRef);
           if (!book.exists) {
             throw StateError('카드 동기화 단어장을 찾을 수 없습니다: ${change.bookId}');
@@ -346,6 +371,10 @@ class CloudBackup {
                 '카드 동기화 카드를 찾을 수 없습니다: ${change.bookId}/${change.wordId}');
           }
           final previousCard = card.data() ?? const <String, dynamic>{};
+          if (book.data()?['deleted'] == true ||
+              previousCard['deleted'] == true) {
+            throw StateError('삭제된 카드의 수정은 전송하지 않습니다. 수정 기록은 기기에 보존됩니다.');
+          }
           final previous = <String, dynamic>{
             for (final key in change.fields.keys) key: previousCard[key],
           };
@@ -360,10 +389,13 @@ class CloudBackup {
             'fieldRevisions': fieldRevisions,
             'updatedAt': FieldValue.serverTimestamp(),
             'lastOperationId': change.id,
+            'lastOperationKind': 'cardPatch',
           });
           transaction.update(bookRef, {
             'nextChange': next,
             'updatedAt': FieldValue.serverTimestamp(),
+            'lastOperationId': change.id,
+            'lastOperationKind': 'cardPatch',
           });
           final changeRef = bookRef
               .collection('changes')
@@ -384,15 +416,17 @@ class CloudBackup {
             'schema': 1,
             'operationId': change.id,
             'changeNumber': next,
+            'changeId': next.toString().padLeft(12, '0'),
             'wordId': change.wordId,
+            'kind': 'cardPatch',
             'createdAt': FieldValue.serverTimestamp(),
           });
-        });
-        await signalRef.set({
-          'deviceId': deviceId,
-          'bookId': change.bookId,
-          'operationId': change.id,
-          'updatedAt': FieldValue.serverTimestamp(),
+          transaction.set(signalRef, {
+            'deviceId': deviceId,
+            'bookId': change.bookId,
+            'operationId': change.id,
+            'updatedAt': FieldValue.serverTimestamp(),
+          });
         });
       });
 
@@ -440,7 +474,6 @@ class CloudBackup {
         final snapshot = await _cardBooksRef.get();
         return snapshot.docs
             .map((item) => Map<String, dynamic>.from(item.data()))
-            .where((item) => item['deleted'] != true)
             .toList(growable: false);
       });
 
@@ -464,9 +497,10 @@ class CloudBackup {
                 fields: Map<String, dynamic>.from(
                     data['fields'] as Map? ?? const {}),
                 operationId: data['operationId']?.toString() ?? '',
+                kind: data['kind']?.toString() ?? 'cardPatch',
               );
             })
-            .where((item) => item.number > 0 && item.wordId != 0)
+            .where((item) => item.number > 0)
             .toList();
       });
 
@@ -571,9 +605,18 @@ class CloudBackup {
           ..sort((a, b) => ((a['index'] as num?)?.toInt() ?? 0)
               .compareTo((b['index'] as num?)?.toInt() ?? 0));
         final bytes = <int>[];
-        for (final row in rows) {
+        final data = metadata.data()!;
+        if (rows.length != (data['chunkCount'] as num?)?.toInt()) {
+          throw StateError('복원본 조각이 누락되었습니다. 다운로드를 다시 시도해 주세요.');
+        }
+        for (var index = 0; index < rows.length; index++) {
+          final row = rows[index];
+          if (row['index'] != index) throw StateError('복원본 조각 순서 오류');
           final data = row['data'];
           if (data is String) bytes.addAll(base64Decode(data));
+        }
+        if (bytes.length != (data['byteSize'] as num?)?.toInt()) {
+          throw StateError('복원본 크기 검증에 실패했습니다.');
         }
         if (bytes.isEmpty) return null;
         return BookRestorePoint.fromJson(
@@ -758,11 +801,14 @@ class CloudBackup {
         // legacy incremental writer targets the now read-only vocabBooks and
         // words collections; keeping it here made a permission failure there
         // abort the independent session upload before V2 was even captured.
+        final heads = _syncV2Ref;
+        final learningSignal = _learningSyncSignal;
+        final legacySignal = _legacySyncSignal;
         final deviceId = await store.cloudChanges.deviceId();
         final payload = await store.syncV2Snapshot();
         final bytes = await compute(_encodeSyncPayload, payload);
         final revision = sha256.convert(bytes).toString();
-        final head = _syncV2Ref.doc(deviceId);
+        final head = heads.doc(deviceId);
         final previous = await head.get();
         if (previous.data()?['revision'] == revision) return;
         final version = head.collection('versions').doc(revision);
@@ -777,39 +823,48 @@ class CloudBackup {
         }
         final metadata = {
           'schema': 2,
+          'protocol': 3,
           'deviceId': deviceId,
           'revision': revision,
           'chunkCount': chunkCount,
           'byteLength': bytes.length,
           'sequence': changes.learningStateGeneration,
+          'clock': (payload['clock'] as num?)?.toInt() ?? 0,
           'updatedAt': FieldValue.serverTimestamp(),
         };
         await version.set(metadata);
         // Publish only after every immutable chunk exists. A failed upload
         // leaves the previous complete version readable.
-        final batch = firestore.batch();
-        batch.set(head, metadata);
-        batch.set(
-          _learningSyncSignal,
-          {
-            'deviceId': deviceId,
-            'revision': revision,
-            'updatedAt': FieldValue.serverTimestamp()
-          },
-        );
-        // Temporary compatibility signal for phones still running a build
-        // from before the channels were split. Current builds do not use this
-        // mixed document as their source of truth.
-        batch.set(
-          _legacySyncSignal,
-          {
-            'deviceId': deviceId,
-            'revision': revision,
-            'updatedAt': FieldValue.serverTimestamp()
-          },
-          SetOptions(merge: true),
-        );
-        await batch.commit();
+        await firestore.runTransaction((transaction) async {
+          final current = await transaction.get(head);
+          if (current.data()?['revision'] == revision) return;
+          if (learningHeadWouldRegress(current.data() ?? {},
+              clock: metadata['clock'] as int,
+              sequence: changes.learningStateGeneration)) {
+            throw StateError('더 최신인 학습 기록이 먼저 저장되었습니다. 병합 후 재시도합니다.');
+          }
+          transaction.set(head, metadata);
+          transaction.set(
+            learningSignal,
+            {
+              'deviceId': deviceId,
+              'revision': revision,
+              'updatedAt': FieldValue.serverTimestamp()
+            },
+          );
+          // Temporary compatibility signal for phones still running a build
+          // from before the channels were split. Current builds do not use this
+          // mixed document as their source of truth.
+          transaction.set(
+            legacySignal,
+            {
+              'deviceId': deviceId,
+              'revision': revision,
+              'updatedAt': FieldValue.serverTimestamp()
+            },
+            SetOptions(merge: true),
+          );
+        });
       });
 
   Future<List<Map<String, dynamic>>> downloadLegacyLearningStates() =>
@@ -954,22 +1009,25 @@ class CloudBackup {
     return fields;
   }
 
-  Future<Map<String, dynamic>> _loadOrMigrateSettings() async {
-    final existing = await _settingsRef.get();
+  Future<Map<String, dynamic>> _loadOrMigrateSettings({
+    required DocumentReference<Map<String, dynamic>> settingsRef,
+    required DocumentReference<Map<String, dynamic>> profileRef,
+  }) async {
+    final existing = await settingsRef.get();
     if (existing.exists) return existing.data()!;
-    final legacy = await _profileRef.get();
+    final legacy = await profileRef.get();
     final seed = legacy.exists ? _legacySettingsFields(legacy.data()!) : {};
     await firestore.runTransaction((transaction) async {
-      final current = await transaction.get(_settingsRef);
+      final current = await transaction.get(settingsRef);
       if (current.exists) return;
-      transaction.set(_settingsRef, {
+      transaction.set(settingsRef, {
         'schema': 1,
         'fields': seed,
         'migratedFromProfile': legacy.exists,
         'updatedAt': FieldValue.serverTimestamp(),
       });
     });
-    return (await _settingsRef.get()).data() ?? {'schema': 1, 'fields': seed};
+    return (await settingsRef.get()).data() ?? {'schema': 1, 'fields': seed};
   }
 
   /// Merges only changed preference fields. It never reads or writes card,
@@ -978,49 +1036,55 @@ class CloudBackup {
     Map<String, Map<String, dynamic>> local,
   ) =>
       _runCloudOperation(() async {
-        final document = await _loadOrMigrateSettings();
-        final remote =
-            Map<String, dynamic>.from(document['fields'] as Map? ?? {});
-        final outgoing = <String, dynamic>{};
-        final resolved = <String, dynamic>{...remote};
-        for (final entry in local.entries) {
-          final remoteEntry = remote[entry.key];
-          if (remoteEntry is! Map ||
-              _compareSettingsVersion(
-                      entry.value, Map<String, dynamic>.from(remoteEntry)) >=
-                  0) {
-            outgoing[entry.key] = entry.value;
-            resolved[entry.key] = entry.value;
+        final settingsRef = _settingsRef;
+        final signalRef = _settingsSyncSignal;
+        final profileRef = _profileRef;
+        await _loadOrMigrateSettings(
+            settingsRef: settingsRef, profileRef: profileRef);
+        return firestore
+            .runTransaction<SettingsSyncResult>((transaction) async {
+          final document = await transaction.get(settingsRef);
+          final remote = Map<String, dynamic>.from(
+              document.data()?['fields'] as Map? ?? {});
+          final outgoing = <String, dynamic>{};
+          final resolved = <String, dynamic>{...remote};
+          for (final entry in local.entries) {
+            final remoteEntry = remote[entry.key];
+            if (remoteEntry is! Map ||
+                _compareSettingsVersion(
+                        entry.value, Map<String, dynamic>.from(remoteEntry)) >=
+                    0) {
+              outgoing[entry.key] = entry.value;
+              resolved[entry.key] = entry.value;
+            }
           }
-        }
-        if (outgoing.isNotEmpty) {
-          final deviceIds = outgoing.values
-              .whereType<Map>()
-              .map((value) => '${value['deviceId'] ?? ''}')
-              .where((value) => value.isNotEmpty)
-              .toSet();
-          final batch = firestore.batch();
-          batch.set(
-              _settingsRef,
-              {
-                'schema': 1,
-                'fields': outgoing,
-                'updatedAt': FieldValue.serverTimestamp(),
-              },
-              SetOptions(merge: true));
-          batch.set(_settingsSyncSignal, {
-            'deviceId': deviceIds.length == 1 ? deviceIds.single : '',
-            'revision': outgoing.values
+          if (outgoing.isNotEmpty) {
+            final deviceIds = outgoing.values
                 .whereType<Map>()
-                .map(
-                    (value) => (value['updatedAtMicros'] as num?)?.toInt() ?? 0)
-                .fold<int>(
-                    0, (latest, value) => value > latest ? value : latest),
-            'updatedAt': FieldValue.serverTimestamp(),
-          });
-          await batch.commit();
-        }
-        return SettingsSyncResult(fields: resolved, submitted: local);
+                .map((value) => '${value['deviceId'] ?? ''}')
+                .where((value) => value.isNotEmpty)
+                .toSet();
+            transaction.set(
+                settingsRef,
+                {
+                  'schema': 1,
+                  'fields': outgoing,
+                  'updatedAt': FieldValue.serverTimestamp(),
+                },
+                SetOptions(merge: true));
+            transaction.set(signalRef, {
+              'deviceId': deviceIds.length == 1 ? deviceIds.single : '',
+              'revision': outgoing.values
+                  .whereType<Map>()
+                  .map((value) =>
+                      (value['updatedAtMicros'] as num?)?.toInt() ?? 0)
+                  .fold<int>(
+                      0, (latest, value) => value > latest ? value : latest),
+              'updatedAt': FieldValue.serverTimestamp(),
+            });
+          }
+          return SettingsSyncResult(fields: resolved, submitted: local);
+        });
       });
 
   Future<void> uploadIncremental(

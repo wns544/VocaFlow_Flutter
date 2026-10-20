@@ -20,13 +20,81 @@ import 'package:vocaflow/kanji_lookup.dart';
 import 'package:vocaflow/models.dart';
 import 'package:vocaflow/store.dart';
 import 'package:vocaflow/study_speech.dart';
+import 'package:vocaflow/card_sync.dart';
 
 void main() {
-  testWidgets('editing meaning preserves a reading received while editor is open', (tester) async {
+  testWidgets('merged session updates range and total without reauthoring on flip', (tester) async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();
-    final book = await store.addBook('편집 검증', [Word(id: 991, term: 'つくづく', reading: 'old', meaning: '절실히')]);
-    await tester.pumpWidget(MaterialApp(home: CardStudyPage(store: store, words: book.words)));
+    final book = await store.addBook('range sync', List.generate(10,
+        (i) => Word(id: i, term: 'term$i', reading: 'reading$i', meaning: 'meaning$i')));
+    final initial = ActiveStudy(queueIds: [0, 1], queueBookIds: [book.id, book.id],
+        total: 10, memorized: 0, reviewed: [], revealed: false, sessionIndexes: [],
+        bookId: book.id, rangeStart: 0, rangeEnd: 10);
+    final key = store.activeStudyKey(initial);
+    final saved = (await store.saveActiveStudyFor(key, initial))!;
+    final baseline = await store.syncV2Snapshot();
+    await tester.pumpWidget(MaterialApp(home: CardStudyPage(store: store, resume: saved)));
+    await tester.pumpAndSettle();
+    final vector = Map<String, dynamic>.from(saved.progress['vector'] as Map)..['pc'] = 1;
+    final incoming = {...saved.toJson(), 'queueIds': [6, 7], 'total': 5,
+      'memorized': 3, 'rangeStart': 5, 'rangeEnd': 10, 'updatedAt': '2020-01-01T00:00:00Z',
+      'progress': {...saved.progress, 'id': 'pc:after-observing-phone', 'device': 'pc', 'vector': vector}};
+    await store.applySyncV2([{'schema': 2, 'clock': (baseline['clock'] as int) + 1,
+      'records': {'session/$key': {'clock': (baseline['clock'] as int) + 1,
+        'device': 'pc', 'value': {'active': incoming, 'words': {}}}}}]);
+    await tester.pumpAndSettle();
+    expect(store.getActiveStudyFor(key)!.rangeStart, 5);
+    expect(find.textContaining('No.5~10'), findsOneWidget,
+      reason: tester.widgetList<Text>(find.byType(Text)).map((w) => w.data ?? '').join('|'));
+    expect(find.text('term6'), findsWidgets);
+    await tester.tap(find.byKey(const ValueKey('study-card')));
+    await tester.pumpAndSettle();
+    final after = await store.syncV2Snapshot();
+    expect(after['records']['session/$key']['value']['active']['progress']['id'], 'pc:after-observing-phone');
+    expect(store.getActiveStudyFor(key)!.total, 5);
+    expect(store.getActiveStudyFor(key)!.rangeStart, 5);
+    expect(store.getActiveStudyFor(key)!.memorized, 3);
+  });
+  testWidgets('remote deletion skips current card without a learning decision',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final book = await store.addBook('delete test', [
+      Word(id: 991, term: 'first', reading: 'first', meaning: '첫째'),
+      Word(id: 992, term: 'second', reading: 'second', meaning: '둘째')
+    ]);
+    for (final op in store.cardChanges.pending) {
+      await store.cardChanges.acknowledge(op);
+    }
+    await tester.pumpWidget(MaterialApp(home: CardStudyPage(
+      store: store, words: book.words.toList(), bookId: book.id,
+      useSavedResume: false,
+    )));
+    await tester.pumpAndSettle();
+    expect(find.text('first'), findsWidgets);
+    await store.mergeCardBooks([CardBookSnapshot(book: {
+      'id': book.id, 'name': book.name, 'wordOrder': [992]
+    }, cards: [book.words.last.toJson(), {'id': 991, 'deleted': true}], changeNumber: 1)]);
+    await tester.pumpAndSettle();
+    expect(find.text('first'), findsNothing);
+    expect(find.text('second'), findsWidgets);
+    expect(store.resolveCard(book.id, 992)!.correctCount, 0);
+    expect(store.resolveCard(book.id, 992)!.wrongCount, 0);
+    expect(store.cardChanges.pending, isEmpty);
+  });
+  testWidgets(
+      'editing meaning preserves a reading received while editor is open',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final book = await store.addBook(
+        '편집 검증', [Word(id: 991, term: 'つくづく', reading: 'old', meaning: '절실히')]);
+    for (final op in store.cardChanges.pending) {
+      await store.cardChanges.acknowledge(op);
+    }
+    await tester.pumpWidget(
+        MaterialApp(home: CardStudyPage(store: store, words: book.words)));
     await tester.pumpAndSettle();
     await tester.tap(find.byIcon(Icons.edit_outlined));
     await tester.pumpAndSettle();

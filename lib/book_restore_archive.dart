@@ -1,5 +1,5 @@
 import 'dart:convert';
-import 'dart:math';
+import 'sync_identifiers.dart';
 
 /// An immutable, account-owned recovery point. Its payload is intentionally
 /// separate from managedBooks so card content never needs to be changed for a
@@ -23,7 +23,7 @@ class BookRestorePoint {
   }) {
     final stamp = (now ?? DateTime.now()).toUtc();
     return BookRestorePoint(
-      id: 'archive-${stamp.microsecondsSinceEpoch.toRadixString(36)}-${Random.secure().nextInt(1 << 32).toRadixString(36)}',
+      id: 'archive-${stamp.microsecondsSinceEpoch.toRadixString(36)}-${createSyncNonce()}',
       bookId: bookId,
       kind: kind,
       createdAt: stamp,

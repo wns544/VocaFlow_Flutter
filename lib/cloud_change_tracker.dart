@@ -93,6 +93,10 @@ class CloudChangeTracker {
   bool _dictionaryOpenSettingDirty = false;
   final Set<String> _settingsKeys = {};
   String? _settingsLastError;
+  int _settingsFailureRevision = 0;
+  Future<void> _settingsStatusWork = Future<void>.value();
+  int _accountEpoch = 0;
+  int get accountEpoch => _accountEpoch;
   final Set<String> _bookIds = {};
   final Map<String, Set<int>> _wordIdsByBook = {};
   final Map<String, Set<int>> _deletedWordIdsByBook = {};
@@ -125,26 +129,45 @@ class CloudChangeTracker {
   bool get dictionaryOpenSettingDirty => _dictionaryOpenSettingDirty;
   bool get settingsDirty => _settingsKeys.isNotEmpty;
   String? get settingsLastError => _settingsLastError;
+  int get settingsFailureRevision => _settingsFailureRevision;
+
+  Future<T> _enqueueSettingsStatus<T>(Future<T> Function() work) {
+    final task = _settingsStatusWork.then((_) => work());
+    _settingsStatusWork =
+        task.then<void>((_) {}, onError: (Object _, StackTrace __) {});
+    return task;
+  }
+
+  Future<T> _settingsStatus<T>(Future<T> Function() work, {required T stale}) {
+    final epoch = _accountEpoch;
+    return _enqueueSettingsStatus(() async {
+      if (epoch != _accountEpoch) return stale;
+      return work();
+    });
+  }
 
   /// Switches the durable upload queue to the signed-in account. Old builds
   /// had one unscoped queue; its pending work is adopted once by the first
   /// account that signs in, never shared with a later account.
-  Future<void> activateAccount(String uid) async {
-    if (_activeAccountId == uid) return;
-    final accountKey = '$_accountStatePrefix$uid';
-    final scoped = _prefs.getString(accountKey);
-    if (scoped != null) {
-      _clearInMemory();
-      _restoreEncoded(scoped);
-    } else {
-      // Only the first signed-in account may adopt old unscoped work. A
-      // second account starts with an empty queue, never a copy of account A.
-      if (_activeAccountId != null) _clearInMemory();
-      await _prefs.setString(accountKey, _encodeState());
-    }
-    _activeAccountId = uid;
-    await _persist();
-    onChanged?.call();
+  Future<void> activateAccount(String uid) {
+    if (_activeAccountId != uid) _accountEpoch++;
+    return _enqueueSettingsStatus(() async {
+      if (_activeAccountId == uid) return;
+      final accountKey = '$_accountStatePrefix$uid';
+      final scoped = _prefs.getString(accountKey);
+      if (scoped != null) {
+        _clearInMemory();
+        _restoreEncoded(scoped);
+      } else {
+        // Only the first signed-in account may adopt old unscoped work. A
+        // second account starts with an empty queue, never a copy of account A.
+        if (_activeAccountId != null) _clearInMemory();
+        await _prefs.setString(accountKey, _encodeState());
+      }
+      _activeAccountId = uid;
+      await _persist();
+      onChanged?.call();
+    });
   }
 
   int get pendingCount => snapshot.pendingCount;
@@ -165,21 +188,77 @@ class CloudChangeTracker {
         return before != _settingsKeys.length;
       });
 
-  Future<void> acknowledgeSettings(Iterable<String> keys) => _mutate(() {
-        var changed = false;
-        for (final key in keys) {
-          changed = _settingsKeys.remove(key) || changed;
+  Future<void> acknowledgeSettings(Iterable<String> keys,
+          {int? expectedFailureRevision}) =>
+      _settingsStatus(() async {
+        final captured = keys.toSet();
+        final previousError = _settingsLastError;
+        try {
+          await _mutate(() {
+            var changed = false;
+            for (final key in captured) {
+              changed = _settingsKeys.remove(key) || changed;
+            }
+            if (_settingsKeys.isEmpty &&
+                _settingsLastError != null &&
+                (expectedFailureRevision == null ||
+                    expectedFailureRevision == _settingsFailureRevision)) {
+              _settingsLastError = null;
+              changed = true;
+            }
+            return changed;
+          });
+        } catch (_) {
+          _settingsKeys.addAll(captured);
+          _settingsLastError = previousError;
+          rethrow;
         }
-        if (_settingsKeys.isEmpty) _settingsLastError = null;
-        return changed;
-      });
+      }, stale: null);
 
-  Future<void> recordSettingsFailure(Object error) => _mutate(() {
-        final next = error.toString();
-        if (_settingsLastError == next) return false;
-        _settingsLastError = next;
+  Future<void> recordSettingsFailure(Object error,
+          {int? expectedAccountEpoch}) =>
+      _settingsStatus(() async {
+        if (expectedAccountEpoch != null &&
+            expectedAccountEpoch != _accountEpoch) return;
+        await _mutate(() {
+          final next = error.toString();
+          _settingsFailureRevision++;
+          _settingsLastError = next;
+          return true;
+        });
+        await recordChannelFailure('settings', error);
+      }, stale: null);
+
+  /// A successful read proves connectivity, not a new server upload. Clear
+  /// only the errors observed when that request began, and never pending work.
+  Future<bool> confirmSettingsCheck(int expectedFailureRevision,
+          {DateTime? uploadedAt}) =>
+      _settingsStatus(() async {
+        if (_settingsKeys.isNotEmpty ||
+            expectedFailureRevision != _settingsFailureRevision) return false;
+        final prefix = 'sync.channel.${_activeAccountId ?? 'local'}.settings';
+        if (!await _prefs.remove('$prefix.error')) {
+          throw StateError('설정 오류 상태를 기기에 저장하지 못했습니다.');
+        }
+        if (uploadedAt != null &&
+            !await _prefs.setString(
+                '$prefix.success', uploadedAt.toUtc().toIso8601String())) {
+          throw StateError('설정 저장 확인 시각을 기기에 저장하지 못했습니다.');
+        }
+        final previousError = _settingsLastError;
+        try {
+          await _mutate(() {
+            if (_settingsLastError == null) return false;
+            _settingsLastError = null;
+            return true;
+          });
+        } catch (_) {
+          _settingsLastError = previousError;
+          rethrow;
+        }
+        onChanged?.call();
         return true;
-      });
+      }, stale: false);
 
   /// Clears only book content after it reaches the dedicated managedBooks
   /// collection. Profile and learning-state work remain queued separately.
@@ -272,7 +351,12 @@ class CloudChangeTracker {
         _learningStateGeneration != uploaded.learningStateGeneration) return;
     _learningStateDirty = false;
     _generation++;
-    await _persist();
+    try {
+      await _persist();
+    } catch (_) {
+      _learningStateDirty = true;
+      rethrow;
+    }
     onChanged?.call();
   }
 
@@ -383,6 +467,7 @@ class CloudChangeTracker {
     _dictionaryOpenSettingDirty = false;
     _settingsKeys.clear();
     _settingsLastError = null;
+    _settingsFailureRevision = 0;
     _bookIds.clear();
     _wordIdsByBook.clear();
     _deletedWordIdsByBook.clear();
@@ -517,6 +602,8 @@ class CloudChangeTracker {
       _settingsKeys.addAll(
           (json['settingsKeys'] as List<dynamic>? ?? []).cast<String>());
       _settingsLastError = json['settingsLastError'] as String?;
+      _settingsFailureRevision =
+          (json['settingsFailureRevision'] as num?)?.toInt() ?? 0;
       _bookIds.addAll((json['bookIds'] as List<dynamic>? ?? []).cast<String>());
       _restoreMap(json['wordIdsByBook'], _wordIdsByBook);
       _restoreMap(json['deletedWordIdsByBook'], _deletedWordIdsByBook);
@@ -540,12 +627,15 @@ class CloudChangeTracker {
     }
   }
 
-  Future<void> _persist() => _prefs.setString(
-        _activeAccountId == null
-            ? _stateKey
-            : '$_accountStatePrefix$_activeAccountId',
-        _encodeState(),
-      );
+  Future<void> _persist() async {
+    final saved = await _prefs.setString(
+      _activeAccountId == null
+          ? _stateKey
+          : '$_accountStatePrefix$_activeAccountId',
+      _encodeState(),
+    );
+    if (!saved) throw StateError('동기화 대기 기록을 기기에 저장하지 못했습니다.');
+  }
 
   String _encodeState() => jsonEncode({
         'generation': _generation,
@@ -553,6 +643,7 @@ class CloudChangeTracker {
         'dictionaryOpenSettingDirty': _dictionaryOpenSettingDirty,
         'settingsKeys': _settingsKeys.toList(),
         'settingsLastError': _settingsLastError,
+        'settingsFailureRevision': _settingsFailureRevision,
         'bookIds': _bookIds.toList(),
         'wordIdsByBook': _encodeMap(_wordIdsByBook),
         'deletedWordIdsByBook': _encodeMap(_deletedWordIdsByBook),

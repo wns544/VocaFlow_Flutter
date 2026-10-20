@@ -1,0 +1,14 @@
+{
+  "baseline": [
+    {"bookId":"synthetic-test-book","wordId":1,"fields":{"meaning":"reference"},"fieldRevisions":{"meaning":0},"referenceOwnedFields":["meaning"]},
+    {"bookId":"synthetic-test-book","wordId":2,"fields":{"meaning":"imported custom"},"fieldRevisions":{"meaning":0}}
+  ],
+  "current": [
+    {"bookId":"synthetic-test-book","wordId":1,"fields":{"meaning":"reference"},"fieldRevisions":{"meaning":0}},
+    {"bookId":"synthetic-test-book","wordId":2,"fields":{"meaning":"imported custom"},"fieldRevisions":{"meaning":0}}
+  ],
+  "proposed": [
+    {"bookId":"synthetic-test-book","wordId":1,"fields":{"meaning":"corrected reference"}},
+    {"bookId":"synthetic-test-book","wordId":2,"fields":{"meaning":"must not overwrite custom"}}
+  ]
+}
