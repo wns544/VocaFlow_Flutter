@@ -681,8 +681,7 @@ class _StartupFailureScreen extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             Text(
-              writerError?.detail ??
-                  '저장된 데이터는 삭제되지 않았습니다. 잠시 후 다시 시도해 주세요.',
+              writerError?.detail ?? '저장된 데이터는 삭제되지 않았습니다. 잠시 후 다시 시도해 주세요.',
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 20),
@@ -2006,22 +2005,118 @@ class _CardStudyPageState extends State<CardStudyPage>
   var revealed = false;
   Word? _pendingRevealWord;
   DateTime? _flipMeasureUntil;
+  Timer? _flipMeasureTimer;
+  int _flipMeasureGeneration = 0;
+  int _flipFrameCount = 0;
+  int _flipSlowFrameCount = 0;
+  int _flipBuildMaxUs = 0;
+  int _flipRasterMaxUs = 0;
+  DateTime? _swipeMeasureUntil;
+  Timer? _swipeMeasureTimer;
+  int _swipeMeasureGeneration = 0;
+  int _swipeFrameCount = 0;
+  int _swipeSlowFrameCount = 0;
+  int _swipeBuildMaxUs = 0;
+  int _swipeRasterMaxUs = 0;
+
+  Map<String, Object?> _studyQueueTrace() => {
+        'frontWordId': queue.firstOrNull?.id,
+        'queueLength': queue.length,
+        'firstQueueIds': queue.take(5).map((word) => word.id).toList(),
+        'roundNumber': roundNumber,
+        'roundCompleted': roundCompleted,
+        'undoCount': undoHistory.length,
+        'progressId': _activeStudyProgressId,
+      };
+
+  void _beginFlipFrameMeasurement(int wordId) {
+    _flipMeasureTimer?.cancel();
+    final generation = ++_flipMeasureGeneration;
+    final started = DateTime.now();
+    _flipMeasureUntil = started.add(const Duration(milliseconds: 550));
+    _flipFrameCount = 0;
+    _flipSlowFrameCount = 0;
+    _flipBuildMaxUs = 0;
+    _flipRasterMaxUs = 0;
+    _flipMeasureTimer = Timer(const Duration(milliseconds: 600), () {
+      if (!mounted || generation != _flipMeasureGeneration) return;
+      _flipMeasureUntil = null;
+      NavigationTrace.record('study_flip_frame_timing', {
+        'wordId': wordId,
+        'sampleMs': DateTime.now().difference(started).inMilliseconds,
+        'frameCount': _flipFrameCount,
+        'slow16ms': _flipSlowFrameCount,
+        'buildMaxUs': _flipBuildMaxUs,
+        'rasterMaxUs': _flipRasterMaxUs,
+      });
+    });
+  }
+
+  void _beginSwipeFrameMeasurement(String frontId) {
+    _swipeMeasureTimer?.cancel();
+    final generation = ++_swipeMeasureGeneration;
+    final started = DateTime.now();
+    _swipeMeasureUntil = started.add(const Duration(milliseconds: 500));
+    _swipeFrameCount = 0;
+    _swipeSlowFrameCount = 0;
+    _swipeBuildMaxUs = 0;
+    _swipeRasterMaxUs = 0;
+    _swipeMeasureTimer = Timer(const Duration(milliseconds: 550), () {
+      if (!mounted || generation != _swipeMeasureGeneration) return;
+      _swipeMeasureUntil = null;
+      NavigationTrace.record('study_swipe_frame_timing', {
+        'frontId': frontId,
+        'sampleMs': DateTime.now().difference(started).inMilliseconds,
+        'frameCount': _swipeFrameCount,
+        'slow16ms': _swipeSlowFrameCount,
+        'buildMaxUs': _swipeBuildMaxUs,
+        'rasterMaxUs': _swipeRasterMaxUs,
+      });
+    });
+  }
 
   void _recordStudyFrameTimings(List<FrameTiming> frames) {
-    final until = _flipMeasureUntil;
-    if (until == null || DateTime.now().isAfter(until) || frames.isEmpty)
-      return;
-    final buildUs =
-        frames.map((f) => f.buildDuration.inMicroseconds).reduce(max);
-    final rasterUs =
-        frames.map((f) => f.rasterDuration.inMicroseconds).reduce(max);
-    final slow = frames
-        .where((f) =>
-            f.buildDuration.inMicroseconds > 16667 ||
-            f.rasterDuration.inMicroseconds > 16667)
-        .length;
-    debugPrint('VOCAFRAME frames=${frames.length} slow16ms=$slow '
-        'buildMaxUs=$buildUs rasterMaxUs=$rasterUs');
+    if (frames.isEmpty) return;
+    if (_swipeMeasureUntil case final swipeUntil?) {
+      if (!DateTime.now().isAfter(swipeUntil)) {
+        _swipeFrameCount += frames.length;
+        _swipeSlowFrameCount += frames
+            .where((frame) =>
+                frame.buildDuration.inMicroseconds > 16667 ||
+                frame.rasterDuration.inMicroseconds > 16667)
+            .length;
+        _swipeBuildMaxUs = max(
+            _swipeBuildMaxUs,
+            frames
+                .map((frame) => frame.buildDuration.inMicroseconds)
+                .reduce(max));
+        _swipeRasterMaxUs = max(
+            _swipeRasterMaxUs,
+            frames
+                .map((frame) => frame.rasterDuration.inMicroseconds)
+                .reduce(max));
+      }
+    }
+    if (_flipMeasureUntil case final flipUntil?) {
+      if (!DateTime.now().isAfter(flipUntil)) {
+        _flipFrameCount += frames.length;
+        _flipSlowFrameCount += frames
+            .where((frame) =>
+                frame.buildDuration.inMicroseconds > 16667 ||
+                frame.rasterDuration.inMicroseconds > 16667)
+            .length;
+        _flipBuildMaxUs = max(
+            _flipBuildMaxUs,
+            frames
+                .map((frame) => frame.buildDuration.inMicroseconds)
+                .reduce(max));
+        _flipRasterMaxUs = max(
+            _flipRasterMaxUs,
+            frames
+                .map((frame) => frame.rasterDuration.inMicroseconds)
+                .reduce(max));
+      }
+    }
   }
 
   var showingExplanation = false;
@@ -2125,7 +2220,7 @@ class _CardStudyPageState extends State<CardStudyPage>
       return KeyEventResult.handled;
     }
     if (key == LogicalKeyboardKey.keyZ && undoHistory.isNotEmpty) {
-      undo();
+      undo(source: 'keyboard');
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
@@ -2319,6 +2414,8 @@ class _CardStudyPageState extends State<CardStudyPage>
 
   @override
   void dispose() {
+    _flipMeasureTimer?.cancel();
+    _swipeMeasureTimer?.cancel();
     widget.store.learningStateRevision.removeListener(_onLearningStateMerged);
     widget.store.cardContentRevision.removeListener(_onCardContentChanged);
     SchedulerBinding.instance.removeTimingsCallback(_recordStudyFrameTimings);
@@ -2357,7 +2454,7 @@ class _CardStudyPageState extends State<CardStudyPage>
           (latest.progress['id'] == _activeStudyProgressId &&
               _activeStudyUpdatedAt != null &&
               !latestAt.isAfter(_activeStudyUpdatedAt!))) return;
-      _applyMergedActiveStudy(latest);
+      _applyMergedActiveStudy(latest, source: 'learning_merge');
       unawaited(widget.store.cloudChanges
           .recordDiagnostic('active_study_screen_refreshed_after_merge', data: {
         'studyKey': _activeStudyStorageKey,
@@ -2404,9 +2501,25 @@ class _CardStudyPageState extends State<CardStudyPage>
     if (mounted) setState(() {});
   }
 
-  void _applyMergedActiveStudy(ActiveStudy latest) {
+  void _applyMergedActiveStudy(ActiveStudy latest, {required String source}) {
     final latestQueue = widget.store.resolveActiveWords(latest);
-    if (latestQueue.isEmpty || !mounted) return;
+    if (latestQueue.isEmpty || !mounted) {
+      NavigationTrace.record('study_merge_queue_skipped', {
+        'source': source,
+        'reason': latestQueue.isEmpty ? 'empty_resolved_queue' : 'unmounted',
+        'incomingProgressId': latest.progress['id'],
+        'incomingQueueLength': latest.queueIds.length,
+      });
+      return;
+    }
+    NavigationTrace.record('study_merge_queue_before', {
+      'source': source,
+      ..._studyQueueTrace(),
+      'incomingProgressId': latest.progress['id'],
+      'incomingUpdatedAt': latest.updatedAt?.toIso8601String(),
+      'incomingFirstQueueIds': latest.queueIds.take(5).toList(),
+      'incomingQueueLength': latest.queueIds.length,
+    });
     final currentWord = queue.firstOrNull;
     final nextWord = latestQueue.first;
     final visibleCardChanged = currentWord == null ||
@@ -2454,6 +2567,10 @@ class _CardStudyPageState extends State<CardStudyPage>
       _activeStudyUpdatedAt = latest.updatedAt;
       _activeStudyProgressId = latest.progress['id'] as String?;
     });
+    NavigationTrace.record('study_merge_queue_after', {
+      'source': source,
+      ..._studyQueueTrace(),
+    });
   }
 
   Future<void> persistStudy({
@@ -2470,20 +2587,29 @@ class _CardStudyPageState extends State<CardStudyPage>
         markCloudChange: markCloudChange);
     if (saved == null) {
       _onLearningStateMerged();
-    } else {
+    } else if (progressChanged) {
       _activeStudyUpdatedAt = saved.updatedAt;
       _activeStudyProgressId = saved.progress['id'] as String?;
-      if (!progressChanged &&
-          mounted &&
-          !exiting &&
-          (total != saved.total ||
-              memorized != saved.memorized ||
-              roundCompleted != saved.roundCompleted ||
-              activeRangeStart != saved.rangeStart ||
-              activeRangeEnd != saved.rangeEnd ||
-              queue.firstOrNull?.id != saved.queueIds.firstOrNull)) {
-        _applyMergedActiveStudy(saved);
-      }
+    } else if (mounted &&
+        !exiting &&
+        (total != saved.total ||
+            memorized != saved.memorized ||
+            roundCompleted != saved.roundCompleted ||
+            activeRangeStart != saved.rangeStart ||
+            activeRangeEnd != saved.rangeEnd ||
+            queue.firstOrNull?.id != saved.queueIds.firstOrNull)) {
+      // A face-only save may finish after the learner has swiped. Its return
+      // value describes the *previously stored* queue, not the visible one.
+      // Never put that older queue back on screen. A real remote merge has
+      // its own revision listener; defer any reconciliation until all pending
+      // decisions have been written.
+      NavigationTrace.record('study_passive_save_older_queue_ignored', {
+        ..._studyQueueTrace(),
+        'savedFirstQueueIds': saved.queueIds.take(5).toList(),
+        'savedQueueLength': saved.queueIds.length,
+        'savedProgressId': saved.progress['id'],
+      });
+      _onLearningStateMerged();
     }
   }
 
@@ -2882,6 +3008,7 @@ class _CardStudyPageState extends State<CardStudyPage>
 
   void decide(StudyState state, {bool? dismissedPositive}) {
     if (queue.isEmpty || _decisionSaveFailed) return;
+    final beforeQueue = _studyQueueTrace();
     final word = queue.removeAt(0);
     seenWordIds.add(word.id);
     roundCompleted = min(roundCompleted + 1, roundTotal);
@@ -2961,6 +3088,12 @@ class _CardStudyPageState extends State<CardStudyPage>
     if (mounted) {
       setState(() => _undoEntryDirection = null);
     }
+    NavigationTrace.record('study_decision_queue_changed', {
+      'wordId': word.id,
+      'decision': state.name,
+      'before': beforeQueue,
+      'after': _studyQueueTrace(),
+    });
     scheduleResumeSnapshotCapture('study');
   }
 
@@ -3040,6 +3173,7 @@ class _CardStudyPageState extends State<CardStudyPage>
     // word counters were updated.
     final canRestoreLastCard = queue.isEmpty;
     if (canRestoreLastCard) {
+      final beforeQueue = _studyQueueTrace();
       queue.insert(0, word);
       word.state = decision.previousState;
       if (roundCompleted > 0) roundCompleted--;
@@ -3072,6 +3206,12 @@ class _CardStudyPageState extends State<CardStudyPage>
       revealed = false;
       showingExplanation = false;
       if (mounted) setState(() => _undoEntryDirection = null);
+      NavigationTrace.record('study_failed_round_card_restored', {
+        'wordId': word.id,
+        'error': error.toString(),
+        'before': beforeQueue,
+        'after': _studyQueueTrace(),
+      });
       try {
         // The production writer can fail after it has updated local counters.
         // Reverse that partial attempt before allowing the card to be judged
@@ -3185,7 +3325,7 @@ class _CardStudyPageState extends State<CardStudyPage>
       return;
     }
     final shouldReveal = !revealed;
-    _flipMeasureUntil = DateTime.now().add(const Duration(seconds: 2));
+    _beginFlipFrameMeasurement(word.id);
     setState(() => revealed = shouldReveal);
     if (widget.store.flipCard) {
       unawaited(cancelResumeSnapshotCapture());
@@ -3562,8 +3702,9 @@ class _CardStudyPageState extends State<CardStudyPage>
               style: TextStyle(color: Color(0x338E8E93), fontSize: 11)),
         ]),
       );
-  Future<void> undo() async {
+  Future<void> undo({String source = 'unknown'}) async {
     if (undoHistory.isEmpty) return;
+    final beforeQueue = _studyQueueTrace();
     final undone = undoHistory.removeLast();
     final sourceBooks = undone.bookId == null
         ? widget.store.books
@@ -3572,7 +3713,15 @@ class _CardStudyPageState extends State<CardStudyPage>
         .expand((book) => book.words)
         .where((item) => item.id == undone.wordId)
         .firstOrNull;
-    if (word == null) return;
+    if (word == null) {
+      NavigationTrace.record('study_undo_failed', {
+        'source': source,
+        'wordId': undone.wordId,
+        'reason': 'card_missing',
+        'before': beforeQueue,
+      });
+      return;
+    }
     queue.removeWhere((item) => item.id == word.id);
     queue.insert(0, word);
     if (!undoHistory.any((item) => item.wordId == word.id)) {
@@ -3616,9 +3765,20 @@ class _CardStudyPageState extends State<CardStudyPage>
         unawaited(HapticFeedback.lightImpact());
       }
     }
+    NavigationTrace.record('study_undo_queue_changed', {
+      'source': source,
+      'wordId': word.id,
+      'before': beforeQueue,
+      'after': _studyQueueTrace(),
+    });
     await widget.store.undoWordDecision(word, undone.previousState,
         bookId: undone.bookId ?? activeBookId);
     await persistStudy(progressChanged: true);
+    NavigationTrace.record('study_undo_persisted', {
+      'source': source,
+      'wordId': word.id,
+      'after': _studyQueueTrace(),
+    });
     scheduleResumeSnapshotCapture('study');
   }
 
@@ -3917,6 +4077,8 @@ class _CardStudyPageState extends State<CardStudyPage>
                               nextWord == null ? null : _cardIdentity(nextWord),
                           horizontalSwipe: horizontalSwipe,
                           onTap: () => toggleReveal(word),
+                          onSwipeStarted: () =>
+                              _beginSwipeFrameMeasurement(_cardIdentity(word)),
                           onPrimaryDragChanged: (value) =>
                               _primaryDrag.value = value,
                           onDismissed: (positive) => decide(
@@ -3987,7 +4149,9 @@ class _CardStudyPageState extends State<CardStudyPage>
                     _RoundIconButton(
                         key: const ValueKey('undo-study'),
                         icon: Icons.undo,
-                        onTap: undoHistory.isEmpty ? null : undo),
+                        onTap: undoHistory.isEmpty
+                            ? null
+                            : () => undo(source: 'button')),
                   ]),
                 ]),
               ),
@@ -4043,6 +4207,7 @@ class _StudyCardDeck extends StatefulWidget {
     required this.front,
     required this.back,
     required this.onTap,
+    required this.onSwipeStarted,
     required this.onPrimaryDragChanged,
     required this.onDismissed,
   });
@@ -4054,6 +4219,7 @@ class _StudyCardDeck extends StatefulWidget {
   final Widget front;
   final Widget? back;
   final VoidCallback onTap;
+  final VoidCallback onSwipeStarted;
   final ValueChanged<double> onPrimaryDragChanged;
   final ValueChanged<bool> onDismissed;
 
@@ -4252,6 +4418,7 @@ class _StudyCardDeckState extends State<_StudyCardDeck>
     final durationMs =
         speed > 650 ? (remaining / speed * 1000).round().clamp(160, 280) : 280;
     setState(() => _dismissing = true);
+    widget.onSwipeStarted();
     await _animateTo(
       offset: target,
       rotation: _rotationFor(target),
@@ -4285,6 +4452,7 @@ class _StudyCardDeckState extends State<_StudyCardDeck>
       _lockedPositive = positive;
       _programmaticPositive = positive;
     });
+    widget.onSwipeStarted();
     await _animateTo(
       offset: target,
       // Keyboard dismissal begins at the centre of the card, so there is no

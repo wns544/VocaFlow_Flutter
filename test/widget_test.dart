@@ -23,35 +23,127 @@ import 'package:vocaflow/study_speech.dart';
 import 'package:vocaflow/card_sync.dart';
 
 void main() {
-  testWidgets('merged session updates range and total without reauthoring on flip', (tester) async {
+  testWidgets('a delayed face save cannot bring back a swiped card',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({'flipCard': false});
+    final store = await VocaStore.load();
+    final book = await store.addBook('face-save race', [
+      Word(id: 901, term: 'alpha', reading: 'alpha', meaning: '첫째'),
+      Word(id: 902, term: 'beta', reading: 'beta', meaning: '둘째'),
+      Word(id: 903, term: 'gamma', reading: 'gamma', meaning: '셋째'),
+    ]);
+    final active = ActiveStudy(
+      queueIds: const [901, 902, 903],
+      queueBookIds: [book.id, book.id, book.id],
+      total: 3,
+      memorized: 0,
+      reviewed: const [],
+      revealed: false,
+      sessionIndexes: const [],
+      bookId: book.id,
+    );
+    final studyKey = store.activeStudyKey(active);
+    final saved = (await store.saveActiveStudyFor(studyKey, active))!;
+    await tester.pumpWidget(MaterialApp(
+      home: CardStudyPage(
+        store: store,
+        resume: saved,
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    final releaseFaceSave = Completer<void>();
+    store.cloudChanges.beforeLearningStateChange = () => releaseFaceSave.future;
+    await tester.tap(find.byKey(const ValueKey('study-card')));
+    await tester.pump();
+    await tester.drag(
+        find.byKey(const ValueKey('study-card')), const Offset(0, -240));
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.text('beta'), findsWidgets);
+
+    releaseFaceSave.complete();
+    await tester.pumpAndSettle();
+    expect(find.text('alpha'), findsNothing);
+    expect(find.text('beta'), findsWidgets);
+    expect(store.getActiveStudyFor(studyKey)!.queueIds.first, 902);
+    expect(book.words.first.correctCount + book.words.first.wrongCount, 1);
+  });
+
+  testWidgets(
+      'merged session updates range and total without reauthoring on flip',
+      (tester) async {
     SharedPreferences.setMockInitialValues({});
     final store = await VocaStore.load();
-    final book = await store.addBook('range sync', List.generate(10,
-        (i) => Word(id: i, term: 'term$i', reading: 'reading$i', meaning: 'meaning$i')));
-    final initial = ActiveStudy(queueIds: [0, 1], queueBookIds: [book.id, book.id],
-        total: 10, memorized: 0, reviewed: [], revealed: false, sessionIndexes: [],
-        bookId: book.id, rangeStart: 0, rangeEnd: 10);
+    final book = await store.addBook(
+        'range sync',
+        List.generate(
+            10,
+            (i) => Word(
+                id: i,
+                term: 'term$i',
+                reading: 'reading$i',
+                meaning: 'meaning$i')));
+    final initial = ActiveStudy(
+        queueIds: [0, 1],
+        queueBookIds: [book.id, book.id],
+        total: 10,
+        memorized: 0,
+        reviewed: [],
+        revealed: false,
+        sessionIndexes: [],
+        bookId: book.id,
+        rangeStart: 0,
+        rangeEnd: 10);
     final key = store.activeStudyKey(initial);
     final saved = (await store.saveActiveStudyFor(key, initial))!;
     final baseline = await store.syncV2Snapshot();
-    await tester.pumpWidget(MaterialApp(home: CardStudyPage(store: store, resume: saved)));
+    await tester.pumpWidget(
+        MaterialApp(home: CardStudyPage(store: store, resume: saved)));
     await tester.pumpAndSettle();
-    final vector = Map<String, dynamic>.from(saved.progress['vector'] as Map)..['pc'] = 1;
-    final incoming = {...saved.toJson(), 'queueIds': [6, 7], 'total': 5,
-      'memorized': 3, 'rangeStart': 5, 'rangeEnd': 10, 'updatedAt': '2020-01-01T00:00:00Z',
-      'progress': {...saved.progress, 'id': 'pc:after-observing-phone', 'device': 'pc', 'vector': vector}};
-    await store.applySyncV2([{'schema': 2, 'clock': (baseline['clock'] as int) + 1,
-      'records': {'session/$key': {'clock': (baseline['clock'] as int) + 1,
-        'device': 'pc', 'value': {'active': incoming, 'words': {}}}}}]);
+    final vector = Map<String, dynamic>.from(saved.progress['vector'] as Map)
+      ..['pc'] = 1;
+    final incoming = {
+      ...saved.toJson(),
+      'queueIds': [6, 7],
+      'total': 5,
+      'memorized': 3,
+      'rangeStart': 5,
+      'rangeEnd': 10,
+      'updatedAt': '2020-01-01T00:00:00Z',
+      'progress': {
+        ...saved.progress,
+        'id': 'pc:after-observing-phone',
+        'device': 'pc',
+        'vector': vector
+      }
+    };
+    await store.applySyncV2([
+      {
+        'schema': 2,
+        'clock': (baseline['clock'] as int) + 1,
+        'records': {
+          'session/$key': {
+            'clock': (baseline['clock'] as int) + 1,
+            'device': 'pc',
+            'value': {'active': incoming, 'words': {}}
+          }
+        }
+      }
+    ]);
     await tester.pumpAndSettle();
     expect(store.getActiveStudyFor(key)!.rangeStart, 5);
     expect(find.textContaining('No.5~10'), findsOneWidget,
-      reason: tester.widgetList<Text>(find.byType(Text)).map((w) => w.data ?? '').join('|'));
+        reason: tester
+            .widgetList<Text>(find.byType(Text))
+            .map((w) => w.data ?? '')
+            .join('|'));
     expect(find.text('term6'), findsWidgets);
     await tester.tap(find.byKey(const ValueKey('study-card')));
     await tester.pumpAndSettle();
     final after = await store.syncV2Snapshot();
-    expect(after['records']['session/$key']['value']['active']['progress']['id'], 'pc:after-observing-phone');
+    expect(
+        after['records']['session/$key']['value']['active']['progress']['id'],
+        'pc:after-observing-phone');
     expect(store.getActiveStudyFor(key)!.total, 5);
     expect(store.getActiveStudyFor(key)!.rangeStart, 5);
     expect(store.getActiveStudyFor(key)!.memorized, 3);
@@ -67,15 +159,25 @@ void main() {
     for (final op in store.cardChanges.pending) {
       await store.cardChanges.acknowledge(op);
     }
-    await tester.pumpWidget(MaterialApp(home: CardStudyPage(
-      store: store, words: book.words.toList(), bookId: book.id,
+    await tester.pumpWidget(MaterialApp(
+        home: CardStudyPage(
+      store: store,
+      words: book.words.toList(),
+      bookId: book.id,
       useSavedResume: false,
     )));
     await tester.pumpAndSettle();
     expect(find.text('first'), findsWidgets);
-    await store.mergeCardBooks([CardBookSnapshot(book: {
-      'id': book.id, 'name': book.name, 'wordOrder': [992]
-    }, cards: [book.words.last.toJson(), {'id': 991, 'deleted': true}], changeNumber: 1)]);
+    await store.mergeCardBooks([
+      CardBookSnapshot(book: {
+        'id': book.id,
+        'name': book.name,
+        'wordOrder': [992]
+      }, cards: [
+        book.words.last.toJson(),
+        {'id': 991, 'deleted': true}
+      ], changeNumber: 1)
+    ]);
     await tester.pumpAndSettle();
     expect(find.text('first'), findsNothing);
     expect(find.text('second'), findsWidgets);
