@@ -818,9 +818,28 @@ class LegacyHomePage extends StatefulWidget {
   State<LegacyHomePage> createState() => _HomePageState();
 }
 
+// Route pushes are not automatically coalesced. Keep the gate until the
+// opened route is popped, including any confirmation dialog before it.
+class _StudyLaunchGate {
+  bool _busy = false;
+
+  Future<void> run(Future<void> Function() launch) async {
+    if (_busy) return;
+    _busy = true;
+    debugPrint('VocaPerf studyLaunch requested');
+    NavigationTrace.record('study_launch_requested');
+    try {
+      await launch();
+    } finally {
+      _busy = false;
+    }
+  }
+}
+
 class _HomePageState extends State<LegacyHomePage> {
   late String selectedBookId = widget.store.quickBook.id;
   final selectedSessions = <int>{};
+  final _studyLaunchGate = _StudyLaunchGate();
 
   WordBook get book => widget.store.books.firstWhere(
         (item) => item.id == selectedBookId,
@@ -997,6 +1016,10 @@ class _HomePageState extends State<LegacyHomePage> {
   }
 
   Future<void> _openStudy(BuildContext context, bool quiz) async {
+    await _studyLaunchGate.run(() => _openStudyOnce(context, quiz));
+  }
+
+  Future<void> _openStudyOnce(BuildContext context, bool quiz) async {
     final indexes = selectedSessions.toList()..sort();
     final sessions = book.sessions(widget.store.sessionSize);
     final words = indexes.expand((index) => sessions[index].words).toList();
@@ -1031,6 +1054,7 @@ class HomePage extends StatefulWidget {
 
 class _ReferenceHomePageState extends State<HomePage> {
   late String selectedBookId = widget.store.quickBook.id;
+  final _studyLaunchGate = _StudyLaunchGate();
   final favoriteScrollController = ScrollController();
   final selectedSessions = <int>{};
   final expandedFavoriteIds = <String>{};
@@ -1124,7 +1148,7 @@ class _ReferenceHomePageState extends State<HomePage> {
         : (progressCount / progressTotal).clamp(0.0, 1.0);
     final progressPercent = (progress * 100).round();
     final canStudy = book.words.isNotEmpty;
-    Future<void> openNextStudy() async {
+    Future<void> openNextStudyOnce() async {
       if (activeNext != null) {
         await Navigator.of(context).push(MaterialPageRoute(
           builder: (_) =>
@@ -1147,6 +1171,10 @@ class _ReferenceHomePageState extends State<HomePage> {
       if (!mounted) return;
       setState(() {});
       widget.refresh();
+    }
+
+    Future<void> openNextStudy() async {
+      await _studyLaunchGate.run(openNextStudyOnce);
     }
 
     return Padding(
@@ -1265,19 +1293,19 @@ class _ReferenceHomePageState extends State<HomePage> {
                             wrongWords.isEmpty ? '없음' : '${wrongWords.length}개',
                         onTap: wrongWords.isEmpty
                             ? null
-                            : () async {
-                                await Navigator.of(context)
-                                    .push(MaterialPageRoute(
-                                  builder: (_) => CardStudyPage(
-                                    store: widget.store,
-                                    words: wrongWords,
-                                    bookId: book.id,
-                                  ),
-                                ));
-                                if (!mounted) return;
-                                setState(() {});
-                                widget.refresh();
-                              },
+                            : () => _studyLaunchGate.run(() async {
+                                  await Navigator.of(context)
+                                      .push(MaterialPageRoute(
+                                    builder: (_) => CardStudyPage(
+                                      store: widget.store,
+                                      words: wrongWords,
+                                      bookId: book.id,
+                                    ),
+                                  ));
+                                  if (!mounted) return;
+                                  setState(() {});
+                                  widget.refresh();
+                                }),
                       ),
                     ],
                   ),
@@ -1590,7 +1618,29 @@ class _ReferenceHomePageState extends State<HomePage> {
 
   Future<void> _openFavoriteCourse(
       WordBook favorite, StudyCourse course) async {
-    await widget.store.selectQuickBook(favorite.id);
+    await _studyLaunchGate.run(() => _openFavoriteCourseOnce(favorite, course));
+  }
+
+  Future<void> _openFavoriteCourseOnce(
+      WordBook favorite, StudyCourse course) async {
+    // The selected-book preference is not a prerequisite for this route: the
+    // route carries its explicit book ID. Keep its durable write queued, but
+    // do not make the first visible response wait behind old card writes.
+    if (widget.store.quickBook.id != favorite.id) {
+      unawaited(widget.store.selectQuickBook(favorite.id).catchError(
+        (Object error, StackTrace stack) {
+          NavigationTrace.record('study_quick_book_save_failed', {
+            'bookId': favorite.id,
+            'error': error.toString(),
+          });
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+              content: Text('선택한 단어장 설정을 저장하지 못했어요. 다시 시도해 주세요.'),
+            ));
+          }
+        },
+      ));
+    }
     if (!mounted) return;
     setState(() => selectedBookId = favorite.id);
 
@@ -1654,6 +1704,11 @@ class _ReferenceHomePageState extends State<HomePage> {
 
   Future<void> _openSelections(
       BuildContext context, Map<String, List<int>> selections) async {
+    await _studyLaunchGate.run(() => _openSelectionsOnce(context, selections));
+  }
+
+  Future<void> _openSelectionsOnce(
+      BuildContext context, Map<String, List<int>> selections) async {
     final words = <Word>[];
     for (final selection in selections.entries) {
       final selectedBook = widget.store.books
@@ -1682,6 +1737,10 @@ class _ReferenceHomePageState extends State<HomePage> {
   }
 
   Future<void> _openReview(BuildContext context, List<Word> words) async {
+    await _studyLaunchGate.run(() => _openReviewOnce(context, words));
+  }
+
+  Future<void> _openReviewOnce(BuildContext context, List<Word> words) async {
     await Navigator.of(context).push(MaterialPageRoute(
       builder: (_) => CardStudyPage(store: widget.store, words: words),
     ));
@@ -2284,6 +2343,15 @@ class _CardStudyPageState extends State<CardStudyPage>
   @override
   void initState() {
     super.initState();
+    final firstFrameTime = Stopwatch()..start();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      debugPrint('VocaPerf studyFirstFrame '
+          'initToFrame=${firstFrameTime.elapsedMilliseconds}ms');
+      NavigationTrace.record('study_first_frame', {
+        'initToFrameMs': firstFrameTime.elapsedMilliseconds,
+      });
+    });
     // A newly created study route is a fresh navigation context. Keep the
     // guard for sheets inside this route, but never inherit a prior route's
     // short duplicate-back reservation.
@@ -2454,6 +2522,27 @@ class _CardStudyPageState extends State<CardStudyPage>
           (latest.progress['id'] == _activeStudyProgressId &&
               _activeStudyUpdatedAt != null &&
               !latestAt.isAfter(_activeStudyUpdatedAt!))) return;
+      // The next round is prepared on screen before its last decision finishes
+      // writing. A delayed sync of the same course must not put the previous
+      // round back in front of the learner. Reassert only the active-study
+      // position; card decisions and their event IDs remain untouched.
+      final sameAttempt = latest.bookId == activeBookId &&
+          latest.rangeStart == activeRangeStart &&
+          latest.rangeEnd == activeRangeEnd &&
+          (_sessionContext?.startedAt == null ||
+              latest.startedAt == null ||
+              latest.startedAt == _sessionContext!.startedAt);
+      if (sameAttempt && latest.roundNumber < roundNumber) {
+        NavigationTrace.record('study_older_round_merge_ignored', {
+          ..._studyQueueTrace(),
+          'incomingRound': latest.roundNumber,
+          'incomingProgressId': latest.progress['id'],
+        });
+        _activeStudyUpdatedAt = latestAt;
+        _activeStudyProgressId = latest.progress['id'] as String?;
+        await persistStudy(progressChanged: true);
+        return;
+      }
       _applyMergedActiveStudy(latest, source: 'learning_merge');
       unawaited(widget.store.cloudChanges
           .recordDiagnostic('active_study_screen_refreshed_after_merge', data: {
@@ -6917,11 +7006,16 @@ class StudyCoursePage extends StatefulWidget {
 
 class _StudyCoursePageState extends State<StudyCoursePage> {
   var source = StudyCourseSource.cumulative;
+  final _studyLaunchGate = _StudyLaunchGate();
 
   WordBook get book =>
       widget.store.books.firstWhere((item) => item.id == widget.bookId);
 
   Future<void> startCourse(StudyCourse course) async {
+    await _studyLaunchGate.run(() => _startCourseOnce(course));
+  }
+
+  Future<void> _startCourseOnce(StudyCourse course) async {
     final active = widget.store.activeCourseForBook(book.id);
     final sameRange =
         active?.rangeStart == course.start && active?.rangeEnd == course.end;

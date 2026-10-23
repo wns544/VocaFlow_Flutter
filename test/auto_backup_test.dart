@@ -17,6 +17,17 @@ void main() {
   setUp(() {
     SharedPreferences.setMockInitialValues({});
   });
+  test('confirmed learning upload survives restart and is account-specific',
+      () async {
+    final tracker = await CloudChangeTracker.load();
+    await tracker.activateAccount('s23u-account');
+    expect(tracker.hasUploadedLearningState('s23u-account'), isFalse);
+    await tracker.recordChannelSuccess('learning', DateTime.utc(2026, 10, 23));
+    final restarted = await CloudChangeTracker.load();
+    await restarted.activateAccount('s23u-account');
+    expect(restarted.hasUploadedLearningState('s23u-account'), isTrue);
+    expect(restarted.hasUploadedLearningState('other-account'), isFalse);
+  });
   test(
       'read-only settings success durably clears old errors without claiming upload',
       () async {

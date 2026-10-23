@@ -18,6 +18,8 @@ part 'store_sync.dart';
 part 'store_card_structure.dart';
 
 String _encodeAccountSnapshot(Map<String, dynamic> state) => jsonEncode(state);
+String _encodeBookSnapshot(List<WordBook> books) =>
+    jsonEncode(books.map((book) => book.toJson()).toList());
 
 class ActiveStudy {
   const ActiveStudy({
@@ -1828,7 +1830,7 @@ class VocaStore {
     'pronunciationSelections.v1',
   ];
 
-  Future<void> _saveAccountState(String uid) async {
+  Future<void> _saveAccountState(String uid, {String? encodedBooks}) async {
     final state = <String, dynamic>{};
     for (final key in _accountScopedKeys) {
       final value = _prefs.get(key);
@@ -1836,7 +1838,7 @@ class VocaStore {
     }
     // The in-memory books can be newer than the last preference write when a
     // caller is midway through a change.
-    state[_booksKey] = _encodeBooks();
+    state[_booksKey] = encodedBooks ?? await _encodeBooksForStorage();
     final encoded = await compute(_encodeAccountSnapshot, state);
     await writeLargeLocalValue(
       _prefs,
@@ -3273,10 +3275,33 @@ class VocaStore {
   String _encodeBooks() =>
       jsonEncode(books.map((book) => book.toJson()).toList());
 
+  Future<String> _encodeBooksForStorage() {
+    final wordCount =
+        books.fold<int>(0, (count, book) => count + book.words.length);
+    return kIsWeb || wordCount < 500
+        ? Future.value(_encodeBooks())
+        : compute(_encodeBookSnapshot, List<WordBook>.of(books));
+  }
+
   Future<void> _saveBooks() async {
-    final encoded = _encodeBooks();
+    // Every learning decision still waits for this durable write. Encode the
+    // full snapshot off the UI isolate on native devices so a large book does
+    // not stall swipes or make a subsequent tap appear unresponsive.
+    final saveTime = Stopwatch()..start();
+    final encoded = await _encodeBooksForStorage();
+    final encodeMs = saveTime.elapsedMilliseconds;
     if (!await _prefs.setString(_booksKey, encoded)) {
       throw StateError('기기에 단어장과 학습 상태를 저장하지 못했습니다.');
+    }
+    final writeMs = saveTime.elapsedMilliseconds - encodeMs;
+    if (encodeMs >= 32 || writeMs >= 32) {
+      debugPrint('VocaPerf bookSave encode=${encodeMs}ms '
+          'write=${writeMs}ms bytes=${encoded.length}');
+      unawaited(cloudChanges.recordDiagnostic('study_book_save_timing', data: {
+        'encodeMs': encodeMs,
+        'writeMs': writeMs,
+        'bytes': encoded.length,
+      }));
     }
     // The root preference is already the durable, live account state.  Its
     // account snapshot is refreshed before an account switch and before a

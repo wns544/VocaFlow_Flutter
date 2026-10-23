@@ -185,13 +185,29 @@ extension VocaStoreSync on VocaStore {
     final task = _syncWork.then((_) async {
       final replica = _replica;
       if (replica == null) return;
-      replica.capture(_syncValues());
+      final captureTime = Stopwatch()..start();
+      final values = _syncValues();
+      final buildMs = captureTime.elapsedMilliseconds;
+      final changed = replica.capture(values);
+      final compareMs = captureTime.elapsedMilliseconds - buildMs;
+      if (buildMs >= 16 || compareMs >= 16) {
+        debugPrint('VocaPerf syncCapture build=${buildMs}ms '
+            'compare=${compareMs}ms values=${values.length} changed=$changed');
+        unawaited(
+            cloudChanges.recordDiagnostic('sync_replica_capture_timing', data: {
+          'buildMs': buildMs,
+          'compareMs': compareMs,
+          'valueCount': values.length,
+          'changed': changed,
+        }));
+      }
       // Account switching must recover the just-finished local action even
       // before the next cloud upload.  Keep this compact local checkpoint
       // current, while reserving the larger replica JSON write for a flush.
       if (_activeAccountId != null) {
-        await _saveAccountState(_activeAccountId!);
-        await _writeSyncCheckpoint();
+        final encodedBooks = await _encodeBooksForStorage();
+        await _saveAccountState(_activeAccountId!, encodedBooks: encodedBooks);
+        await _writeSyncCheckpoint(encodedBooks: encodedBooks);
       }
       if (persist) {
         final key = kIsWeb
@@ -208,21 +224,21 @@ extension VocaStoreSync on VocaStore {
     return task;
   }
 
-  Future<void> _writeSyncCheckpoint() async {
+  Future<void> _writeSyncCheckpoint({String? encodedBooks}) async {
     final data = <String, dynamic>{
       for (final key in VocaStore._accountScopedKeys)
         if (!VocaStore.settingsPreferenceKeys.contains(key) &&
             key != VocaStore._settingsVersionsKey &&
             _prefs.get(key) != null)
           key: _prefs.get(key),
-      VocaStore._booksKey: _encodeBooks(),
+      VocaStore._booksKey: encodedBooks ?? await _encodeBooksForStorage(),
     };
     final account = _activeAccountId;
     if (account == null) return;
     await writeLargeLocalValue(
       _prefs,
       'sync.v2.checkpoint.$account',
-      jsonEncode({
+      await compute(_encodeAccountSnapshot, {
         'account': account,
         'state': data,
       }),
@@ -282,12 +298,39 @@ extension VocaStoreSync on VocaStore {
 
   Future<void> _applySyncV2Locked(
       Iterable<Map<String, dynamic>> snapshots) async {
+    final applyTime = Stopwatch()..start();
     await _captureSyncReplica();
+    final captureMs = applyTime.elapsedMilliseconds;
     final task = _syncWork.then((_) async {
       _applyingReplica = true;
       try {
-        for (final snapshot in snapshots) _replica!.merge(snapshot);
+        final mergeTime = Stopwatch()..start();
+        final mergeInput = {
+          'local': _replica!.toJson(),
+          'remote': snapshots.toList(),
+        };
+        // Widget tests run with a fake async clock that cannot await a real
+        // isolate. Production native builds keep this costly merge off the UI.
+        final merged = kIsWeb || kDebugMode
+            ? SyncReplica.mergeEnvelopes(mergeInput)
+            : await compute(SyncReplica.mergeEnvelopes, mergeInput);
+        _replica = SyncReplica.fromJson(merged);
+        final mergeMs = mergeTime.elapsedMilliseconds;
+        final valueApplyTime = Stopwatch()..start();
         await _applyReplicaValues();
+        final applyMs = valueApplyTime.elapsedMilliseconds;
+        if (captureMs >= 16 || mergeMs >= 16 || applyMs >= 16) {
+          debugPrint('VocaPerf syncApply capture=${captureMs}ms '
+              'merge=${mergeMs}ms apply=${applyMs}ms '
+              'records=${_replica!.records.length}');
+          unawaited(
+              cloudChanges.recordDiagnostic('sync_replica_apply_timing', data: {
+            'captureMs': captureMs,
+            'mergeMs': mergeMs,
+            'applyMs': applyMs,
+            'recordCount': _replica!.records.length,
+          }));
+        }
         final key = kIsWeb
             ? '$_syncReplicaKey.${_activeAccountId ?? 'local'}'
             : _syncReplicaKey;
@@ -296,9 +339,12 @@ extension VocaStoreSync on VocaStore {
           key,
           jsonEncode(_replica!.toJson()),
         );
-        if (_activeAccountId != null)
-          await _saveAccountState(_activeAccountId!);
-        await _writeSyncCheckpoint();
+        if (_activeAccountId != null) {
+          final encodedBooks = await _encodeBooksForStorage();
+          await _saveAccountState(_activeAccountId!,
+              encodedBooks: encodedBooks);
+          await _writeSyncCheckpoint(encodedBooks: encodedBooks);
+        }
       } finally {
         _applyingReplica = false;
       }

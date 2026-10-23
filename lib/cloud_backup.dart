@@ -282,6 +282,33 @@ class CloudBackup {
       .collection('syncSignals')
       .doc('managedBooks');
   final Map<String, Map<String, dynamic>> _syncPayloadCache = {};
+  String? _lastDownloadedLearningUid;
+  Map<String, String>? _lastDownloadedLearningRevisions;
+
+  /// Revisions belonging to the payloads returned by the last successful
+  /// download. Never persist this marker: a process restart must merge again.
+  Map<String, String>? lastDownloadedLearningRevisionsFor(String uid) =>
+      _lastDownloadedLearningUid == uid &&
+              _lastDownloadedLearningRevisions != null
+          ? Map<String, String>.unmodifiable(_lastDownloadedLearningRevisions!)
+          : null;
+
+  /// An authoritative, head-only read for the no-change fast path. A cached
+  /// Firestore result must not be allowed to claim that another device has
+  /// made no progress.
+  Future<Map<String, String>?> readLearningRevisionsFromServer() =>
+      _runCloudOperation(() async {
+        final heads =
+            await _syncV2Ref.get(const GetOptions(source: Source.server));
+        if (heads.docs.isEmpty) return null;
+        final revisions = <String, String>{};
+        for (final doc in heads.docs) {
+          final revision = doc.data()['revision'];
+          if (revision is! String || revision.isEmpty) return null;
+          revisions[doc.id] = revision;
+        }
+        return revisions;
+      }, timeout: _learningStateOperationTimeout);
 
   Stream<Map<String, dynamic>?> watchLegacySyncSignal() =>
       _legacySyncSignal.snapshots().map((event) => event.data());
@@ -792,7 +819,7 @@ class CloudBackup {
           !(await _learningStatesRef.limit(1).get()).docs.isEmpty,
       timeout: _learningStateOperationTimeout);
 
-  Future<void> uploadLearningState(
+  Future<String> uploadLearningState(
     VocaStore store,
     CloudChangeSnapshot changes,
   ) =>
@@ -809,8 +836,8 @@ class CloudBackup {
         final bytes = await compute(_encodeSyncPayload, payload);
         final revision = sha256.convert(bytes).toString();
         final head = heads.doc(deviceId);
-        final previous = await head.get();
-        if (previous.data()?['revision'] == revision) return;
+        final previous = await head.get(const GetOptions(source: Source.server));
+        if (previous.data()?['revision'] == revision) return revision;
         final version = head.collection('versions').doc(revision);
         const chunkBytes = 256 * 1024;
         final chunkCount = (bytes.length / chunkBytes).ceil();
@@ -865,6 +892,7 @@ class CloudBackup {
             SetOptions(merge: true),
           );
         });
+        return revision;
       });
 
   Future<List<Map<String, dynamic>>> downloadLegacyLearningStates() =>
@@ -879,13 +907,17 @@ class CloudBackup {
 
   Future<List<Map<String, dynamic>>> downloadLearningStates() =>
       _runCloudOperation(() async {
+        _lastDownloadedLearningUid = null;
+        _lastDownloadedLearningRevisions = null;
         final uid = _user.uid;
         final heads = await _syncV2Ref.get();
         if (heads.docs.isEmpty) return downloadLegacyLearningStates();
         final result = <Map<String, dynamic>>[];
+        final revisions = <String, String>{};
         for (final doc in heads.docs) {
           final head = doc.data();
           final revision = head['revision'] as String;
+          revisions[doc.id] = revision;
           final key = '$uid/${doc.id}/$revision';
           var payload = _syncPayloadCache[key];
           if (payload == null) {
@@ -916,6 +948,8 @@ class CloudBackup {
           }
           result.add(payload);
         }
+        _lastDownloadedLearningUid = uid;
+        _lastDownloadedLearningRevisions = revisions;
         return result;
       });
 
@@ -1091,8 +1125,9 @@ class CloudBackup {
     VocaStore store,
     CloudChangeSnapshot changes, {
     bool forceProfile = false,
-  }) =>
-      uploadLearningState(store, changes);
+  }) async {
+    await uploadLearningState(store, changes);
+  }
 
   Future<void> upload(VocaStore store) async {
     await store.cloudChanges.markLearningState();

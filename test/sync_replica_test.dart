@@ -1,6 +1,10 @@
+import 'dart:convert';
+
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vocaflow/models.dart';
+import 'package:vocaflow/large_local_store.dart';
 import 'package:vocaflow/store.dart';
 import 'package:vocaflow/sync_replica.dart';
 
@@ -19,6 +23,36 @@ void main() {
     expect(a.clock, 201);
     b.merge(a.toJson());
     expect(b.values, a.values);
+  });
+
+  test('capture compares nested JSON without losing field distinctions', () {
+    final replica = SyncReplica('phone')
+      ..seed({
+        'word/book/1': {
+          'count': 1,
+          'tags': ['a', 'b'],
+          'nested': {'x': true, 'y': null},
+        },
+      });
+    expect(
+        replica.capture({
+          'word/book/1': {
+            'nested': {'y': null, 'x': true},
+            'tags': ['a', 'b'],
+            'count': 1,
+          },
+        }),
+        isFalse);
+    expect(
+        replica.capture({
+          'word/book/1': {
+            'nested': {'x': true, 'y': null},
+            'tags': ['a', 'b'],
+            'count': 1.0,
+          },
+        }),
+        isTrue);
+    expect(replica.records['word/book/1']!['value']['count'], 1.0);
   });
 
   test('conflicting queues converge and preserve losing branch', () {
@@ -48,6 +82,80 @@ void main() {
     b.merge(a.toJson());
     expect(a.values, b.values);
     expect(a.recovery.values.any((r) => r['clock'] == 100), isTrue);
+  });
+
+  test('replica restoration preserves records and recovery before merge', () {
+    final local = SyncReplica('phone')
+      ..seed({
+        'word/book/1': {'state': 'fresh'},
+        'session/course': {
+          'queue': [1, 2]
+        },
+      });
+    local.capture({
+      'word/book/1': {'state': 'memorized'},
+      'session/course': {
+        'queue': [2]
+      },
+    }, nowMicros: 100);
+    final remote = SyncReplica('web')
+      ..seed({
+        'word/book/1': {'state': 'fresh'},
+        'session/course': {
+          'queue': [1, 2]
+        },
+      });
+    remote.capture({
+      'word/book/1': {'state': 'fresh'},
+      'session/course': {
+        'queue': [1]
+      },
+    }, nowMicros: 200);
+
+    final original = SyncReplica.fromJson(local.toJson());
+    final restored = SyncReplica.fromJson(local.toJson());
+    expect(restored.toJson(), original.toJson());
+    original.merge(remote.toJson());
+    restored.merge(remote.toJson());
+    expect(restored.toJson(), original.toJson());
+    restored.acceptView(restored.values);
+    expect(restored.capture(restored.values), isFalse);
+  });
+
+  test('background merge matches direct merge with retained session history',
+      () async {
+    final phone = SyncReplica('phone')
+      ..seed({
+        'word/book/1': {'state': 'fresh'},
+        'session/course': {
+          'queue': [1, 2]
+        },
+      });
+    phone.capture({
+      'word/book/1': {'state': 'memorized'},
+      'session/course': {
+        'queue': [2]
+      },
+    }, nowMicros: 100);
+    final web = SyncReplica('web')
+      ..seed({
+        'word/book/1': {'state': 'fresh'},
+        'session/course': {
+          'queue': [1, 2]
+        },
+      });
+    web.capture({
+      'word/book/1': {'state': 'fresh'},
+      'session/course': {
+        'queue': [1]
+      },
+    }, nowMicros: 200);
+    final direct = SyncReplica.fromJson(phone.toJson())..merge(web.toJson());
+    final result = await compute(SyncReplica.mergeEnvelopes, {
+      'local': phone.toJson(),
+      'remote': [web.toJson()],
+    });
+    expect(result, direct.toJson());
   });
 
   test('two phones keep study progress made on different cards', () {
@@ -134,6 +242,25 @@ void main() {
     await next.activateAccount('a');
     expect(next.isSessionCompleted('default', 0), isTrue);
     expect(next.undoHaptics, isTrue);
+  });
+
+  test('account snapshot and recovery checkpoint contain identical books',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    await store.activateAccount('snapshot-account');
+    final book = await store.addBook('snapshot book', [
+      Word(id: 881001, term: '言葉', reading: 'ことば', meaning: '말'),
+    ]);
+    await store.mark(book.words.first, StudyState.memorized, bookId: book.id);
+    await store.syncV2Snapshot();
+    final prefs = await SharedPreferences.getInstance();
+    final account = jsonDecode((await readLargeLocalValue(
+        prefs, 'accountState.v1.snapshot-account'))!) as Map;
+    final checkpoint = jsonDecode((await readLargeLocalValue(
+        prefs, 'sync.v2.checkpoint.snapshot-account'))!) as Map;
+    expect(checkpoint['state']['books'], account['books']);
+    expect((jsonDecode(account['books'] as String) as List), isNotEmpty);
   });
 
   test('learning snapshots exclude settings but retain word favorites',

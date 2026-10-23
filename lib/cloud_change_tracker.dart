@@ -546,6 +546,11 @@ class CloudChangeTracker {
   String? channelError(String channel) => _prefs
       .getString('sync.channel.${_activeAccountId ?? 'local'}.$channel.error');
 
+  /// A successful V2 learning upload is the durable proof that this account
+  /// no longer needs the one-time legacy-local-state seed on every launch.
+  bool hasUploadedLearningState(String uid) =>
+      _prefs.getString('sync.channel.$uid.learning.success') != null;
+
   Future<void> recordChannelSuccess(String channel, DateTime time) async {
     final prefix = 'sync.channel.${_activeAccountId ?? 'local'}.$channel';
     await _prefs.setString('$prefix.success', time.toUtc().toIso8601String());

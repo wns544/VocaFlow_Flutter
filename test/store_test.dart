@@ -6,6 +6,35 @@ import 'package:vocaflow/models.dart';
 import 'package:vocaflow/store.dart';
 
 void main() {
+  test('large book writes keep consecutive decisions durable', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final book = await store.addBook(
+      'large study book',
+      List.generate(
+        520,
+        (index) => Word(
+          id: 500000 + index,
+          term: 'term$index',
+          reading: 'reading$index',
+          meaning: 'meaning$index',
+        ),
+      ),
+    );
+    await Future.wait([
+      store.mark(book.words[0], StudyState.memorized, bookId: book.id),
+      store.mark(book.words[1], StudyState.review, bookId: book.id),
+    ]);
+
+    final restored = await VocaStore.load();
+    expect(restored.resolveCard(book.id, 500000)!.correctCount, 1);
+    expect(restored.resolveCard(book.id, 500001)!.wrongCount, 1);
+    expect(restored.studyEventLog, hasLength(2));
+    final sync = await restored.syncV2Snapshot();
+    expect(sync['records'], contains('word/${book.id}/500000'));
+    expect(sync['records'], contains('word/${book.id}/500001'));
+  });
+
   test('legacy learning snapshots cannot overwrite question settings',
       () async {
     SharedPreferences.setMockInitialValues({});

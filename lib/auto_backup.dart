@@ -48,6 +48,52 @@ Future<bool> isolateSettingsSyncFailure({
       onFailure: onFailure,
     );
 
+@visibleForTesting
+bool canSkipLearningMerge({
+  required String? accountId,
+  required String? mergedAccountId,
+  required Map<String, String>? mergedRevisions,
+  required Map<String, String>? serverRevisions,
+  required int? mergedGeneration,
+  required int localGeneration,
+  required bool localDirty,
+  required bool forceFull,
+}) =>
+    !forceFull &&
+    accountId != null &&
+    accountId == mergedAccountId &&
+    mergedRevisions != null &&
+    mergedRevisions.isNotEmpty &&
+    serverRevisions != null &&
+    mapEquals(mergedRevisions, serverRevisions) &&
+    mergedGeneration == localGeneration &&
+    !localDirty;
+
+@visibleForTesting
+Map<String, String>? learningRevisionsAfterUpload({
+  required String accountId,
+  required String? mergedAccountId,
+  required Map<String, String>? mergedRevisions,
+  required String deviceId,
+  required String uploadedRevision,
+  required int uploadedGeneration,
+  required int localGeneration,
+  required bool localDirty,
+}) {
+  if (accountId != mergedAccountId ||
+      mergedRevisions == null ||
+      localDirty ||
+      uploadedGeneration != localGeneration) return null;
+  return {...mergedRevisions, deviceId: uploadedRevision};
+}
+
+@visibleForTesting
+bool shouldImportLegacyRelations({
+  required bool legacySyncImported,
+  required bool hasUploadedLearningState,
+}) =>
+    !legacySyncImported && !hasUploadedLearningState;
+
 /// Learning progress follows the user's backup preference. Account-owned
 /// vocabulary books are different: while signed in, their add/edit/delete
 /// queue always syncs between that account's devices. Neither channel writes
@@ -116,6 +162,9 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   DateTime? _firstLearningPendingAt;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
   String? _preparedAccountId;
+  String? _mergedLearningAccountId;
+  Map<String, String>? _mergedLearningRevisions;
+  int? _mergedLearningGeneration;
   StreamSubscription<Map<String, dynamic>?>? _learningSignalSubscription;
   StreamSubscription<Map<String, dynamic>?>? _bookSignalSubscription;
   StreamSubscription<Map<String, dynamic>?>? _cardBookSignalSubscription;
@@ -337,6 +386,9 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       return _accountPreparation!;
     }
     _observedCardVersion = -1;
+    _mergedLearningAccountId = null;
+    _mergedLearningRevisions = null;
+    _mergedLearningGeneration = null;
     _preparedAccountId = current.uid;
     return _accountPreparation = () async {
       await store.activateAccount(current.uid);
@@ -524,6 +576,9 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       }
       _cardReceipts.clear();
       learningStateVerified = false;
+      _mergedLearningAccountId = null;
+      _mergedLearningRevisions = null;
+      _mergedLearningGeneration = null;
       _cancelScheduledUpload();
       _remoteRetryTimer?.cancel();
       _remoteRetryTimer = null;
@@ -569,7 +624,6 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       }
       onChanged?.call();
     });
-    if (enabled && initialized) unawaited(_seedLearningState());
   }
 
   /// A browser starts without app storage, so requiring an extra confirmation
@@ -818,6 +872,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         reason: '클라우드 학습 데이터 가져오기',
         ownsGate: true,
         pullManagedBooks: false,
+        forceFull: true,
       );
     } catch (error, stackTrace) {
       await _recordFailure(error, '클라우드 학습 데이터 가져오기', stackTrace: stackTrace);
@@ -1012,8 +1067,11 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
   Future<void> _seedLearningState() async {
     if (!enabled || !initialized || store.cloudChanges.learningStateDirty)
       return;
-    // One compact document per app launch makes legacy local progress visible
-    // without writing a single existing word document.
+    final current = user;
+    if (current == null ||
+        store.cloudChanges.hasUploadedLearningState(current.uid)) return;
+    // Seed legacy local progress once, until its first confirmed V2 upload.
+    // A clean restart must not manufacture an edit and force a full merge.
     await store.cloudChanges.markLearningState();
     requestImmediateBackup();
   }
@@ -1324,6 +1382,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     required String reason,
     bool ownsGate = false,
     bool pullManagedBooks = true,
+    bool forceFull = false,
   }) async {
     if (!ownsGate && _syncing) return;
     learningStateVerified = false;
@@ -1336,8 +1395,43 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         'reason': reason,
       });
       if (pullManagedBooks) await _pullManagedBooks(reason: reason);
-      if (!store.legacySyncImported) {
+      // Legacy relations are needed only before this account has a durable V2
+      // upload. Once V2 contains them, re-reading the old collection on every
+      // resume wastes a round trip and can requeue stale relation writes.
+      if (accountId != null &&
+          shouldImportLegacyRelations(
+            legacySyncImported: store.legacySyncImported,
+            hasUploadedLearningState:
+                store.cloudChanges.hasUploadedLearningState(accountId),
+          )) {
         await wordRelations.syncFromCloud();
+      }
+      final local = store.cloudChanges.snapshot;
+      if (!forceFull &&
+          accountId != null &&
+          _mergedLearningAccountId == accountId &&
+          _mergedLearningRevisions != null &&
+          _mergedLearningGeneration == local.learningStateGeneration &&
+          !local.learningStateDirty) {
+        // A network/permission failure must surface as a retryable failure,
+        // never as proof that a cached head is still current.
+        final serverRevisions = await cloud.readLearningRevisionsFromServer();
+        final latestLocal = store.cloudChanges.snapshot;
+        if (user?.uid == accountId &&
+            canSkipLearningMerge(
+              accountId: accountId,
+              mergedAccountId: _mergedLearningAccountId,
+              mergedRevisions: _mergedLearningRevisions,
+              serverRevisions: serverRevisions,
+              mergedGeneration: _mergedLearningGeneration,
+              localGeneration: latestLocal.learningStateGeneration,
+              localDirty: latestLocal.learningStateDirty,
+              forceFull: forceFull,
+            )) {
+          learningStateVerified = true;
+          await store.cloudChanges.recordLog('$reason · learningState 변경 없음');
+          return;
+        }
       }
       final snapshots = await cloud.downloadLearningStates();
       if (user?.uid != accountId) return;
@@ -1345,6 +1439,12 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         await store.importLegacyForSyncV2(snapshots);
       }
       await store.applyLearningStateSnapshots(snapshots);
+      _mergedLearningAccountId = accountId;
+      _mergedLearningRevisions = accountId == null
+          ? null
+          : cloud.lastDownloadedLearningRevisionsFor(accountId);
+      _mergedLearningGeneration =
+          store.cloudChanges.snapshot.learningStateGeneration;
       final current = user;
       if (current != null) {
         await store.cloudChanges.recordDownload(current.uid, _now());
@@ -1356,6 +1456,11 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         'reason': reason,
         'remoteSnapshotCount': snapshots.length,
       });
+    } catch (_) {
+      _mergedLearningAccountId = null;
+      _mergedLearningRevisions = null;
+      _mergedLearningGeneration = null;
+      rethrow;
     } finally {
       _downloading = false;
       if (!ownsGate) _syncing = false;
@@ -1868,6 +1973,7 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     final current = user;
     if (current == null || !store.cloudChanges.learningStateDirty) return;
     final snapshot = store.cloudChanges.snapshot;
+    final deviceId = await store.cloudChanges.deviceId();
     final metrics = await _learningStateMetrics();
     await store.cloudChanges.recordLog(
       '$reason · learningState 전송 시작 · 순번 ${snapshot.learningStateGeneration} · ${metrics['utf8Bytes'] ?? '?'} bytes',
@@ -1888,10 +1994,24 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       'pendingCount': snapshot.pendingCount,
       ...metrics,
     });
-    await cloud.uploadLearningState(store, snapshot);
+    final uploadedRevision = await cloud.uploadLearningState(store, snapshot);
     if (user?.uid != current.uid) return;
     await store.cloudChanges.acknowledgeProfileMetadata(snapshot);
     await store.cloudChanges.acknowledgeLearningState(snapshot);
+    final mergedRevisions = learningRevisionsAfterUpload(
+      accountId: current.uid,
+      mergedAccountId: _mergedLearningAccountId,
+      mergedRevisions: _mergedLearningRevisions,
+      deviceId: deviceId,
+      uploadedRevision: uploadedRevision,
+      uploadedGeneration: snapshot.learningStateGeneration,
+      localGeneration: store.cloudChanges.snapshot.learningStateGeneration,
+      localDirty: store.cloudChanges.learningStateDirty,
+    );
+    if (mergedRevisions != null) {
+      _mergedLearningRevisions = mergedRevisions;
+      _mergedLearningGeneration = snapshot.learningStateGeneration;
+    }
     await store.cloudChanges.recordChannelSuccess('learning', _now());
     if (!store.cloudChanges.learningStateDirty) _firstLearningPendingAt = null;
     await store.cloudChanges.recordSuccess(current.uid, _now());

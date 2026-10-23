@@ -65,10 +65,11 @@ class _Cloud extends CloudBackup {
   @override
   Future<List<Map<String, dynamic>>> downloadLearningStates() async => [];
   @override
-  Future<void> uploadLearningState(
+  Future<String> uploadLearningState(
       VocaStore store, CloudChangeSnapshot changes) async {
     learningUploads++;
     await store.syncV2Snapshot();
+    return 'test-revision-$learningUploads';
   }
 
   @override

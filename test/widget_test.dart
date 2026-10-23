@@ -23,6 +23,37 @@ import 'package:vocaflow/study_speech.dart';
 import 'package:vocaflow/card_sync.dart';
 
 void main() {
+  testWidgets('a delayed preference write cannot delay or duplicate study',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final book = await store.addBook('favorite', [
+      Word(id: 701, term: 'first', reading: 'first', meaning: '첫째'),
+      Word(id: 702, term: 'second', reading: 'second', meaning: '둘째'),
+    ]);
+    book.isFavorite = true;
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(body: HomePage(store: store, refresh: () {})),
+    ));
+    await tester.tap(find.byKey(ValueKey('favorite-sessions-${book.id}')));
+    await tester.pumpAndSettle();
+
+    final releaseOldWrite = Completer<void>();
+    final oldWrite = store.runLocalMutation(() => releaseOldWrite.future);
+    final row = tester.widget<ListTile>(
+      find.byKey(ValueKey('favorite-${book.id}-course-0-2')),
+    );
+    row.onTap!();
+    row.onTap!();
+    await tester.pump();
+    expect(find.byType(CardStudyPage, skipOffstage: false), findsOneWidget);
+
+    releaseOldWrite.complete();
+    await oldWrite;
+    await tester.pumpAndSettle();
+    expect(find.byType(CardStudyPage, skipOffstage: false), findsOneWidget);
+  });
+
   testWidgets('a delayed face save cannot bring back a swiped card',
       (tester) async {
     SharedPreferences.setMockInitialValues({'flipCard': false});
@@ -67,6 +98,73 @@ void main() {
     expect(find.text('beta'), findsWidgets);
     expect(store.getActiveStudyFor(studyKey)!.queueIds.first, 902);
     expect(book.words.first.correctCount + book.words.first.wrongCount, 1);
+  });
+
+  testWidgets('a delayed previous-round merge cannot rewind the active round',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await VocaStore.load();
+    final book = await store.addBook('round merge', [
+      Word(id: 811, term: 'old', reading: 'old', meaning: '이전'),
+      Word(id: 812, term: 'current', reading: 'current', meaning: '현재'),
+    ]);
+    final active = ActiveStudy(
+      queueIds: const [812],
+      queueBookIds: [book.id],
+      total: 2,
+      memorized: 1,
+      reviewed: const ['current'],
+      revealed: false,
+      sessionIndexes: const [],
+      bookId: book.id,
+      roundNumber: 2,
+      roundTotal: 1,
+      roundCompleted: 0,
+      startedAt: DateTime.utc(2026, 10, 22),
+    );
+    final key = store.activeStudyKey(active);
+    final saved = (await store.saveActiveStudyFor(key, active))!;
+    final baseline = await store.syncV2Snapshot();
+    await tester.pumpWidget(MaterialApp(
+      home: CardStudyPage(store: store, resume: saved),
+    ));
+    await tester.pumpAndSettle();
+
+    final vector = Map<String, dynamic>.from(saved.progress['vector'] as Map)
+      ..['pc'] = 1;
+    final previousRound = {
+      ...saved.toJson(),
+      'queueIds': [811, 812],
+      'queueBookIds': [book.id, book.id],
+      'roundNumber': 1,
+      'roundTotal': 2,
+      'roundCompleted': 0,
+      'updatedAt': DateTime.utc(2026, 10, 22, 0, 1).toIso8601String(),
+      'progress': {
+        ...saved.progress,
+        'id': 'pc:delayed-old-round',
+        'device': 'pc',
+        'vector': vector,
+      },
+    };
+    await store.applySyncV2([
+      {
+        'schema': 2,
+        'clock': (baseline['clock'] as int) + 1,
+        'records': {
+          'session/$key': {
+            'clock': (baseline['clock'] as int) + 1,
+            'device': 'pc',
+            'value': {'active': previousRound, 'words': {}}
+          }
+        }
+      }
+    ]);
+    await tester.pumpAndSettle();
+    expect(find.text('old'), findsNothing);
+    expect(find.text('current'), findsWidgets);
+    expect(store.getActiveStudyFor(key)!.roundNumber, 2);
+    expect(store.getActiveStudyFor(key)!.queueIds, [812]);
   });
 
   testWidgets(

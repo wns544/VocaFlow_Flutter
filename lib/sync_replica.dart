@@ -3,6 +3,36 @@ import 'dart:convert';
 /// A field-level replica with a hybrid logical clock and durable deletions.
 class SyncReplica {
   SyncReplica(this.deviceId);
+
+  /// Restore an in-memory replica without replaying its records as a new
+  /// merge. A replay can change the retained session recovery frontier.
+  factory SyncReplica.fromJson(Map<String, dynamic> encoded) {
+    if (encoded['schema'] != 2 || encoded['records'] is! Map) {
+      throw const FormatException('Unsupported sync snapshot');
+    }
+    final replica = SyncReplica(encoded['deviceId'] as String);
+    replica.clock = (encoded['clock'] as num?)?.toInt() ?? 0;
+    for (final entry in (encoded['records'] as Map).entries) {
+      replica.records[entry.key.toString()] =
+          Map<String, dynamic>.from(entry.value as Map);
+    }
+    for (final entry in (encoded['recovery'] as Map? ?? const {}).entries) {
+      replica.recovery[entry.key.toString()] =
+          Map<String, dynamic>.from(entry.value as Map);
+    }
+    return replica;
+  }
+
+  /// A standalone merge entry point suitable for Flutter's compute isolate.
+  static Map<String, dynamic> mergeEnvelopes(Map<String, dynamic> input) {
+    final replica =
+        SyncReplica.fromJson(Map<String, dynamic>.from(input['local'] as Map));
+    for (final raw in input['remote'] as List) {
+      replica.merge(Map<String, dynamic>.from(raw as Map));
+    }
+    return replica.toJson();
+  }
+
   final String deviceId;
   int clock = 0;
   final Map<String, Map<String, dynamic>> records = {};
@@ -22,6 +52,38 @@ class SyncReplica {
     }
     if (value is List) return '[${value.map(canonical).join(',')}]';
     return jsonEncode(value);
+  }
+
+  /// Compare JSON-shaped values without formatting every unchanged card as a
+  /// canonical string on each sync capture. Preserve canonical's treatment
+  /// of number types and unordered string-keyed maps.
+  static bool _sameJsonValue(dynamic before, dynamic after) {
+    if (identical(before, after)) return true;
+    if (before is Map && after is Map) {
+      if (before.length != after.length) return false;
+      if (before.keys.any((key) => key is! String) ||
+          after.keys.any((key) => key is! String)) {
+        return canonical(before) == canonical(after);
+      }
+      for (final entry in before.entries) {
+        if (!after.containsKey(entry.key) ||
+            !_sameJsonValue(entry.value, after[entry.key])) {
+          return false;
+        }
+      }
+      return true;
+    }
+    if (before is List && after is List) {
+      if (before.length != after.length) return false;
+      for (var index = 0; index < before.length; index++) {
+        if (!_sameJsonValue(before[index], after[index])) return false;
+      }
+      return true;
+    }
+    if (before is num && after is num) {
+      return jsonEncode(before) == jsonEncode(after);
+    }
+    return before.runtimeType == after.runtimeType && before == after;
   }
 
   void seed(Map<String, dynamic> values) {
@@ -60,7 +122,7 @@ class SyncReplica {
           // session. Only an actual local progress revision can do that.
           return false;
         }
-        return canonical(before) != canonical(after);
+        return !_sameJsonValue(before, after);
       },
     ).toList();
     if (changed.isEmpty) return false;
