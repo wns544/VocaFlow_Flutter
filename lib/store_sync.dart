@@ -23,6 +23,9 @@ extension VocaStoreSync on VocaStore {
       final value = state[key];
       if (value is List) {
         await _prefs.setStringList(key, value.cast<String>());
+      } else if (value is String &&
+          (key == VocaStore._booksKey || isLargeLocalValueKey(key))) {
+        await writeLargeLocalValue(_prefs, key, value);
       } else {
         await _setSharedPreference(key, value);
       }
@@ -84,9 +87,11 @@ extension VocaStoreSync on VocaStore {
       }
     }
     final hadSavedReplica = saved != null;
+    _loadedReplicaFromDurableStore = false;
     if (hadSavedReplica) {
       replica.merge(Map<String, dynamic>.from(jsonDecode(saved)));
       replica.acceptView(replica.values);
+      _loadedReplicaFromDurableStore = true;
     }
     if (_prefs.getString(_syncDailyBaseKey) == null) {
       await _prefs.setString(_syncDailyBaseKey,
@@ -110,8 +115,8 @@ extension VocaStoreSync on VocaStore {
       // durable web recovery source, so never let this optional copy block web
       // startup. Remove an older copy to reclaim space for live state.
       if (_prefs.containsKey(backupKey)) await _prefs.remove(backupKey);
-    } else if (!_prefs.containsKey(backupKey)) {
-      await _prefs.setString(backupKey, jsonEncode(toBackupJson()));
+    } else if (await readLargeLocalValue(_prefs, backupKey) == null) {
+      await writeLargeLocalValue(_prefs, backupKey, jsonEncode(toBackupJson()));
     }
     await writeLargeLocalValue(
       _prefs,
@@ -156,7 +161,7 @@ extension VocaStoreSync on VocaStore {
           'active': {...entry.value.toJson(), 'revealed': false},
           // Preserve the branch's touched card states alongside its queue.
           'words': {
-            if (entry.value.progress['schema'] != 1)
+            if ((entry.value.progress['schema'] as num? ?? 0) < 1)
               for (final decision in entry.value.undoHistory)
                 for (final book in books.where(
                     (b) => b.id == (decision.bookId ?? entry.value.bookId)))
@@ -246,6 +251,7 @@ extension VocaStoreSync on VocaStore {
   }
 
   Future<Map<String, dynamic>> syncV2Snapshot() => runLocalMutation(() async {
+        await _flushPendingStudyBookWritesLocked();
         await _captureSyncReplica(persist: true);
         return jsonDecode(jsonEncode(_replica!.toJson()))
             as Map<String, dynamic>;
@@ -257,7 +263,7 @@ extension VocaStoreSync on VocaStore {
     final marker = 'sync.v2.imported.${_activeAccountId ?? 'local'}';
     if (_prefs.getBool(marker) == true) return;
     final before = await syncV2Snapshot();
-    await _prefs.setString('$marker.backup', jsonEncode(snapshots));
+    await writeLargeLocalValue(_prefs, '$marker.backup', jsonEncode(snapshots));
     await applyLearningStateSnapshots(snapshots);
     await _rememberCompletedMembership();
     // Legacy totals are a baseline; new event deltas remain separate.
@@ -356,7 +362,11 @@ extension VocaStoreSync on VocaStore {
 
   Future<void> _setSharedPreference(String key, dynamic value) async {
     if (value == null) {
-      await _prefs.remove(key);
+      if (isLargeLocalValueKey(key)) {
+        await removeLargeLocalValue(_prefs, key);
+      } else {
+        await _prefs.remove(key);
+      }
     } else if (value is bool) {
       await _prefs.setBool(key, value);
     } else if (value is int) {
@@ -364,7 +374,11 @@ extension VocaStoreSync on VocaStore {
     } else if (value is num) {
       await _prefs.setDouble(key, value.toDouble());
     } else if (value is String) {
-      await _prefs.setString(key, value);
+      if (isLargeLocalValueKey(key)) {
+        await writeLargeLocalValue(_prefs, key, value);
+      } else {
+        await _prefs.setString(key, value);
+      }
     } else if (value is List) {
       await _prefs.setStringList(key, value.cast<String>());
     }
@@ -453,7 +467,8 @@ extension VocaStoreSync on VocaStore {
       final data = entry.value['value'] as Map;
       studies[entry.key.substring(8)] =
           ActiveStudy.fromJson(Map<String, dynamic>.from(data['active']));
-      if (studies[entry.key.substring(8)]!.progress['schema'] == 1) continue;
+      if ((studies[entry.key.substring(8)]!.progress['schema'] as num? ?? 0) >=
+          1) continue;
       for (final word in (data['words'] as Map? ?? {}).entries) {
         final old = wordRecords[word.key];
         if (old == null || SyncReplica.compare(entry.value, old) > 0) {

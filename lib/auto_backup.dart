@@ -1,6 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
-
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
@@ -13,13 +11,11 @@ import 'cloud_change_tracker.dart';
 import 'card_sync.dart';
 import 'store.dart';
 import 'word_relations.dart';
+import 'performance_probe.dart';
 
 enum InitialSyncChoice { cloudReplace, merge }
 
 enum CardSaveOutcome { saved, waiting, offline, failed }
-
-int _encodedPayloadSize(Map<String, dynamic> payload) =>
-    utf8.encode(jsonEncode(payload)).length;
 
 /// Runs a non-learning sync channel without allowing its failure to skip the
 /// learning-state channel. Callers can continue their learning-state work
@@ -68,6 +64,34 @@ bool canSkipLearningMerge({
     mapEquals(mergedRevisions, serverRevisions) &&
     mergedGeneration == localGeneration &&
     !localDirty;
+
+/// A pending local decision is already layered on top of the last completed
+/// merge. Before uploading it, unchanged authoritative server heads mean
+/// there is no new remote state to merge. Never use this for a first sync or
+/// after a failed/incomplete local checkpoint.
+@visibleForTesting
+bool canSkipLearningMergeBeforeUpload({
+  required String? accountId,
+  required String? mergedAccountId,
+  required Map<String, String>? mergedRevisions,
+  required Map<String, String>? serverRevisions,
+  required int? mergedGeneration,
+  required int localGeneration,
+  required bool localDirty,
+  required bool hasDurableLearningCache,
+  required bool forceFull,
+}) =>
+    !forceFull &&
+    localDirty &&
+    hasDurableLearningCache &&
+    accountId != null &&
+    accountId == mergedAccountId &&
+    mergedRevisions != null &&
+    mergedRevisions.isNotEmpty &&
+    serverRevisions != null &&
+    mapEquals(mergedRevisions, serverRevisions) &&
+    mergedGeneration != null &&
+    mergedGeneration <= localGeneration;
 
 @visibleForTesting
 Map<String, String>? learningRevisionsAfterUpload({
@@ -1047,6 +1071,10 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       _schedule(Duration.zero, ignoreMinimumInterval: ignoreMinimumInterval);
 
   Future<void> flushPendingBackup() async {
+    // This local durability step must not depend on Firebase login or the
+    // network policy. A logged-out/offline learner still gets a complete book
+    // snapshot when the app leaves the foreground.
+    await store.flushPendingStudyBookWrites();
     if (_flushingForBackground ||
         _syncing ||
         !accountBookSyncEnabled ||
@@ -1407,44 +1435,82 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
         await wordRelations.syncFromCloud();
       }
       final local = store.cloudChanges.snapshot;
+      if (accountId != null &&
+          _mergedLearningAccountId != accountId &&
+          store.hasDurableLearningCache) {
+        final verified = store.cloudChanges.verifiedLearningHeads(accountId);
+        if (verified != null &&
+            verified.generation == local.learningStateGeneration) {
+          _mergedLearningAccountId = accountId;
+          _mergedLearningRevisions = verified.revisions;
+          _mergedLearningGeneration = verified.generation;
+        }
+      }
       if (!forceFull &&
           accountId != null &&
           _mergedLearningAccountId == accountId &&
           _mergedLearningRevisions != null &&
-          _mergedLearningGeneration == local.learningStateGeneration &&
-          !local.learningStateDirty) {
+          (local.learningStateDirty ||
+              _mergedLearningGeneration == local.learningStateGeneration)) {
         // A network/permission failure must surface as a retryable failure,
         // never as proof that a cached head is still current.
-        final serverRevisions = await cloud.readLearningRevisionsFromServer();
+        final serverRevisions = await PerformanceProbe.measure(
+            'learning_read_heads', cloud.readLearningRevisionsFromServer);
         final latestLocal = store.cloudChanges.snapshot;
         if (user?.uid == accountId &&
-            canSkipLearningMerge(
-              accountId: accountId,
-              mergedAccountId: _mergedLearningAccountId,
-              mergedRevisions: _mergedLearningRevisions,
-              serverRevisions: serverRevisions,
-              mergedGeneration: _mergedLearningGeneration,
-              localGeneration: latestLocal.learningStateGeneration,
-              localDirty: latestLocal.learningStateDirty,
-              forceFull: forceFull,
-            )) {
+            (canSkipLearningMerge(
+                  accountId: accountId,
+                  mergedAccountId: _mergedLearningAccountId,
+                  mergedRevisions: _mergedLearningRevisions,
+                  serverRevisions: serverRevisions,
+                  mergedGeneration: _mergedLearningGeneration,
+                  localGeneration: latestLocal.learningStateGeneration,
+                  localDirty: latestLocal.learningStateDirty,
+                  forceFull: forceFull,
+                ) ||
+                canSkipLearningMergeBeforeUpload(
+                  accountId: accountId,
+                  mergedAccountId: _mergedLearningAccountId,
+                  mergedRevisions: _mergedLearningRevisions,
+                  serverRevisions: serverRevisions,
+                  mergedGeneration: _mergedLearningGeneration,
+                  localGeneration: latestLocal.learningStateGeneration,
+                  localDirty: latestLocal.learningStateDirty,
+                  hasDurableLearningCache: store.hasDurableLearningCache,
+                  forceFull: forceFull,
+                ))) {
           learningStateVerified = true;
-          await store.cloudChanges.recordLog('$reason · learningState 변경 없음');
+          await store.cloudChanges.recordLog(
+              '$reason · 서버 학습 변경 없음 · 로컬 전송 대기 ${latestLocal.learningStateDirty}');
           return;
         }
       }
-      final snapshots = await cloud.downloadLearningStates();
+      final snapshots = await PerformanceProbe.measure(
+          'learning_download', cloud.downloadLearningStates);
       if (user?.uid != accountId) return;
       if (snapshots.every((snapshot) => snapshot['schema'] != 2)) {
         await store.importLegacyForSyncV2(snapshots);
       }
-      await store.applyLearningStateSnapshots(snapshots);
+      await PerformanceProbe.measure(
+          'learning_apply', () => store.applyLearningStateSnapshots(snapshots));
       _mergedLearningAccountId = accountId;
       _mergedLearningRevisions = accountId == null
           ? null
           : cloud.lastDownloadedLearningRevisionsFor(accountId);
       _mergedLearningGeneration =
           store.cloudChanges.snapshot.learningStateGeneration;
+      if (accountId != null && _mergedLearningRevisions != null) {
+        // A restart may trust this head-only check only after the complete
+        // merge and its local recovery checkpoint have finished. This marker
+        // is an optimization; failing to write it merely forces a full pull.
+        try {
+          await store.cloudChanges.recordVerifiedLearningHeads(
+            accountId,
+            _mergedLearningGeneration!,
+            _mergedLearningRevisions!,
+          );
+        } catch (_) {}
+      }
       final current = user;
       if (current != null) {
         await store.cloudChanges.recordDownload(current.uid, _now());
@@ -1936,37 +2002,23 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     });
   }
 
-  Future<Map<String, Object?>> _learningStateMetrics() async {
-    final payload = store.toLearningStateJson();
-    final wordStates = payload['wordStates'];
+  Map<String, Object?> _learningStateMetrics(Map<String, dynamic> payload) {
+    final records = payload['records'];
     var wordCount = 0;
     var bookCount = 0;
-    if (wordStates is Map) {
-      bookCount = wordStates.length;
-      for (final words in wordStates.values) {
-        if (words is Map) wordCount += words.length;
+    if (records is Map) {
+      for (final key in records.keys) {
+        final text = key.toString();
+        if (text.startsWith('word/')) wordCount++;
+        if (text.startsWith('bookFavorite/')) bookCount++;
       }
     }
-    try {
-      final bytes = await compute(_encodedPayloadSize, payload);
-      return {
-        'jsonEncodable': true,
-        'utf8Bytes': bytes,
-        'bookCount': bookCount,
-        'wordStateCount': wordCount,
-        'completedCount': (payload['completed'] as List?)?.length ?? 0,
-        'activeStudyCount': (payload['activeStudies'] as Map?)?.length ?? 0,
-        'studyEventCount': (payload['studyEventLog'] as List?)?.length ?? 0,
-        'dailyStatCount': (payload['dailyStudyStats'] as Map?)?.length ?? 0,
-      };
-    } catch (error) {
-      return {
-        'jsonEncodable': false,
-        'encodingError': error.toString(),
-        'bookCount': bookCount,
-        'wordStateCount': wordCount,
-      };
-    }
+    return {
+      'jsonEncodable': true,
+      'bookCount': bookCount,
+      'wordStateCount': wordCount,
+      'replicaRecordCount': records is Map ? records.length : 0,
+    };
   }
 
   Future<void> _sendLearningState({required String reason}) async {
@@ -1974,7 +2026,10 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
     if (current == null || !store.cloudChanges.learningStateDirty) return;
     final snapshot = store.cloudChanges.snapshot;
     final deviceId = await store.cloudChanges.deviceId();
-    final metrics = await _learningStateMetrics();
+    // Capture once.  CloudBackup reuses this immutable replica instead of
+    // serializing every card, event and session twice for one upload.
+    final payload = await store.syncV2Snapshot();
+    final metrics = _learningStateMetrics(payload);
     await store.cloudChanges.recordLog(
       '$reason · learningState 전송 시작 · 순번 ${snapshot.learningStateGeneration} · ${metrics['utf8Bytes'] ?? '?'} bytes',
     );
@@ -1994,7 +2049,13 @@ class AutoBackupCoordinator with WidgetsBindingObserver {
       'pendingCount': snapshot.pendingCount,
       ...metrics,
     });
-    final uploadedRevision = await cloud.uploadLearningState(store, snapshot);
+    final uploadedRevision = await PerformanceProbe.measure(
+        'learning_upload',
+        () => cloud.uploadLearningState(store, snapshot,
+            preparedPayload: payload),
+        data: {
+          'generation': snapshot.learningStateGeneration,
+        });
     if (user?.uid != current.uid) return;
     await store.cloudChanges.acknowledgeProfileMetadata(snapshot);
     await store.cloudChanges.acknowledgeLearningState(snapshot);

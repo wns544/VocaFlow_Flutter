@@ -4,7 +4,9 @@ import 'dart:math';
 
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'large_local_store.dart';
 import 'sync_diagnostic_log.dart';
+import 'performance_probe.dart';
 
 enum AutoBackupNetworkPolicy { all, wifiOnly }
 
@@ -65,7 +67,6 @@ class CloudChangeSnapshot {
 class CloudChangeTracker {
   CloudChangeTracker._(this._prefs) {
     _diagnosticSequence = _prefs.getInt(_diagnosticSequenceKey) ?? 0;
-    _restore();
   }
 
   static const _stateKey = 'cloudChangeTracker.v1';
@@ -75,6 +76,7 @@ class CloudChangeTracker {
   static const _networkPrefix = 'autoBackup.network.';
   static const _lastSuccessPrefix = 'autoBackup.lastSuccess.';
   static const _lastDownloadPrefix = 'autoBackup.lastDownload.';
+  static const _verifiedLearningHeadsPrefix = 'sync.v2.verifiedHeads.';
   static const _lastErrorPrefix = 'autoBackup.lastError.';
   static const _managedBookFullCheckPrefix = 'managedBooks.fullCheck.v1.';
   static const _logKey = 'autoBackup.logs.v1';
@@ -107,8 +109,12 @@ class CloudChangeTracker {
   bool _learningStateDirty = false;
   int _learningStateGeneration = 0;
 
-  static Future<CloudChangeTracker> load() async =>
-      CloudChangeTracker._(await SharedPreferences.getInstance());
+  static Future<CloudChangeTracker> load() async {
+    final tracker = CloudChangeTracker._(await SharedPreferences.getInstance());
+    final encoded = await readLargeLocalValue(tracker._prefs, _stateKey);
+    if (encoded != null) tracker._restoreEncoded(encoded);
+    return tracker;
+  }
 
   CloudChangeSnapshot get snapshot => CloudChangeSnapshot(
         generation: _generation,
@@ -154,7 +160,7 @@ class CloudChangeTracker {
     return _enqueueSettingsStatus(() async {
       if (_activeAccountId == uid) return;
       final accountKey = '$_accountStatePrefix$uid';
-      final scoped = _prefs.getString(accountKey);
+      final scoped = await readLargeLocalValue(_prefs, accountKey);
       if (scoped != null) {
         _clearInMemory();
         _restoreEncoded(scoped);
@@ -162,7 +168,7 @@ class CloudChangeTracker {
         // Only the first signed-in account may adopt old unscoped work. A
         // second account starts with an empty queue, never a copy of account A.
         if (_activeAccountId != null) _clearInMemory();
-        await _prefs.setString(accountKey, _encodeState());
+        await writeLargeLocalValue(_prefs, accountKey, _encodeState());
       }
       _activeAccountId = uid;
       await _persist();
@@ -307,7 +313,8 @@ class CloudChangeTracker {
       // ordering and actual arrival time in the journal.
       final sequence = ++_diagnosticSequence;
       final timestamp = DateTime.now().toUtc();
-      await _prefs.setInt(_diagnosticSequenceKey, sequence);
+      await PerformanceProbe.measure('diagnostic_sequence_commit',
+          () => _prefs.setInt(_diagnosticSequenceKey, sequence));
       final id = await deviceId();
       // This journal is recovery evidence only. In particular, never wait for
       // a slow platform directory lookup before the card queue can be saved
@@ -489,6 +496,41 @@ class CloudChangeTracker {
       DateTime.tryParse(_prefs.getString('$_lastSuccessPrefix$uid') ?? '');
   DateTime? lastDownload(String uid) =>
       DateTime.tryParse(_prefs.getString('$_lastDownloadPrefix$uid') ?? '');
+
+  /// Only a fully applied, durable learning merge may create this marker.
+  /// A changed local generation or a missing replica makes it unusable.
+  ({int generation, Map<String, String> revisions})? verifiedLearningHeads(
+      String uid) {
+    final encoded = _prefs.getString('$_verifiedLearningHeadsPrefix$uid');
+    if (encoded == null) return null;
+    try {
+      final data = Map<String, dynamic>.from(jsonDecode(encoded) as Map);
+      final generation = data['generation'];
+      final revisions = data['revisions'];
+      if (generation is! int || revisions is! Map) return null;
+      final verified = <String, String>{};
+      for (final entry in revisions.entries) {
+        if (entry.key is! String ||
+            entry.value is! String ||
+            (entry.value as String).isEmpty) return null;
+        verified[entry.key as String] = entry.value as String;
+      }
+      if (verified.isEmpty) return null;
+      return (generation: generation, revisions: verified);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> recordVerifiedLearningHeads(
+      String uid, int generation, Map<String, String> revisions) async {
+    if (revisions.isEmpty) return;
+    if (!await _prefs.setString('$_verifiedLearningHeadsPrefix$uid',
+        jsonEncode({'generation': generation, 'revisions': revisions}))) {
+      throw StateError('학습 확인 번호를 기기에 저장하지 못했습니다.');
+    }
+  }
+
   bool hasCompletedManagedBookFullCheck(String uid) =>
       _prefs.getBool('$_managedBookFullCheckPrefix$uid') ?? false;
   List<String> get logs => _prefs.getStringList(_logKey) ?? <String>[];
@@ -587,16 +629,6 @@ class CloudChangeTracker {
     onChanged?.call();
   }
 
-  void _restore() {
-    final encoded = _prefs.getString(_stateKey);
-    if (encoded == null) return;
-    try {
-      _restoreEncoded(encoded);
-    } catch (_) {
-      // A corrupt journal must not prevent the local app from opening.
-    }
-  }
-
   void _restoreEncoded(String encoded) {
     try {
       final json = jsonDecode(encoded) as Map<String, dynamic>;
@@ -633,13 +665,13 @@ class CloudChangeTracker {
   }
 
   Future<void> _persist() async {
-    final saved = await _prefs.setString(
+    await writeLargeLocalValue(
+      _prefs,
       _activeAccountId == null
           ? _stateKey
           : '$_accountStatePrefix$_activeAccountId',
       _encodeState(),
     );
-    if (!saved) throw StateError('동기화 대기 기록을 기기에 저장하지 못했습니다.');
   }
 
   String _encodeState() => jsonEncode({

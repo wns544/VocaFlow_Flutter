@@ -59,13 +59,31 @@ class SyncDiagnosticLog {
     return file.readAsString();
   }
 
-  Future<List<String>> readRecent({int limit = 300}) async => (await readAll())
-      .split('\n')
-      .where((line) => line.trim().isNotEmpty)
-      .toList()
-      .reversed
-      .take(limit)
-      .toList();
+  Future<List<String>> readRecent({int limit = 300}) async {
+    await _tail;
+    final file = await _file();
+    if (!await file.exists()) return const [];
+    // The settings diagnostic dialog needs the newest evidence only. Reading
+    // a 64 MB journal to show 300 lines was a surprising CPU/IO spike while
+    // studying, so read a bounded tail instead.
+    final length = await file.length();
+    final bytesToRead = length.clamp(0, 768 * 1024).toInt();
+    final handle = await file.open();
+    try {
+      await handle.setPosition(length - bytesToRead);
+      final text =
+          utf8.decode(await handle.read(bytesToRead), allowMalformed: true);
+      return text
+          .split('\n')
+          .where((line) => line.trim().isNotEmpty)
+          .toList()
+          .reversed
+          .take(limit)
+          .toList();
+    } finally {
+      await handle.close();
+    }
+  }
 
   Future<String> exportText() => readAll();
 

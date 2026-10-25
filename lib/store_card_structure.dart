@@ -3,7 +3,7 @@ part of 'store.dart';
 extension CardStructureStore on VocaStore {
   Future<void> _queueTextRepairsFromCache(
       Map<String, List<int>> changed) async {
-    final oldBooks = {for (final book in _loadBooks()) book.id: book};
+    final oldBooks = {for (final book in await _loadBooks()) book.id: book};
     final operations = <Map<String, dynamic>>[];
     for (final entry in changed.entries) {
       if (entry.key == 'default') continue;

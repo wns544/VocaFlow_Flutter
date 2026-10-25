@@ -8,6 +8,7 @@ import 'cloud_change_tracker.dart';
 import 'card_sync.dart';
 import 'kanji_lookup.dart';
 import 'large_local_store.dart';
+import 'performance_probe.dart';
 import 'local_word_search.dart';
 import 'models.dart';
 import 'sync_replica.dart';
@@ -20,6 +21,9 @@ part 'store_card_structure.dart';
 String _encodeAccountSnapshot(Map<String, dynamic> state) => jsonEncode(state);
 String _encodeBookSnapshot(List<WordBook> books) =>
     jsonEncode(books.map((book) => book.toJson()).toList());
+List<String> _encodeBookSegments(List<WordBook> books) =>
+    books.map((book) => jsonEncode(book.toJson())).toList();
+String _encodeSingleBook(WordBook book) => jsonEncode(book.toJson());
 
 class ActiveStudy {
   const ActiveStudy({
@@ -49,6 +53,8 @@ class ActiveStudy {
     this.sourceMode,
     this.rangeCourseSchema = VocaStore.rangeCourseSchemaVersion,
     this.progress = const {},
+    this.runId,
+    this.decisionSequence = 0,
   });
 
   final List<int> queueIds;
@@ -79,6 +85,14 @@ class ActiveStudy {
 
   /// Causal revision of actual study actions, never of a restored screen.
   final Map<String, dynamic> progress;
+
+  /// Stable identity for one pass through a study queue.  Unlike a screen
+  /// timestamp it does not change when the route is rebuilt or restored.
+  final String? runId;
+
+  /// Monotonic action number inside [runId].  It is deliberately independent
+  /// of wall-clock time so a delayed view snapshot can never move a run back.
+  final int decisionSequence;
 
   bool get isRangeCourse =>
       bookId != null && rangeStart != null && rangeEnd != null;
@@ -111,6 +125,8 @@ class ActiveStudy {
         'sourceMode': sourceMode,
         'rangeCourseSchema': rangeCourseSchema,
         'progress': progress,
+        'runId': runId,
+        'decisionSequence': decisionSequence,
       };
 
   factory ActiveStudy.fromJson(Map<String, dynamic> json) => ActiveStudy(
@@ -164,6 +180,8 @@ class ActiveStudy {
         sourceMode: json['sourceMode'] as String?,
         rangeCourseSchema: (json['rangeCourseSchema'] as num?)?.toInt() ?? 1,
         progress: Map<String, dynamic>.from(json['progress'] as Map? ?? {}),
+        runId: json['runId'] as String?,
+        decisionSequence: (json['decisionSequence'] as num?)?.toInt() ?? 0,
       );
 }
 
@@ -265,6 +283,10 @@ class StudyEventLog {
     this.previousWrongCount,
     this.previousLastStudiedAt,
     this.previousLastWrongAt,
+    this.runId,
+    this.runSequence,
+    this.sourceDeviceId,
+    this.operationType = 'decision',
   });
 
   final String id;
@@ -279,6 +301,10 @@ class StudyEventLog {
   final int? previousWrongCount;
   final DateTime? previousLastStudiedAt;
   final DateTime? previousLastWrongAt;
+  final String? runId;
+  final int? runSequence;
+  final String? sourceDeviceId;
+  final String operationType;
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -293,6 +319,10 @@ class StudyEventLog {
         'previousWrongCount': previousWrongCount,
         'previousLastStudiedAt': previousLastStudiedAt?.toIso8601String(),
         'previousLastWrongAt': previousLastWrongAt?.toIso8601String(),
+        'runId': runId,
+        'runSequence': runSequence,
+        'sourceDeviceId': sourceDeviceId,
+        'operationType': operationType,
       };
 
   factory StudyEventLog.fromJson(Map<String, dynamic> json) => StudyEventLog(
@@ -318,6 +348,10 @@ class StudyEventLog {
             DateTime.tryParse(json['previousLastStudiedAt'] as String? ?? ''),
         previousLastWrongAt:
             DateTime.tryParse(json['previousLastWrongAt'] as String? ?? ''),
+        runId: json['runId'] as String?,
+        runSequence: (json['runSequence'] as num?)?.toInt(),
+        sourceDeviceId: json['sourceDeviceId'] as String?,
+        operationType: json['operationType'] as String? ?? 'decision',
       );
 }
 
@@ -325,6 +359,9 @@ enum DailyStudyStatus { none, low, medium, completed }
 
 class VocaStore {
   VocaStore._(this._prefs);
+
+  List<String>? _bookSegmentIds;
+  List<String>? _bookSegments;
 
   static const _booksKey = 'books';
   static const _accountStatePrefix = 'accountState.v1.';
@@ -417,6 +454,21 @@ class VocaStore {
   late LocalWordSearchIndex wordSearch;
   Future<void> _localWrites = Future<void>.value();
   final Object _mutationZone = Object();
+  int _performancePendingMutations = 0;
+  Map<String, Object?> get performanceState {
+    final current = activeStudy;
+    return {
+      'pendingMutations': _performancePendingMutations,
+      'incompleteDecisionJournal': _prefs.containsKey(_localDecisionKey),
+      'learningDirty': cloudChanges.learningStateDirty,
+      'cardOperations': cardChanges.pendingCount,
+      'round': current?.roundNumber,
+      'roundCompleted': current?.roundCompleted,
+      'roundTotal': current?.roundTotal,
+      'decisionSequence': current?.decisionSequence,
+    };
+  }
+
   String? _decisionEventPrefix;
   int _decisionEventSequence = 0;
   final ValueNotifier<int> cardContentRevision = ValueNotifier<int>(0);
@@ -425,8 +477,33 @@ class VocaStore {
   /// decision's read/modify/write steps. Nested store helpers remain reentrant.
   Future<T> runLocalMutation<T>(Future<T> Function() action) {
     if (Zone.current[_mutationZone] == true) return action();
+    if (!PerformanceProbe.supported) {
+      final task = _localWrites
+          .then((_) => runZoned(action, zoneValues: {_mutationZone: true}));
+      _localWrites =
+          task.then<void>((_) {}, onError: (Object _, StackTrace __) {});
+      return task;
+    }
+    final epochQueuedAt = Stopwatch()..start();
+    if (PerformanceProbe.supported) {
+      _performancePendingMutations++;
+      PerformanceProbe.instance.event(
+          'mutation_enqueued', {'pending': _performancePendingMutations});
+    }
     final task = _localWrites
-        .then((_) => runZoned(action, zoneValues: {_mutationZone: true}));
+        .then((_) => PerformanceProbe.measure('store_mutation',
+                () => runZoned(action, zoneValues: {_mutationZone: true}),
+                data: {
+                  'waitUs': epochQueuedAt.elapsedMicroseconds,
+                  'pending': _performancePendingMutations,
+                }))
+        .whenComplete(() {
+      if (PerformanceProbe.supported) {
+        _performancePendingMutations--;
+        PerformanceProbe.instance.event(
+            'mutation_finished', {'pending': _performancePendingMutations});
+      }
+    });
     _localWrites =
         task.then<void>((_) {}, onError: (Object _, StackTrace __) {});
     return task;
@@ -465,9 +542,22 @@ class VocaStore {
   Map<String, DateTime>? _completedAtCache;
   Map<String, DateTime>? _resetMarkersCache;
   SyncReplica? _replica;
+  bool _loadedBooksFromDurableStore = false;
+  bool _loadedReplicaFromDurableStore = false;
+  bool get hasDurableLearningCache =>
+      _loadedBooksFromDurableStore && _loadedReplicaFromDurableStore;
   Future<void> _syncWork = Future<void>.value();
   Future<void> Function()? beforeRemoteApply;
   bool _applyingReplica = false;
+
+  // A card decision must survive an immediate process death, but rewriting a
+  // 2,500-card library for every tap was the main CPU/thermal offender. Keep
+  // the changed card state in this small, durable file first; the full book
+  // snapshot is consolidated after a short batch or before a cloud flush.
+  static const _pendingWordStatesPrefix = 'learning.pendingWordStates.';
+  final Map<String, Map<String, dynamic>> _pendingWordStates = {};
+  Timer? _pendingBookSnapshotTimer;
+  int _pendingBookSnapshotCount = 0;
 
   /// Increments only after a complete dedicated learning-state merge.
   /// Study routes listen to it so they never keep showing a stale queue.
@@ -475,7 +565,8 @@ class VocaStore {
 
   static Future<VocaStore> load() async {
     final store = VocaStore._(await SharedPreferences.getInstance());
-    store.books = store._loadBooks();
+    store.books = await store._loadBooks();
+    await store._restorePendingWordStates();
     store.cloudChanges = await CloudChangeTracker.load();
     store.cardChanges = await CardChangeTracker.load();
     final savedOwner = store._prefs.getString(_lastActiveAccountKey);
@@ -508,6 +599,84 @@ class VocaStore {
     // here serialized every word in every book on each interaction.
     SyncAuxiliary.onChanged = store.cloudChanges.markLearningState;
     return store;
+  }
+
+  String get _pendingWordStatesKey =>
+      '$_pendingWordStatesPrefix${_activeAccountId ?? _prefs.getString(_lastActiveAccountKey) ?? 'local'}';
+
+  Map<String, dynamic> _wordStatePatch(Word word) => <String, dynamic>{
+        'state': word.state.name,
+        'correctCount': word.correctCount,
+        'wrongCount': word.wrongCount,
+        'lastStudiedAt': word.lastStudiedAt?.toIso8601String(),
+        'lastWrongAt': word.lastWrongAt?.toIso8601String(),
+      };
+
+  Future<void> _restorePendingWordStates() async {
+    final encoded = await readLargeLocalValue(_prefs, _pendingWordStatesKey);
+    if (encoded == null) return;
+    try {
+      final entries = Map<String, dynamic>.from(jsonDecode(encoded) as Map);
+      for (final entry in entries.entries) {
+        final divider = entry.key.lastIndexOf(':');
+        if (divider <= 0 || entry.value is! Map) continue;
+        final bookId = entry.key.substring(0, divider);
+        final wordId = int.tryParse(entry.key.substring(divider + 1));
+        if (wordId == null) continue;
+        final word = resolveCard(bookId, wordId);
+        if (word == null) continue;
+        final patch = Map<String, dynamic>.from(entry.value as Map);
+        final state = patch['state']?.toString();
+        if (state != null) {
+          word.state = StudyState.values.firstWhere(
+              (value) => value.name == state,
+              orElse: () => word.state);
+        }
+        word.correctCount =
+            (patch['correctCount'] as num?)?.toInt() ?? word.correctCount;
+        word.wrongCount =
+            (patch['wrongCount'] as num?)?.toInt() ?? word.wrongCount;
+        word.lastStudiedAt =
+            DateTime.tryParse(patch['lastStudiedAt']?.toString() ?? '') ??
+                word.lastStudiedAt;
+        word.lastWrongAt =
+            DateTime.tryParse(patch['lastWrongAt']?.toString() ?? '') ??
+                word.lastWrongAt;
+        _pendingWordStates[entry.key] = patch;
+      }
+      _pendingBookSnapshotCount = _pendingWordStates.length;
+    } catch (_) {
+      // The per-decision journal is still recovered below if this optional
+      // compact delta is malformed.
+    }
+  }
+
+  Future<void> _queueStudyBookSave(Word word, String bookId) async {
+    _pendingWordStates['$bookId:${word.id}'] = _wordStatePatch(word);
+    await writeLargeLocalValue(
+        _prefs, _pendingWordStatesKey, jsonEncode(_pendingWordStates));
+    _pendingBookSnapshotCount++;
+    if (_pendingBookSnapshotCount >= 20) {
+      await _flushPendingStudyBookWritesLocked();
+      return;
+    }
+    _pendingBookSnapshotTimer ??= Timer(
+        const Duration(seconds: 30),
+        () => unawaited(
+              runLocalMutation(_flushPendingStudyBookWritesLocked),
+            ));
+  }
+
+  /// Forces the batched library snapshot out before app backgrounding or a
+  /// learning upload. The small delta is written before this is ever called.
+  Future<void> flushPendingStudyBookWrites() =>
+      runLocalMutation(_flushPendingStudyBookWritesLocked);
+
+  Future<void> _flushPendingStudyBookWritesLocked() async {
+    _pendingBookSnapshotTimer?.cancel();
+    _pendingBookSnapshotTimer = null;
+    if (_pendingWordStates.isEmpty) return;
+    await _saveBooks();
   }
 
   Future<void> _migrateMainTab() async {
@@ -797,18 +966,24 @@ class VocaStore {
 
   Future<void> _saveDailyStudyStats(Map<String, DailyStudyStats> stats) {
     _dailyStudyStatsCache = Map<String, DailyStudyStats>.from(stats);
-    return _prefs.setString(
-      _dailyStudyStatsKey,
-      jsonEncode(stats.map((key, value) => MapEntry(key, value.toJson()))),
-    );
+    return PerformanceProbe.measure(
+        'daily_stats_commit',
+        () => _prefs.setString(
+              _dailyStudyStatsKey,
+              jsonEncode(
+                  stats.map((key, value) => MapEntry(key, value.toJson()))),
+            ));
   }
 
   Future<void> _saveStudyEventLog(List<StudyEventLog> events) {
     _studyEventLogCache = List<StudyEventLog>.of(events);
-    return _prefs.setString(
-      _studyEventLogKey,
-      jsonEncode(events.map((event) => event.toJson()).toList()),
-    );
+    return PerformanceProbe.measure(
+        'study_event_log_commit',
+        () => _prefs.setString(
+              _studyEventLogKey,
+              jsonEncode(events.map((event) => event.toJson()).toList()),
+            ),
+        data: {'eventCount': events.length});
   }
 
   List<StudyEventLog> _prunedStudyEventLog(List<StudyEventLog> events,
@@ -836,6 +1011,9 @@ class VocaStore {
     required DateTime? previousLastStudiedAt,
     required DateTime? previousLastWrongAt,
     String? operationId,
+    String? runId,
+    int? runSequence,
+    String? sourceDeviceId,
   }) async {
     final day = _dayKey(now);
     final stats = Map<String, DailyStudyStats>.from(dailyStudyStats);
@@ -862,6 +1040,9 @@ class VocaStore {
       previousWrongCount: previousWrongCount,
       previousLastStudiedAt: previousLastStudiedAt,
       previousLastWrongAt: previousLastWrongAt,
+      runId: runId,
+      runSequence: runSequence,
+      sourceDeviceId: sourceDeviceId,
     );
     await _saveStudyEventLog(
         _prunedStudyEventLog([event, ...studyEventLog], now: now));
@@ -1030,7 +1211,7 @@ class VocaStore {
       updatedAt: DateTime.now(),
     );
     await saveActiveStudyFor(currentCourseKey(bookId), active,
-        markCloudChange: false);
+        markCloudChange: false, allowProgressRegression: true);
     await cloudChanges.markProfile();
     return activeCourseForBook(bookId);
   }
@@ -1073,10 +1254,12 @@ class VocaStore {
           {bool markCloudChange = true,
           DateTime? expectedUpdatedAt,
           bool progressChanged = true,
+          bool allowProgressRegression = false,
           String? expectedProgressId}) =>
       runLocalMutation(() => _saveActiveStudyFor(key, active,
           markCloudChange: markCloudChange,
           progressChanged: progressChanged,
+          allowProgressRegression: allowProgressRegression,
           expectedProgressId: expectedProgressId,
           expectedUpdatedAt: expectedUpdatedAt));
 
@@ -1084,6 +1267,7 @@ class VocaStore {
       {bool markCloudChange = true,
       DateTime? expectedUpdatedAt,
       bool progressChanged = true,
+      bool allowProgressRegression = false,
       String? expectedProgressId}) async {
     final studies = Map<String, ActiveStudy>.from(activeStudies);
     final resolvedKey = active.isRangeCourse && active.bookId != null
@@ -1109,6 +1293,25 @@ class VocaStore {
       }));
       return null;
     }
+    if (progressChanged &&
+        !allowProgressRegression &&
+        previousActive != null &&
+        previousActive.bookId == active.bookId &&
+        previousActive.rangeStart == active.rangeStart &&
+        previousActive.rangeEnd == active.rangeEnd &&
+        (active.roundNumber < previousActive.roundNumber ||
+            (active.roundNumber == previousActive.roundNumber &&
+                active.roundCompleted < previousActive.roundCompleted))) {
+      unawaited(cloudChanges
+          .recordDiagnostic('active_study_save_rejected_regression', data: {
+        'studyKey': resolvedKey,
+        'attemptedRound': active.roundNumber,
+        'attemptedCompleted': active.roundCompleted,
+        'storedRound': previousActive.roundNumber,
+        'storedCompleted': previousActive.roundCompleted,
+      }));
+      return null;
+    }
     Map<String, dynamic> progress(ActiveStudy study) {
       final raw = study.toJson();
       return {
@@ -1129,7 +1332,9 @@ class VocaStore {
           'sessionSelections',
           'rangeStart',
           'rangeEnd',
-          'sourceMode'
+          'sourceMode',
+          'runId',
+          'decisionSequence'
         ])
           key: raw[key]
       };
@@ -1153,10 +1358,22 @@ class VocaStore {
         previousActive?.updatedAt ??
         DateTime.now();
     final device = await cloudChanges.deviceId();
+    final resolvedRunId = active.runId ??
+        previousActive?.runId ??
+        '$device:${startedAt.toUtc().microsecondsSinceEpoch}:$resolvedKey';
+    final resolvedDecisionSequence =
+        active.decisionSequence > (previousActive?.decisionSequence ?? 0)
+            ? active.decisionSequence
+            : previousActive?.decisionSequence ?? active.decisionSequence;
     final revision = Map<String, dynamic>.from(previousActive?.progress ?? {});
     final vector = Map<String, dynamic>.from(revision['vector'] as Map? ?? {});
     vector[device] = ((vector[device] as num?)?.toInt() ?? 0) + 1;
     final actionAt = DateTime.now().toUtc();
+    final isIntentionalRegression = allowProgressRegression &&
+        previousActive != null &&
+        (active.roundNumber < previousActive.roundNumber ||
+            (active.roundNumber == previousActive.roundNumber &&
+                active.roundCompleted < previousActive.roundCompleted));
     final updatedActive = ActiveStudy(
       queueIds: active.queueIds,
       queueBookIds: active.queueBookIds,
@@ -1182,9 +1399,16 @@ class VocaStore {
       rangeEnd: active.rangeEnd,
       sourceMode: active.sourceMode,
       rangeCourseSchema: active.rangeCourseSchema,
+      runId: resolvedRunId,
+      decisionSequence: resolvedDecisionSequence,
       updatedAt: DateTime.now(),
       progress: {
-        'schema': 1,
+        'schema': 2,
+        if (isIntentionalRegression) 'allowsRegression': true,
+        if (isIntentionalRegression || revision['regressionEpoch'] != null)
+          'regressionEpoch': isIntentionalRegression
+              ? '$device:${actionAt.microsecondsSinceEpoch}'
+              : revision['regressionEpoch'],
         'id': '$device:${actionAt.microsecondsSinceEpoch}:${vector[device]}',
         'device': device,
         'primary': revision['primary'] ?? device,
@@ -1759,6 +1983,8 @@ class VocaStore {
 
   Future<void> _activateAccount(String uid) async {
     if (_activeAccountId == uid) return;
+    // Never carry an unsnapshotted card-state delta into another account.
+    await _flushPendingStudyBookWritesLocked();
     // Persist everything that determines what a user can resume on this
     // device before switching to a different account's local cache.
     if (_activeAccountId != null) await _saveAccountState(_activeAccountId!);
@@ -1787,6 +2013,7 @@ class VocaStore {
     }
     _activeAccountId = uid;
     await _prefs.setString(_lastActiveAccountKey, uid);
+    await _restorePendingWordStates();
     await cloudChanges.activateAccount(uid);
     await cardChanges.activateAccount(uid);
     await _bootstrapLegacySettingsForAccount(uid);
@@ -1833,7 +2060,9 @@ class VocaStore {
   Future<void> _saveAccountState(String uid, {String? encodedBooks}) async {
     final state = <String, dynamic>{};
     for (final key in _accountScopedKeys) {
-      final value = _prefs.get(key);
+      final value = isLargeLocalValueKey(key)
+          ? await readLargeLocalValue(_prefs, key)
+          : _prefs.get(key);
       if (value != null) state[key] = value;
     }
     // The in-memory books can be newer than the last preference write when a
@@ -1856,7 +2085,11 @@ class VocaStore {
       if (!_accountScopedKeys.contains(key)) continue;
       final value = entry.value;
       if (value is String) {
-        await _prefs.setString(key, value);
+        if (key == _booksKey || isLargeLocalValueKey(key)) {
+          await writeLargeLocalValue(_prefs, key, value);
+        } else {
+          await _prefs.setString(key, value);
+        }
       } else if (value is bool) {
         await _prefs.setBool(key, value);
       } else if (value is int) {
@@ -1868,7 +2101,7 @@ class VocaStore {
             key, value.map((item) => item.toString()).toList());
       }
     }
-    books = _loadBooks();
+    books = await _loadBooks();
     _dailyStudyStatsCache = null;
     _studyEventLogCache = null;
     _activeStudiesCache = null;
@@ -1879,7 +2112,11 @@ class VocaStore {
 
   Future<void> _clearAccountScopedState() async {
     for (final key in _accountScopedKeys) {
-      await _prefs.remove(key);
+      if (key == _booksKey || isLargeLocalValueKey(key)) {
+        await removeLargeLocalValue(_prefs, key);
+      } else {
+        await _prefs.remove(key);
+      }
     }
     _dailyStudyStatsCache = null;
     _studyEventLogCache = null;
@@ -1887,6 +2124,8 @@ class VocaStore {
     _activeStudyTombstonesCache = null;
     _completedAtCache = null;
     _resetMarkersCache = null;
+    _loadedBooksFromDurableStore = false;
+    _loadedReplicaFromDurableStore = false;
   }
 
   Future<void> updateBook(WordBook updated) => runLocalMutation(() async {
@@ -2518,12 +2757,18 @@ class VocaStore {
         if (_prefs.containsKey(_localDecisionKey))
           await _recoverLocalDecision();
         try {
-          await _mark(word, state,
-              recordAttempt: recordAttempt,
-              bookId: bookId,
-              sessionIndexes: sessionIndexes,
-              decisionId: decisionId,
-              activeStudy: activeStudy);
+          await PerformanceProbe.measure(
+              'study_decision',
+              () => _mark(word, state,
+                  recordAttempt: recordAttempt,
+                  bookId: bookId,
+                  sessionIndexes: sessionIndexes,
+                  decisionId: decisionId,
+                  activeStudy: activeStudy),
+              data: {
+                'operationId': decisionId,
+                'runSequence': activeStudy?.decisionSequence,
+              });
         } finally {
           _decisionEventPrefix = null;
         }
@@ -2633,9 +2878,12 @@ class VocaStore {
         previousLastStudiedAt: beforeLastStudiedAt,
         previousLastWrongAt: beforeLastWrongAt,
         operationId: attemptId,
+        runId: activeStudy?.runId,
+        runSequence: activeStudy?.decisionSequence,
+        sourceDeviceId: attemptId.split(':').first,
       );
     }
-    await _saveBooks();
+    await _queueStudyBookSave(word, bookId);
     if (recordAttempt && activeStudy != null) {
       await saveActiveStudyFor(activeStudyKey(activeStudy), activeStudy,
           markCloudChange: false);
@@ -3254,19 +3502,24 @@ class VocaStore {
     }
   }
 
-  List<WordBook> _loadBooks() {
-    final saved = _prefs.getString(_booksKey);
+  Future<List<WordBook>> _loadBooks() async {
+    _bookSegmentIds = null;
+    _bookSegments = null;
+    final saved = await readLargeLocalValue(_prefs, _booksKey);
     return _decodeBooks(saved);
   }
 
   List<WordBook> _decodeBooks(String? saved) {
+    _loadedBooksFromDurableStore = false;
     if (saved == null) return [_defaultBook()];
     try {
       final decoded = jsonDecode(saved) as List<dynamic>;
       final loaded = decoded
           .map((item) => WordBook.fromJson(item as Map<String, dynamic>))
           .toList();
-      return loaded.isEmpty ? [_defaultBook()] : loaded;
+      if (loaded.isEmpty) return [_defaultBook()];
+      _loadedBooksFromDurableStore = true;
+      return loaded;
     } catch (_) {
       return [_defaultBook()];
     }
@@ -3283,15 +3536,48 @@ class VocaStore {
         : compute(_encodeBookSnapshot, List<WordBook>.of(books));
   }
 
-  Future<void> _saveBooks() async {
+  Future<void> _saveBooks({String? changedBookId}) async {
     // Every learning decision still waits for this durable write. Encode the
     // full snapshot off the UI isolate on native devices so a large book does
     // not stall swipes or make a subsequent tap appear unresponsive.
     final saveTime = Stopwatch()..start();
-    final encoded = await _encodeBooksForStorage();
+    final ids = books.map((book) => book.id).toList();
+    final canReuse = changedBookId != null &&
+        ids.contains(changedBookId) &&
+        _bookSegmentIds != null &&
+        _bookSegments != null &&
+        ids.length == _bookSegmentIds!.length &&
+        ids
+            .asMap()
+            .entries
+            .every((entry) => entry.value == _bookSegmentIds![entry.key]);
+    final segments = canReuse
+        ? List<String>.of(_bookSegments!)
+        : kIsWeb || books.length < 2
+            ? _encodeBookSegments(books)
+            : await compute(_encodeBookSegments, List<WordBook>.of(books));
+    if (canReuse) {
+      final index = ids.indexOf(changedBookId);
+      if (index >= 0) {
+        segments[index] = kIsWeb
+            ? _encodeSingleBook(books[index])
+            : await compute(_encodeSingleBook, books[index]);
+      }
+    }
+    final encoded = '[${segments.join(',')}]';
     final encodeMs = saveTime.elapsedMilliseconds;
-    if (!await _prefs.setString(_booksKey, encoded)) {
-      throw StateError('기기에 단어장과 학습 상태를 저장하지 못했습니다.');
+    await writeLargeLocalValue(_prefs, _booksKey, encoded);
+    _bookSegmentIds = ids;
+    _bookSegments = segments;
+    _loadedBooksFromDurableStore = true;
+    // A complete library snapshot includes every pending per-card patch.
+    // Clear that compact recovery layer only after this verified write.
+    if (_pendingWordStates.isNotEmpty) {
+      _pendingWordStates.clear();
+      _pendingBookSnapshotCount = 0;
+      _pendingBookSnapshotTimer?.cancel();
+      _pendingBookSnapshotTimer = null;
+      await removeLargeLocalValue(_prefs, _pendingWordStatesKey);
     }
     final writeMs = saveTime.elapsedMilliseconds - encodeMs;
     if (encodeMs >= 32 || writeMs >= 32) {

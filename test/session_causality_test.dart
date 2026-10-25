@@ -40,16 +40,28 @@ Map<String, dynamic> envelope(Map<String, dynamic> record,
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   setUp(() => SharedPreferences.setMockInitialValues({}));
-  test('explicit session tombstone is not defeated by an older modern revision', () {
+  test('explicit session tombstone is not defeated by an older modern revision',
+      () {
     final session = revision('s23', {'s23': 1}, 41, 100);
-    final deleted = <String, dynamic>{'clock': 200, 'device': 's23', 'value': null};
-    for (final order in [[session, deleted], [deleted, session]]) {
+    final deleted = <String, dynamic>{
+      'clock': 200,
+      'device': 's23',
+      'value': null
+    };
+    for (final order in [
+      [session, deleted],
+      [deleted, session]
+    ]) {
       final replica = SyncReplica('reader');
-      for (final record in order) { replica.merge(envelope(record)); }
+      for (final record in order) {
+        replica.merge(envelope(record));
+      }
       expect(replica.values['session/book:current'], isNull);
     }
     final restarted = revision('s23', {'s23': 2}, 0, 300);
-    final replica = SyncReplica('reader')..merge(envelope(deleted))..merge(envelope(restarted));
+    final replica = SyncReplica('reader')
+      ..merge(envelope(deleted))
+      ..merge(envelope(restarted));
     expect(replica.values['session/book:current']['active']['memorized'], 0);
   });
 
@@ -102,6 +114,115 @@ void main() {
     }
   });
 
+  test('same-device delayed snapshots cannot rewind a completed round', () {
+    Map<String, dynamic> at(int vector, int completed,
+        {String? epoch, bool intentional = false}) {
+      final item = revision('s23', {'s23': vector}, completed, vector);
+      final active = item['value']['active'] as Map<String, dynamic>;
+      active['bookId'] = 'ch02';
+      active['roundNumber'] = 1;
+      active['roundTotal'] = 366;
+      active['roundCompleted'] = completed;
+      final progress = active['progress'] as Map<String, dynamic>;
+      if (epoch != null) progress['regressionEpoch'] = epoch;
+      if (intentional) progress['allowsRegression'] = true;
+      return item;
+    }
+
+    final advance = at(310, 365);
+    final delayed = at(311, 329);
+    final delayedAgain = at(319, 316);
+    for (final order in [
+      [advance, delayed, delayedAgain],
+      [delayedAgain, delayed, advance],
+    ]) {
+      final replica = SyncReplica('reader');
+      for (final item in order) {
+        replica.merge(envelope(item));
+      }
+      expect(replica.values['session/book:current']['active']['roundCompleted'],
+          365);
+    }
+
+    final undone = at(320, 364, epoch: 'undo-1', intentional: true);
+    final afterUndo = at(321, 364, epoch: 'undo-1');
+    final replica = SyncReplica('reader')
+      ..merge(envelope(advance))
+      ..merge(envelope(undone))
+      ..merge(envelope(afterUndo));
+    expect(replica.values['session/book:current']['active']['roundCompleted'],
+        364);
+  });
+
+  test('decision sequence beats a delayed newer screen snapshot in one run',
+      () {
+    Map<String, dynamic> at(int clock, int completed, int sequence) {
+      final item = revision('s23', {'s23': clock}, completed, clock);
+      final active = item['value']['active'] as Map<String, dynamic>;
+      active
+        ..['bookId'] = 'ch02'
+        ..['roundNumber'] = 1
+        ..['roundTotal'] = 366
+        ..['roundCompleted'] = completed
+        ..['runId'] = 's23-ch02-run'
+        ..['decisionSequence'] = sequence;
+      (active['progress'] as Map<String, dynamic>)['schema'] = 2;
+      return item;
+    }
+
+    // This exactly mirrors the production failure: a stale view persisted
+    // later (larger replica clock) must not re-open card 316 after card 365.
+    final at365 = at(365, 365, 365);
+    final stale329 = at(400, 329, 329);
+    final stale316 = at(401, 316, 316);
+    for (final order in [
+      [at365, stale329, stale316],
+      [stale316, at365, stale329],
+    ]) {
+      final replica = SyncReplica('reader');
+      for (final record in order) {
+        replica.merge(envelope(record));
+      }
+      expect(replica.values['session/book:current']['active']['roundCompleted'],
+          365);
+    }
+  });
+
+  test(
+      'batched device merge retains sequential results and every recovery record',
+      () {
+    final snapshots = <Map<String, dynamic>>[];
+    for (var i = 1; i <= 70; i++) {
+      final record = revision(i.isEven ? 'pc' : 's23', {'s23': i}, i, i);
+      record['value']['active'].addAll({
+        'bookId': 'ch02',
+        'roundNumber': 1,
+        'roundTotal': 366,
+        'roundCompleted': i,
+      });
+      snapshots.add(envelope(record, extra: {
+        'event/action-$i': {'clock': i, 'device': 's23', 'value': i},
+      }));
+    }
+    for (final ordered in [snapshots, snapshots.reversed.toList()]) {
+      final sequential = SyncReplica('reader');
+      for (final snapshot in ordered) {
+        sequential.merge(snapshot);
+      }
+      final batched = SyncReplica.mergeEnvelopes({
+        'local': SyncReplica('reader').toJson(),
+        'remote': ordered,
+      });
+      expect(batched, sequential.toJson());
+      final repeated = SyncReplica.mergeEnvelopes({
+        'local': batched,
+        'remote': ordered,
+      });
+      expect(repeated, batched);
+      expect((batched['recovery'] as Map).length, 70);
+    }
+  });
+
   test('derived view changes never advance session or change queue', () async {
     final store = await VocaStore.load();
     final book = await store
@@ -140,6 +261,61 @@ void main() {
         await store.saveActiveStudyFor(key, changedView,
             expectedProgressId: 'obsolete'),
         isNull);
+  });
+
+  test('a stale same-round snapshot cannot move study progress backward',
+      () async {
+    final store = await VocaStore.load();
+    final book = await store.addBook('test', [
+      Word(id: 1, term: 'a', reading: 'a', meaning: 'a'),
+      Word(id: 2, term: 'b', reading: 'b', meaning: 'b'),
+    ]);
+    final active = ActiveStudy(
+      queueIds: [2],
+      total: 366,
+      memorized: 243,
+      reviewed: const [],
+      revealed: false,
+      bookId: book.id,
+      sessionIndexes: const [],
+      roundNumber: 1,
+      roundTotal: 366,
+      roundCompleted: 365,
+      startedAt: DateTime.utc(2026, 10, 24, 8),
+    );
+    final key = store.activeStudyKey(active);
+    final saved = (await store.saveActiveStudyFor(key, active))!;
+    final stale = ActiveStudy.fromJson({
+      ...saved.toJson(),
+      'roundCompleted': 329,
+      'queueIds': [1, 2],
+    });
+    expect(
+        await store.saveActiveStudyFor(key, stale,
+            expectedProgressId: saved.progress['id']),
+        isNull);
+    expect(store.getActiveStudyFor(key)!.roundCompleted, 365);
+
+    final undo = (await store.saveActiveStudyFor(key, stale,
+        expectedProgressId: saved.progress['id'],
+        allowProgressRegression: true))!;
+    expect(undo.roundCompleted, 329);
+    expect(undo.progress['allowsRegression'], isTrue);
+    expect(undo.startedAt, saved.startedAt);
+  });
+
+  test('saving one studied card preserves every other book after reload',
+      () async {
+    final store = await VocaStore.load();
+    final first = await store.addBook(
+        'first', [Word(id: 1, term: '甲', reading: 'こう', meaning: '첫째')]);
+    final second = await store.addBook(
+        'second', [Word(id: 2, term: '乙', reading: 'おつ', meaning: '둘째')]);
+    await store.mark(first.words.first, StudyState.memorized,
+        bookId: first.id, decisionId: 'first-decision');
+    final restored = await VocaStore.load();
+    expect(restored.resolveCard(first.id, 1)!.correctCount, 1);
+    expect(restored.resolveCard(second.id, 2)!.meaning, '둘째');
   });
 
   test('same action ID cannot be restamped through a new view timestamp', () {

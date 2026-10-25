@@ -27,9 +27,12 @@ class SyncReplica {
   static Map<String, dynamic> mergeEnvelopes(Map<String, dynamic> input) {
     final replica =
         SyncReplica.fromJson(Map<String, dynamic>.from(input['local'] as Map));
-    for (final raw in input['remote'] as List) {
-      replica.merge(Map<String, dynamic>.from(raw as Map));
+    final remote = input['remote'] as List;
+    for (final raw in remote) {
+      replica._merge(Map<String, dynamic>.from(raw as Map),
+          resolveSessions: false);
     }
+    if (remote.isNotEmpty) replica._resolveSessions();
     return replica.toJson();
   }
 
@@ -145,11 +148,24 @@ class SyncReplica {
     final candidates = <String, Map<String, dynamic>>{};
     for (final entry in recovery.entries) {
       if (entry.key.startsWith('$key@')) {
-        candidates[canonical(entry.value)] = entry.value;
+        // Archive keys already identify immutable revisions. Formatting every
+        // queue and undo history as a sorted JSON string just to deduplicate
+        // them allocated the entire history again on every device merge.
+        candidates[entry.key] = entry.value;
       }
     }
     final local = records[key];
-    if (local != null) candidates[canonical(local)] = local;
+    if (local != null) {
+      final stamp = '$key@${local['clock']}@${local['device']}';
+      final archived = candidates[stamp];
+      if (archived == null || _sameJsonValue(archived, local)) {
+        candidates[stamp] = local;
+      } else {
+        // Preserve the old behavior for a view with the same revision stamp
+        // but a different body. This rare collision must keep both candidates.
+        candidates['$stamp@local'] = local;
+      }
+    }
     var eligible = candidates.values.toList();
     if (eligible.isEmpty) return;
     final tombstones = eligible.where((r) => r['value'] == null).toList()
@@ -167,8 +183,10 @@ class SyncReplica {
           : const {};
     }
 
-    if (eligible.any((r) => progress(r)['schema'] == 1)) {
-      eligible = eligible.where((r) => progress(r)['schema'] == 1).toList();
+    if (eligible.any((r) => (progress(r)['schema'] as num? ?? 0) >= 1)) {
+      eligible = eligible
+          .where((r) => (progress(r)['schema'] as num? ?? 0) >= 1)
+          .toList();
     }
     bool dominates(Map a, Map b) {
       final av = progress(a)['vector'] as Map? ?? const {};
@@ -181,6 +199,91 @@ class SyncReplica {
         greater |= x > y;
       }
       return greater;
+    }
+
+    Map active(Map record) {
+      final value = record['value'];
+      final session = value is Map ? value['active'] : null;
+      return session is Map ? session : const {};
+    }
+
+    bool hasUnmarkedRegression(Map candidate) {
+      final current = active(candidate);
+      final currentTotal = (current['roundTotal'] as num?)?.toInt() ?? 0;
+      if (currentTotal <= 0) return false;
+      final currentRound = (current['roundNumber'] as num?)?.toInt() ?? 1;
+      final currentDone = (current['roundCompleted'] as num?)?.toInt() ?? 0;
+      final epoch = progress(candidate)['regressionEpoch'];
+      for (final earlier in eligible) {
+        if (!dominates(candidate, earlier) ||
+            progress(earlier)['regressionEpoch'] != epoch) continue;
+        final prior = active(earlier);
+        if (prior['bookId'] != current['bookId'] ||
+            prior['rangeStart'] != current['rangeStart'] ||
+            prior['rangeEnd'] != current['rangeEnd'] ||
+            (prior['roundTotal'] as num?)?.toInt() != currentTotal) continue;
+        final priorRound = (prior['roundNumber'] as num?)?.toInt() ?? 1;
+        final priorDone = (prior['roundCompleted'] as num?)?.toInt() ?? 0;
+        if (currentRound < priorRound ||
+            (currentRound == priorRound && currentDone < priorDone)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // A causally newer write can still carry an older queue when a delayed
+    // screen snapshot is saved. Preserve the last proven position. An undo or
+    // explicit new attempt starts a new regression epoch in the store.
+    eligible = eligible.where((r) => !hasUnmarkedRegression(r)).toList();
+
+    // Screen snapshots are allowed to arrive after the learner has already
+    // acted again.  For one run the decision sequence is the authority, not
+    // the replica clock: a late 316/366 snapshot must never beat 365/366 just
+    // because it happened to be uploaded later.  Separate runs (for example
+    // two devices studying independently) use the furthest reached position.
+    final rollback = Map<Map, bool>.identity();
+    bool isIntentionalRollback(Map record) => rollback.putIfAbsent(record, () {
+          final epoch = progress(record)['regressionEpoch'];
+          if (epoch == null) return false;
+          return eligible.any((candidate) =>
+              progress(candidate)['regressionEpoch'] == epoch &&
+              progress(candidate)['allowsRegression'] == true &&
+              (identical(candidate, record) || dominates(record, candidate)));
+        });
+
+    int compareStudyPosition(Map a, Map b) {
+      final aa = active(a);
+      final bb = active(b);
+      final aRollback = isIntentionalRollback(a);
+      final bRollback = isIntentionalRollback(b);
+      if (aRollback != bRollback) return aRollback ? 1 : -1;
+      final sameRun = aa['runId'] != null && aa['runId'] == bb['runId'];
+      if (sameRun) {
+        final sequence = ((aa['decisionSequence'] as num?)?.toInt() ?? 0)
+            .compareTo((bb['decisionSequence'] as num?)?.toInt() ?? 0);
+        if (sequence != 0) return sequence;
+      }
+      final round = ((aa['roundNumber'] as num?)?.toInt() ?? 1)
+          .compareTo((bb['roundNumber'] as num?)?.toInt() ?? 1);
+      if (round != 0) return round;
+      final completed = ((aa['roundCompleted'] as num?)?.toInt() ?? 0)
+          .compareTo((bb['roundCompleted'] as num?)?.toInt() ?? 0);
+      if (completed != 0) return completed;
+      return 0;
+    }
+
+    if (eligible.length > 1) {
+      var best = eligible.first;
+      for (final candidate in eligible.skip(1)) {
+        if (compareStudyPosition(candidate, best) > 0) best = candidate;
+      }
+      // Retain tied candidates so the existing primary-device/vector rules
+      // decide only true ties.  Discard lower positions before causal clocks
+      // can make a delayed stale screen win.
+      eligible = eligible
+          .where((candidate) => compareStudyPosition(candidate, best) == 0)
+          .toList();
     }
 
     // Descendants have a strictly larger vector sum. Visit them first, so
@@ -218,7 +321,10 @@ class SyncReplica {
     records[key] = frontier.last;
   }
 
-  void merge(Map<String, dynamic> envelope) {
+  void merge(Map<String, dynamic> envelope) =>
+      _merge(envelope, resolveSessions: true);
+
+  void _merge(Map<String, dynamic> envelope, {required bool resolveSessions}) {
     if (envelope['schema'] != 2 || envelope['records'] is! Map) {
       throw const FormatException('Unsupported sync snapshot');
     }
@@ -263,6 +369,12 @@ class SyncReplica {
         records[key] = incoming;
       }
     }
+    if (resolveSessions) _resolveSessions();
+  }
+
+  void _resolveSessions() {
+    // Resolve the retained history once after gathering every device, rather
+    // than redoing the same comparisons for every downloaded envelope.
     // An envelope may carry a previously hidden branch in recovery only.
     final sessionKeys = <String>{
       ...records.keys.where((key) => key.startsWith('session/')),

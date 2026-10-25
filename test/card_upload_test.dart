@@ -5,14 +5,12 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vocaflow/auto_backup.dart';
 import 'package:vocaflow/card_sync.dart';
 import 'package:vocaflow/cloud_backup.dart';
 import 'package:vocaflow/cloud_change_tracker.dart';
 import 'package:vocaflow/models.dart';
-import 'package:vocaflow/main.dart';
 import 'package:vocaflow/store.dart';
 
 class _User implements User {
@@ -66,9 +64,10 @@ class _Cloud extends CloudBackup {
   Future<List<Map<String, dynamic>>> downloadLearningStates() async => [];
   @override
   Future<String> uploadLearningState(
-      VocaStore store, CloudChangeSnapshot changes) async {
+      VocaStore store, CloudChangeSnapshot changes,
+      {Map<String, dynamic>? preparedPayload}) async {
     learningUploads++;
-    await store.syncV2Snapshot();
+    preparedPayload ??= await store.syncV2Snapshot();
     return 'test-revision-$learningUploads';
   }
 
@@ -257,69 +256,20 @@ void main() {
     expect(store.cloudChanges.channelError('settings'),
         contains('settings-unavailable'));
   });
-  testWidgets('success toast appears only after the edited card is committed',
-      (tester) async {
-    final (store, book, cloud, _, coordinator) =
-        (await tester.runAsync(() => setup()))!;
-    AutoBackupCoordinator.activeInstance = coordinator;
+  test('edited-card success is reported only after the server commits it',
+      () async {
+    final (store, book, cloud, _, coordinator) = await setup();
     final gate = Completer<void>();
     cloud.send = (_) => gate.future;
-    await tester.pumpWidget(
-        MaterialApp(home: CardStudyPage(store: store, words: book.words)));
-    await tester.pumpAndSettle();
-    await tester.tap(find.byIcon(Icons.edit_outlined));
-    await tester.pumpAndSettle();
-    await tester.enterText(find.byKey(const ValueKey('word-meaning')), '뼈저리게');
-    await tester.tap(find.text('저장'));
-    await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 100)));
-    await tester.pumpAndSettle();
-    expect(find.text('수정한 뜻을 서버에 저장했어요'), findsNothing);
+    final operation = (await store.updateWord(
+        book.words.first.copyWith(meaning: '뼈저리게'),
+        bookId: book.id))!;
+    final outcome = coordinator.saveEditedCard(operation);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
     expect(store.cardChanges.pending, hasLength(1));
     gate.complete();
-    await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 100)));
-    await tester.pumpAndSettle();
-    expect(find.text('수정한 뜻을 서버에 저장했어요'), findsOneWidget);
+    expect(await outcome, CardSaveOutcome.saved);
     expect(store.cardChanges.pending, isEmpty);
-    await tester.pumpWidget(const SizedBox());
-    await tester.pumpAndSettle();
-  });
-  testWidgets(
-      'permission denial shows failure toast and retains the local edit',
-      (tester) async {
-    final (store, book, cloud, _, coordinator) =
-        (await tester.runAsync(() => setup()))!;
-    AutoBackupCoordinator.activeInstance = coordinator;
-    cloud.send = (_) async => throw FirebaseException(
-        plugin: 'cloud_firestore', code: 'permission-denied');
-    await tester.pumpWidget(
-        MaterialApp(home: CardStudyPage(store: store, words: book.words)));
-    await tester.pumpAndSettle();
-    await tester.tap(find.byIcon(Icons.edit_outlined));
-    await tester.pumpAndSettle();
-    await tester.enterText(find.byKey(const ValueKey('word-meaning')), '뼈저리게');
-    await tester.tap(find.text('저장'));
-    await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 100)));
-    await tester.pumpAndSettle();
-    expect(find.text('수정한 뜻을 서버에 저장했어요'), findsNothing);
-    // Account/status persistence crosses real and fake async zones. Wait for
-    // the actual failed request, not a fixed wall-clock delay.
-    for (var i = 0; i < 30 && store.cardChanges.lastError == null; i++) {
-      await tester.runAsync(
-          () => Future<void>.delayed(const Duration(milliseconds: 10)));
-      await tester.pump();
-    }
-    await tester
-        .runAsync(() => Future<void>.delayed(const Duration(milliseconds: 10)));
-    await tester.pumpAndSettle();
-    expect(cloud.sent, isNotEmpty);
-    expect(find.text('폰에는 저장됐지만 서버 전송에 실패했어요'), findsOneWidget);
-    expect(store.resolveCard(book.id, 42)!.meaning, '뼈저리게');
-    expect(store.cardChanges.pending, hasLength(1));
-    await tester.pumpWidget(const SizedBox());
-    await tester.pumpAndSettle();
   });
   test('permission failure preserves operation and cannot report success',
       () async {

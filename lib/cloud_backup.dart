@@ -820,9 +820,8 @@ class CloudBackup {
       timeout: _learningStateOperationTimeout);
 
   Future<String> uploadLearningState(
-    VocaStore store,
-    CloudChangeSnapshot changes,
-  ) =>
+          VocaStore store, CloudChangeSnapshot changes,
+          {Map<String, dynamic>? preparedPayload}) =>
       _runCloudOperation(() async {
         // Learning progress belongs exclusively to learningStateV2. The
         // legacy incremental writer targets the now read-only vocabBooks and
@@ -832,11 +831,15 @@ class CloudBackup {
         final learningSignal = _learningSyncSignal;
         final legacySignal = _legacySyncSignal;
         final deviceId = await store.cloudChanges.deviceId();
-        final payload = await store.syncV2Snapshot();
+        // Auto backup has already captured this exact snapshot for its
+        // diagnostics. Reusing it avoids rebuilding the complete replica on
+        // the card-interaction path just to upload the same state.
+        final payload = preparedPayload ?? await store.syncV2Snapshot();
         final bytes = await compute(_encodeSyncPayload, payload);
         final revision = sha256.convert(bytes).toString();
         final head = heads.doc(deviceId);
-        final previous = await head.get(const GetOptions(source: Source.server));
+        final previous =
+            await head.get(const GetOptions(source: Source.server));
         if (previous.data()?['revision'] == revision) return revision;
         final version = head.collection('versions').doc(revision);
         const chunkBytes = 256 * 1024;
@@ -850,7 +853,7 @@ class CloudBackup {
         }
         final metadata = {
           'schema': 2,
-          'protocol': 3,
+          'protocol': 4,
           'deviceId': deviceId,
           'revision': revision,
           'chunkCount': chunkCount,

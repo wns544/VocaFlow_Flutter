@@ -96,9 +96,7 @@ class CardChange {
 /// only the exact operation that was sent; a newer edit to the same card is
 /// therefore never accidentally acknowledged by an older request.
 class CardChangeTracker {
-  CardChangeTracker._(this._prefs) {
-    _restore();
-  }
+  CardChangeTracker._(this._prefs);
 
   static const _legacyKey = 'cardChangeTracker.v1';
   static const _accountPrefix = 'cardChangeTracker.v1.';
@@ -157,10 +155,8 @@ class CardChangeTracker {
 
   static Future<CardChangeTracker> load() async {
     final tracker = CardChangeTracker._(await SharedPreferences.getInstance());
-    if (kIsWeb) {
-      final encoded = await readLargeLocalValue(tracker._prefs, _legacyKey);
-      if (encoded != null) tracker._restoreEncoded(encoded);
-    }
+    final encoded = await readLargeLocalValue(tracker._prefs, _legacyKey);
+    if (encoded != null) tracker._restoreEncoded(encoded);
     return tracker;
   }
 
@@ -382,11 +378,6 @@ class CardChangeTracker {
     _lastError = null;
     await _persist();
     onChanged?.call();
-  }
-
-  void _restore() {
-    final encoded = _prefs.getString(_legacyKey);
-    if (encoded != null) _restoreEncoded(encoded);
   }
 
   void _restoreEncoded(String encoded) {

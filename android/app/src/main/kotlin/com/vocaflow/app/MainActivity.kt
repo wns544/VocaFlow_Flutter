@@ -26,6 +26,7 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.io.FileOutputStream
+import java.security.MessageDigest
 import java.util.Locale
 
 class MainActivity : FlutterActivity() {
@@ -34,6 +35,7 @@ class MainActivity : FlutterActivity() {
     private val externalChannelName = "com.vocaflow.app/external_links"
     private val snapshotChannelName = "com.vocaflow.app/resume_snapshot"
     private val navigationDiagnosticChannelName = "com.vocaflow.app/navigation_diagnostics"
+    private val largeLocalStoreChannelName = "com.vocaflow.app/large_local_store"
     private val snapshotFile by lazy { File(cacheDir, "resume_snapshot.jpg") }
     private val snapshotTempFile by lazy { File(cacheDir, "resume_snapshot.tmp") }
     private val snapshotPreferences by lazy {
@@ -49,6 +51,7 @@ class MainActivity : FlutterActivity() {
     private var pendingSnapshotResult: MethodChannel.Result? = null
     private var navigationDiagnosticChannel: MethodChannel? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var performanceCapture: PerformanceCapture? = null
     private val snapshotIdleDelayMs = 750L
     private val snapshotTimeout = Runnable {
         removeSnapshotOverlay(deleteFile = true)
@@ -91,6 +94,62 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        val metadata = packageManager.getApplicationInfo(packageName,
+            android.content.pm.PackageManager.GET_META_DATA).metaData
+        if (metadata?.getBoolean("vocaflow.performanceProbe", false) == true) {
+            val probe = PerformanceCapture(this)
+            performanceCapture = probe
+            MethodChannel(flutterEngine.dartExecutor.binaryMessenger,
+                "com.vocaflow.app/performance").setMethodCallHandler { call, result ->
+                if (call.method == "sample") {
+                    result.success(probe.sample())
+                } else {
+                    Thread {
+                        try {
+                            val value: Any? = when (call.method) {
+                                "prepareRecovery" -> { probe.prepareRecovery(); null }
+                                "start" -> { probe.start(call.argument<Boolean>("javaSampling") == true); null }
+                                "stop" -> probe.stop(call.argument<String>("events").orEmpty(),
+                                    call.argument<Int>("dropped") ?: 0)
+                                else -> throw IllegalArgumentException("Unknown measurement method")
+                            }
+                            mainHandler.post { result.success(value) }
+                        } catch (error: Exception) {
+                            mainHandler.post { result.error("measurement-failed", error.toString(), null) }
+                        }
+                    }.start()
+                }
+            }
+        }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, largeLocalStoreChannelName)
+            .setMethodCallHandler { call, result ->
+                Thread {
+                    try {
+                        when (call.method) {
+                            "removeLegacyKeys" -> {
+                                val keys = call.argument<List<String>>("keys")
+                                    ?.filter { it.isNotBlank() }
+                                    ?.distinct()
+                                    ?: emptyList()
+                                // All entries have already been copied and verified in
+                                // the app-support file store. One editor commit avoids
+                                // serializing FlutterSharedPreferences once per key.
+                                val editor = getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE).edit()
+                                keys.forEach { editor.remove(it) }
+                                mainHandler.post { result.success(editor.commit()) }
+                            }
+                            "migrateLegacyLargeValues" -> {
+                                val migrated = migrateLegacyLargeValuesNatively()
+                                mainHandler.post { result.success(migrated) }
+                            }
+                            else -> mainHandler.post { result.notImplemented() }
+                        }
+                    } catch (error: Exception) {
+                        mainHandler.post { result.error("large-store-migration-failed", error.toString(), null) }
+                    }
+                }.start()
+            }
+
         textToSpeech = TextToSpeech(this) { status ->
             speechReady = status == TextToSpeech.SUCCESS
             if (speechReady) {
@@ -193,6 +252,63 @@ class MainActivity : FlutterActivity() {
                 }
             }
     }
+
+    // Run before Dart opens SharedPreferences. The old XML is copied and
+    // read-back verified before a single cleanup commit. Returning false keeps
+    // the source XML in place for recovery rather than risking data loss.
+    private fun migrateLegacyLargeValuesNatively(): Boolean {
+        val preferences = getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
+        val values = preferences.all
+        val candidates = values.entries.filter { (storedKey, value) ->
+            value is String && isLargeLocalValueKey(storedKey.removePrefix("flutter."))
+        }
+        if (candidates.isEmpty()) return true
+        val directory = File(filesDir, "large_local_store_v1")
+        if (!directory.exists() && !directory.mkdirs()) return false
+        val copied = ArrayList<String>()
+        try {
+            for ((storedKey, rawValue) in candidates) {
+                val value = rawValue as String
+                val key = storedKey.removePrefix("flutter.")
+                val target = File(directory, sha256(key) + ".json")
+                val temporary = File(directory, target.name + ".native.tmp")
+                temporary.outputStream().bufferedWriter(Charsets.UTF_8).use { it.write(value) }
+                if (!temporary.readText(Charsets.UTF_8).contentEquals(value)) {
+                    temporary.delete()
+                    return false
+                }
+                if (target.exists()) target.delete()
+                if (!temporary.renameTo(target)) {
+                    temporary.delete()
+                    return false
+                }
+                copied.add(storedKey)
+            }
+            val editor = preferences.edit()
+            copied.forEach { editor.remove(it) }
+            return editor.commit()
+        } catch (error: Exception) {
+            Log.e(backLogTag, "Native large-store migration retained legacy XML", error)
+            return false
+        }
+    }
+
+    private fun isLargeLocalValueKey(key: String): Boolean =
+        key == "books" ||
+            key == "sync.v2.replica" ||
+            key == "cardChangeTracker.v1" ||
+            key == "cloudChangeTracker.v1" ||
+            key.startsWith("accountState.v1.") ||
+            key.startsWith("sync.v2.checkpoint.") ||
+            key.startsWith("sync.v2.beforeMigration.") ||
+            key.startsWith("sync.v2.imported.") ||
+            key.startsWith("learning.pendingWordStates.") ||
+            key.startsWith("cardChangeTracker.v1.") ||
+            key.startsWith("cloudChangeTracker.v2.")
+
+    private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it.toInt() and 0xff) }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         // Flutter KeyboardManager sends unhandled events back through this
@@ -490,6 +606,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        performanceCapture?.close()
         snapshotOverlay = null
         stopStudyAudio()
         textToSpeech?.stop()

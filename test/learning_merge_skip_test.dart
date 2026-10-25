@@ -1,7 +1,25 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vocaflow/auto_backup.dart';
+import 'package:vocaflow/cloud_change_tracker.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  test('verified learning heads survive restart but stay account-scoped',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final first = await CloudChangeTracker.load();
+    await first.recordVerifiedLearningHeads(
+        's23u-account', 7, {'s23u': 'revision-a', 'a52s': 'revision-b'});
+
+    final restarted = await CloudChangeTracker.load();
+    final verified = restarted.verifiedLearningHeads('s23u-account');
+    expect(verified?.generation, 7);
+    expect(verified?.revisions, {'s23u': 'revision-a', 'a52s': 'revision-b'});
+    expect(restarted.verifiedLearningHeads('another-account'), isNull);
+  });
+
   bool skip({
     String? accountId = 's23u-account',
     String? mergedAccountId = 's23u-account',
@@ -57,6 +75,58 @@ void main() {
           'web': 'revision-d',
         }),
         isFalse);
+  });
+
+  test('pending local study skips pre-upload merge only with unchanged heads',
+      () {
+    bool skipPending({
+      String? accountId = 'account',
+      Map<String, String>? serverRevisions = const {
+        's23u': 'revision-a',
+        'a52s': 'revision-b',
+      },
+      int? mergedGeneration = 7,
+      int localGeneration = 8,
+      bool localDirty = true,
+      bool hasDurableLearningCache = true,
+      bool forceFull = false,
+    }) =>
+        canSkipLearningMergeBeforeUpload(
+          accountId: accountId,
+          mergedAccountId: 'account',
+          mergedRevisions: const {
+            's23u': 'revision-a',
+            'a52s': 'revision-b',
+          },
+          serverRevisions: serverRevisions,
+          mergedGeneration: mergedGeneration,
+          localGeneration: localGeneration,
+          localDirty: localDirty,
+          hasDurableLearningCache: hasDurableLearningCache,
+          forceFull: forceFull,
+        );
+
+    expect(skipPending(), isTrue);
+    expect(skipPending(serverRevisions: null), isFalse);
+    expect(
+        skipPending(serverRevisions: const {
+          's23u': 'revision-a',
+          'a52s': 'revision-new',
+        }),
+        isFalse);
+    expect(
+        skipPending(serverRevisions: const {
+          's23u': 'revision-a',
+          'a52s': 'revision-b',
+          'web': 'revision-c',
+        }),
+        isFalse);
+    expect(skipPending(accountId: 'other'), isFalse);
+    expect(skipPending(mergedGeneration: null), isFalse);
+    expect(skipPending(localGeneration: 6), isFalse);
+    expect(skipPending(localDirty: false), isFalse);
+    expect(skipPending(hasDurableLearningCache: false), isFalse);
+    expect(skipPending(forceFull: true), isFalse);
   });
 
   test('successful upload advances only this device head in clean merge cache',

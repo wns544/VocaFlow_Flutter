@@ -13,6 +13,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:google_sign_in/google_sign_in.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'auto_backup.dart';
 import 'book_restore_archive.dart';
@@ -23,11 +24,13 @@ import 'csv_parser.dart';
 import 'excel_exporter.dart';
 import 'excel_parser.dart';
 import 'diagnostic_export.dart';
+import 'performance_probe.dart';
 import 'firebase_options.dart';
 import 'google_sheets_import.dart';
 import 'in_app_browser.dart';
 import 'kanji_lookup.dart';
 import 'local_word_search.dart';
+import 'large_local_store.dart';
 import 'models.dart';
 import 'navigation_trace.dart';
 import 'pronunciation/pronunciation_pack_manager.dart';
@@ -353,11 +356,21 @@ class _VocaFlowAppState extends State<VocaFlowApp> {
     // Acquire before loading ANY shared cache or starting sync. Two web tabs
     // otherwise use stale whole-journal snapshots and the same replica ID.
     await (widget.acquireWebWriter ?? ensureWebWriter)();
+    // Measurement builds must preserve the old install before loading or
+    // migrating any learning preferences. Failure uses the startup retry UI.
+    await PerformanceProbe.instance.prepareRecovery();
+    // The old XML can exceed 80MB. Move it natively before the plugin turns
+    // it into Dart strings, then clean up any small remaining legacy values.
+    await prepareLargeLocalStoreMigration();
+    await migrateLegacyLargeLocalValues(await SharedPreferences.getInstance());
     final localState = VocaStore.load();
     if (kReleaseMode) {
       await Future<void>.delayed(flutterSplashMinimumDuration);
     }
     final value = await localState;
+    if (PerformanceProbe.supported) {
+      PerformanceProbe.instance.stateProvider = () => value.performanceState;
+    }
     NavigationTrace.bind(value.cloudChanges);
     var active = value.activeStudy;
     if (active != null &&
@@ -2202,7 +2215,11 @@ class _CardStudyPageState extends State<CardStudyPage>
   ModalRoute<dynamic>? _route;
   DateTime? _activeStudyUpdatedAt;
   String? _activeStudyProgressId;
+  String? _activeStudyRegressionEpoch;
   ActiveStudy? _sessionContext;
+  late DateTime _studyStartedAt;
+  late String _studyRunId;
+  int _decisionSequence = 0;
 
   bool get horizontalSwipe => widget.store.horizontalSwipe;
   String? get activeBookId =>
@@ -2391,6 +2408,10 @@ class _CardStudyPageState extends State<CardStudyPage>
     }
     final resume = resolvedResume;
     _sessionContext = resume;
+    _studyStartedAt = resume?.startedAt ?? DateTime.now();
+    _studyRunId = resume?.runId ??
+        '${_studyStartedAt.toUtc().microsecondsSinceEpoch}:${widget.bookId ?? 'mixed'}:${widget.rangeStart ?? -1}:${widget.rangeEnd ?? -1}';
+    _decisionSequence = resume?.decisionSequence ?? 0;
     if (resume == null) {
       final words = widget.words ?? widget.store.nextWords();
       queue = shuffleNewStudyQueues
@@ -2401,6 +2422,8 @@ class _CardStudyPageState extends State<CardStudyPage>
     } else {
       _activeStudyUpdatedAt = resume.updatedAt;
       _activeStudyProgressId = resume.progress['id'] as String?;
+      _activeStudyRegressionEpoch =
+          resume.progress['regressionEpoch'] as String?;
       queue = widget.store.resolveActiveWords(resume);
       // Keep the original-book association even when this is a combined
       // review.  The queue can contain same-id cards from several books, so
@@ -2460,7 +2483,10 @@ class _CardStudyPageState extends State<CardStudyPage>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       // A resumed route already has a stored snapshot. Re-saving it here used
       // to race a just-finished cloud merge and could put an older queue back.
-      if (resume == null) unawaited(persistStudy(progressChanged: true));
+      if (resume == null) {
+        unawaited(
+            persistStudy(progressChanged: true, allowProgressRegression: true));
+      }
       if (mounted) scheduleResumeSnapshotCapture('study');
     });
   }
@@ -2526,20 +2552,27 @@ class _CardStudyPageState extends State<CardStudyPage>
       // writing. A delayed sync of the same course must not put the previous
       // round back in front of the learner. Reassert only the active-study
       // position; card decisions and their event IDs remain untouched.
-      final sameAttempt = latest.bookId == activeBookId &&
+      final sameCourse = latest.bookId == activeBookId &&
           latest.rangeStart == activeRangeStart &&
-          latest.rangeEnd == activeRangeEnd &&
-          (_sessionContext?.startedAt == null ||
-              latest.startedAt == null ||
-              latest.startedAt == _sessionContext!.startedAt);
-      if (sameAttempt && latest.roundNumber < roundNumber) {
-        NavigationTrace.record('study_older_round_merge_ignored', {
+          latest.rangeEnd == activeRangeEnd;
+      if (sameCourse &&
+          latest.progress['allowsRegression'] != true &&
+          (latest.progress['regressionEpoch'] == null ||
+              latest.progress['regressionEpoch'] ==
+                  _activeStudyRegressionEpoch) &&
+          (latest.roundNumber < roundNumber ||
+              (latest.roundNumber == roundNumber &&
+                  latest.roundCompleted < roundCompleted))) {
+        NavigationTrace.record('study_regressed_merge_ignored', {
           ..._studyQueueTrace(),
           'incomingRound': latest.roundNumber,
+          'incomingCompleted': latest.roundCompleted,
           'incomingProgressId': latest.progress['id'],
         });
         _activeStudyUpdatedAt = latestAt;
         _activeStudyProgressId = latest.progress['id'] as String?;
+        _activeStudyRegressionEpoch =
+            latest.progress['regressionEpoch'] as String?;
         await persistStudy(progressChanged: true);
         return;
       }
@@ -2655,6 +2688,11 @@ class _CardStudyPageState extends State<CardStudyPage>
         ..addAll(latest.undoHistory);
       _activeStudyUpdatedAt = latest.updatedAt;
       _activeStudyProgressId = latest.progress['id'] as String?;
+      _activeStudyRegressionEpoch =
+          latest.progress['regressionEpoch'] as String?;
+      _studyStartedAt = latest.startedAt ?? _studyStartedAt;
+      _studyRunId = latest.runId ?? _studyRunId;
+      _decisionSequence = latest.decisionSequence;
     });
     NavigationTrace.record('study_merge_queue_after', {
       'source': source,
@@ -2666,6 +2704,7 @@ class _CardStudyPageState extends State<CardStudyPage>
     bool markCloudChange = true,
     bool allowWhileExiting = false,
     bool progressChanged = false,
+    bool allowProgressRegression = false,
   }) async {
     if (queue.isEmpty || (exiting && !allowWhileExiting)) return;
     final key = _activeStudyStorageKey;
@@ -2673,12 +2712,15 @@ class _CardStudyPageState extends State<CardStudyPage>
         expectedUpdatedAt: _activeStudyUpdatedAt,
         expectedProgressId: _activeStudyProgressId,
         progressChanged: progressChanged,
+        allowProgressRegression: allowProgressRegression,
         markCloudChange: markCloudChange);
     if (saved == null) {
       _onLearningStateMerged();
     } else if (progressChanged) {
       _activeStudyUpdatedAt = saved.updatedAt;
       _activeStudyProgressId = saved.progress['id'] as String?;
+      _activeStudyRegressionEpoch =
+          saved.progress['regressionEpoch'] as String?;
     } else if (mounted &&
         !exiting &&
         (total != saved.total ||
@@ -2725,6 +2767,9 @@ class _CardStudyPageState extends State<CardStudyPage>
         rangeStart: activeRangeStart,
         rangeEnd: activeRangeEnd,
         sourceMode: activeSourceMode,
+        startedAt: _studyStartedAt,
+        runId: _studyRunId,
+        decisionSequence: _decisionSequence,
       ).toJson());
 
   bool _matchesStoredWord(Word candidate, Word word) => candidate.id == word.id;
@@ -2955,6 +3000,9 @@ class _CardStudyPageState extends State<CardStudyPage>
     final snapshot = _studySnapshot();
     final decisionId =
         'decision-${DateTime.now().microsecondsSinceEpoch}-${word.id}';
+    PerformanceProbe.instance.queue('decision_persistence', 1);
+    PerformanceProbe.instance.event('decision_queued',
+        {'operationId': decisionId, 'runSequence': snapshot.decisionSequence});
     Future<void> writeDecision() async {
       await WidgetsBinding.instance.endOfFrame;
       final markAt = Stopwatch()..start();
@@ -2978,6 +3026,9 @@ class _CardStudyPageState extends State<CardStudyPage>
         _activeStudyProgressId = widget.store
             .getActiveStudyFor(_activeStudyStorageKey)
             ?.progress['id'] as String?;
+        _activeStudyRegressionEpoch = widget.store
+            .getActiveStudyFor(_activeStudyStorageKey)
+            ?.progress['regressionEpoch'] as String?;
       }
       final persistMs = persistAt.elapsedMilliseconds;
       if (queuedAt.elapsedMilliseconds >= 24 ||
@@ -2993,7 +3044,13 @@ class _CardStudyPageState extends State<CardStudyPage>
     }
 
     _persistenceChain = _persistenceChain
-        .then((_) => writeDecision())
+        .then((_) => PerformanceProbe.measure(
+                'decision_persistence', writeDecision, data: {
+              'operationId': decisionId,
+              'queuedUs': queuedAt.elapsedMicroseconds
+            }))
+        .whenComplete(
+            () => PerformanceProbe.instance.queue('decision_persistence', -1))
         .catchError((Object error, StackTrace stack) {
       _decisionSaveFailed = true;
       if (!mounted) return;
@@ -3098,6 +3155,9 @@ class _CardStudyPageState extends State<CardStudyPage>
   void decide(StudyState state, {bool? dismissedPositive}) {
     if (queue.isEmpty || _decisionSaveFailed) return;
     final beforeQueue = _studyQueueTrace();
+    // Advance before the asynchronous persistence chain begins.  Every
+    // snapshot made for this tap therefore has a stable, monotonic position.
+    _decisionSequence++;
     final word = queue.removeAt(0);
     seenWordIds.add(word.id);
     roundCompleted = min(roundCompleted + 1, roundTotal);
@@ -3159,6 +3219,8 @@ class _CardStudyPageState extends State<CardStudyPage>
             if (widget.decisionWriter == null && latest != null) {
               _activeStudyUpdatedAt = latest.updatedAt;
               _activeStudyProgressId = latest.progress['id'] as String?;
+              _activeStudyRegressionEpoch =
+                  latest.progress['regressionEpoch'] as String?;
             }
             await persistStudy(progressChanged: widget.decisionWriter != null);
           }
@@ -3312,7 +3374,8 @@ class _CardStudyPageState extends State<CardStudyPage>
             bookId: decision.bookId ?? activeBookId,
           );
         }
-        await persistStudy(progressChanged: true);
+        await persistStudy(
+            progressChanged: true, allowProgressRegression: true);
       } catch (rollbackError, rollbackStackTrace) {
         unawaited(widget.store.cloudChanges.recordDiagnostic(
           'round_transition_rollback_failed',
@@ -3794,6 +3857,9 @@ class _CardStudyPageState extends State<CardStudyPage>
   Future<void> undo({String source = 'unknown'}) async {
     if (undoHistory.isEmpty) return;
     final beforeQueue = _studyQueueTrace();
+    // Undo is a real action, not an old view arriving late.  Give it its own
+    // later sequence so it is the only legal way to move a run backwards.
+    _decisionSequence++;
     final undone = undoHistory.removeLast();
     final sourceBooks = undone.bookId == null
         ? widget.store.books
@@ -3862,7 +3928,7 @@ class _CardStudyPageState extends State<CardStudyPage>
     });
     await widget.store.undoWordDecision(word, undone.previousState,
         bookId: undone.bookId ?? activeBookId);
-    await persistStudy(progressChanged: true);
+    await persistStudy(progressChanged: true, allowProgressRegression: true);
     NavigationTrace.record('study_undo_persisted', {
       'source': source,
       'wordId': word.id,
@@ -8264,6 +8330,10 @@ class _SettingsPageState extends State<SettingsPage> {
         _showSnack('서버 사용량이 초과되어 지금은 동기화할 수 없어요. 나중에 다시 시도해 주세요.');
       } else if (error is CloudSyncTimeoutException) {
         _showSnack('서버 응답이 오래 걸려 동기화를 멈췄어요. 잠시 후 다시 시도해 주세요.');
+      } else if (error is FirebaseException &&
+          error.plugin == 'firebase_storage' &&
+          error.code == 'object-not-found') {
+        _showSnack('진단 파일 저장소를 찾지 못했어요. 보고서 공유를 이용해 주세요.');
       } else {
         _showSnack('클라우드 작업에 실패했습니다. ($error)');
       }
@@ -8391,8 +8461,23 @@ class _SettingsPageState extends State<SettingsPage> {
     try {
       final stamp =
           DateTime.now().toUtc().toIso8601String().replaceAll(':', '-');
+      final text = await _detailedSyncLogText();
+      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+        // file_picker 8.3.7 can lose its pending bytes when Android recreates
+        // the activity while the document picker is open. Its native result
+        // handler then crashes the entire process. Share a real temporary
+        // file instead so the user can save it through the Android sheet.
+        final shared = await shareDiagnosticText(
+          text,
+          fileName: 'vocaflow-diagnostic-$stamp.txt',
+        );
+        if (mounted) {
+          _showSnack(shared ? '진단 보고서를 공유했습니다.' : '공유 대상을 고르지 않았습니다.');
+        }
+        return;
+      }
       final result = await saveDiagnosticText(
-        await _detailedSyncLogText(),
+        text,
         fileName: 'vocaflow-diagnostic-$stamp.txt',
       );
       if (!mounted) return;
@@ -8403,6 +8488,8 @@ class _SettingsPageState extends State<SettingsPage> {
       } else {
         _showSnack('파일 내보내기에 실패했습니다. (${result.error ?? '알 수 없는 오류'})');
       }
+    } catch (error) {
+      if (mounted) _showSnack('진단 보고서를 공유하지 못했습니다. ($error)');
     } finally {
       if (mounted) setState(() => exportingDiagnostics = false);
     }
@@ -8422,8 +8509,17 @@ class _SettingsPageState extends State<SettingsPage> {
       await widget.store.cloudChanges
           .recordDiagnostic('diagnostic_upload_started');
       final archive = await widget.store.cloudChanges.diagnostics.gzipBytes();
-      final path = await auto.cloud.uploadDiagnosticArchive(archive,
-          deviceId: await widget.store.cloudChanges.deviceId());
+      late final String path;
+      try {
+        path = await auto.cloud.uploadDiagnosticArchive(archive,
+            deviceId: await widget.store.cloudChanges.deviceId());
+      } catch (error) {
+        await widget.store.cloudChanges.recordDiagnostic(
+          'diagnostic_upload_failed',
+          data: {'error': error.toString()},
+        );
+        rethrow;
+      }
       await widget.store.cloudChanges.recordDiagnostic(
           'diagnostic_upload_succeeded',
           data: {'storagePath': path, 'bytes': archive.length});
@@ -8468,6 +8564,38 @@ class _SettingsPageState extends State<SettingsPage> {
             style: TextStyle(
                 color: ink, fontSize: 24, fontWeight: FontWeight.w800)),
         const SizedBox(height: 18),
+        if (PerformanceProbe.supported)
+          ListenableBuilder(
+              listenable: PerformanceProbe.instance,
+              builder: (context, _) {
+                final probe = PerformanceProbe.instance;
+                return Card(
+                    child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text('일시적 성능 측정'),
+                              Text(probe.status),
+                              Wrap(spacing: 8, children: [
+                                OutlinedButton(
+                                    onPressed: probe.busy || probe.recording
+                                        ? null
+                                        : () =>
+                                            probe.start(javaSampling: false),
+                                    child: const Text('비교 측정 30초')),
+                                OutlinedButton(
+                                    onPressed: probe.busy || probe.recording
+                                        ? null
+                                        : () => probe.start(javaSampling: true),
+                                    child: const Text('함수 추적 30초')),
+                                TextButton(
+                                    onPressed:
+                                        probe.recording ? probe.stop : null,
+                                    child: const Text('측정 종료')),
+                              ]),
+                            ])));
+              }),
         const _SectionTitle('계정'),
         Card(
           child: Padding(
@@ -8629,7 +8757,10 @@ class _SettingsPageState extends State<SettingsPage> {
                     child: OutlinedButton.icon(
                       onPressed: exportingDiagnostics ? null : _exportSyncLog,
                       icon: const Icon(Icons.file_download_outlined, size: 17),
-                      label: const Text('파일 내보내기'),
+                      label: Text(!kIsWeb &&
+                              defaultTargetPlatform == TargetPlatform.android
+                          ? '파일 공유/저장'
+                          : '파일 내보내기'),
                     ),
                   ),
                   const SizedBox(width: 8),
@@ -10320,12 +10451,17 @@ Future<bool> _saveEditedWord(
               coordinator.user?.uid == feedbackAccount &&
               (result == CardSaveOutcome.saved ||
                   result == CardSaveOutcome.failed) &&
-              _latestCardFeedback[feedbackKey] == operation.id &&
-              WidgetsBinding.instance.lifecycleState ==
-                  AppLifecycleState.resumed) {
+              _latestCardFeedback[feedbackKey] == operation.id) {
+            // Replace the temporary “checking” notice. Queueing the final
+            // receipt behind it makes a successful save appear invisible for
+            // several seconds even though the server already confirmed it.
+            messenger.hideCurrentSnackBar();
             messenger.showSnackBar(SnackBar(
                 content: Text(result == CardSaveOutcome.saved
-                    ? '카드 수정을 서버에 저장했어요'
+                    ? (operation.fields.length == 1 &&
+                            operation.fields.containsKey('meaning')
+                        ? '수정한 뜻을 서버에 저장했어요'
+                        : '카드 수정을 서버에 저장했어요')
                     : '폰에는 저장됐지만 서버 전송에 실패했어요')));
           }
         }
