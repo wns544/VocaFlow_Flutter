@@ -1864,8 +1864,9 @@ void main() {
     final termRichText = tester.widget<Text>(
       find.byKey(const ValueKey('tappable-study-term')),
     );
-    expect(termRichText.maxLines, 1);
-    expect(termRichText.softWrap, isFalse);
+    expect(termRichText.maxLines, 2);
+    expect(termRichText.softWrap, isTrue);
+    expect(termRichText.overflow, TextOverflow.ellipsis);
 
     await tester.tap(find.byKey(const ValueKey('study-card')));
     await tester.pumpAndSettle();

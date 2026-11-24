@@ -3740,21 +3740,22 @@ class _CardStudyPageState extends State<CardStudyPage>
                 child: Row(mainAxisSize: MainAxisSize.min, children: [
                   const SizedBox(width: 40),
                   Flexible(
-                    child: FittedBox(
-                      fit: BoxFit.scaleDown,
-                      child: _TappableHanTerm(
-                        term: word.term,
-                        style: TextStyle(
-                            color: ink,
-                            fontSize: widget.store.termFontSize,
-                            fontFamily: japaneseFontFamily(widget.store),
-                            fontWeight: FontWeight.w800),
-                        onCharacterTap: (character) =>
-                            showKanjiDetails(character, word),
-                        onTermTap: () => showKanjiDetails(word.term, word),
-                        onCharacterDoubleTap: copyText,
-                        onCharacterLongPress: copyText,
-                      ),
+                    // Long grammar patterns used to be forced into a single
+                    // FittedBox line. That shrank the actual term to an
+                    // unreadable size even though the card has ample height.
+                    // Keep the configured font size and use up to two lines.
+                    child: _TappableHanTerm(
+                      term: word.term,
+                      style: TextStyle(
+                          color: ink,
+                          fontSize: widget.store.termFontSize,
+                          fontFamily: japaneseFontFamily(widget.store),
+                          fontWeight: FontWeight.w800),
+                      onCharacterTap: (character) =>
+                          showKanjiDetails(character, word),
+                      onTermTap: () => showKanjiDetails(word.term, word),
+                      onCharacterDoubleTap: copyText,
+                      onCharacterLongPress: copyText,
                     ),
                   ),
                   SizedBox(
@@ -4783,8 +4784,9 @@ class _TappableHanTerm extends StatelessWidget {
           key: const ValueKey('tappable-study-term'),
           style: style,
           textAlign: TextAlign.center,
-          maxLines: 1,
-          softWrap: false,
+          maxLines: 2,
+          softWrap: true,
+          overflow: TextOverflow.ellipsis,
         ),
       );
     }
@@ -4812,8 +4814,9 @@ class _TappableHanTerm extends StatelessWidget {
         ],
       ),
       textAlign: TextAlign.center,
-      maxLines: 1,
-      softWrap: false,
+      maxLines: 2,
+      softWrap: true,
+      overflow: TextOverflow.ellipsis,
     );
   }
 }
@@ -10126,19 +10129,17 @@ Future<bool> showCardFontSizeEditor(
                       Row(mainAxisSize: MainAxisSize.min, children: [
                         const SizedBox(width: 40),
                         Flexible(
-                          child: FittedBox(
-                            fit: BoxFit.scaleDown,
-                            child: Text(word.term,
-                                key: const ValueKey('font-preview-term'),
-                                maxLines: 1,
-                                softWrap: false,
-                                textAlign: TextAlign.center,
-                                style: TextStyle(
-                                    color: ink,
-                                    fontSize: term,
-                                    fontFamily: japaneseFontFamily(store),
-                                    fontWeight: FontWeight.w800)),
-                          ),
+                          child: Text(word.term,
+                              key: const ValueKey('font-preview-term'),
+                              maxLines: 2,
+                              softWrap: true,
+                              overflow: TextOverflow.ellipsis,
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                  color: ink,
+                                  fontSize: term,
+                                  fontFamily: japaneseFontFamily(store),
+                                  fontWeight: FontWeight.w800)),
                         ),
                         const SizedBox(
                           width: 40,
